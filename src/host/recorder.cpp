@@ -48,6 +48,15 @@ inline void cpu_relax() {
 #endif
 }
 
+// Flushes this core's write-combining buffers (see recorder_thread).
+inline void write_combine_fence() {
+#if defined(__x86_64__)
+    _mm_sfence();
+#else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
+
 struct DrawPacket {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     // Descriptor writes, applied first and in order. Each write's info
@@ -156,6 +165,13 @@ const bool g_recorder_on = [] {
     const char* e = std::getenv("BBHOST_RECORDER");
     return !(e && e[0] == '0');
 }();
+// BBHOST_RECORDER_INLINE=1 (a diagnostic): the packets are replayed on the
+// publishing thread at once, no recorder thread - the packet path's command
+// order, recorded in place.
+const bool g_recorder_inline = [] {
+    const char* e = std::getenv("BBHOST_RECORDER_INLINE");
+    return e && e[0] == '1';
+}();
 
 void replay(DrawPacket& p) {
     const VkCommandBuffer cmd = p.cmd;
@@ -247,6 +263,17 @@ void recorder_thread() {
         while (done < published) {
             replay(g_ring[done % kRing]);
             ++done;
+            // The driver may record into write-combined memory (AMD's
+            // Windows driver does: its command chunks are GPU memory the
+            // CPU writes through). Write-combining buffers are per core and
+            // x86's ordering does not cover them - a release store is a
+            // plain store - so without a store fence the command processor
+            // could end and submit this command buffer while some of the
+            // packet's commands still sat in this core's buffers, and the
+            // GPU ran whatever was in memory: a device loss in the title's
+            // first frames on a Radeon 8060S, every run, while in-place
+            // recording (the same commands, one thread) never was.
+            write_combine_fence();
             g_done.store(done, std::memory_order_release);
         }
         g_replayed.store(done, std::memory_order_relaxed);
@@ -256,6 +283,10 @@ void recorder_thread() {
 void ensure_started() {
     static const bool started = [] {
         g_ring = new DrawPacket[kRing];  // never freed: the thread runs until exit
+        if (g_recorder_inline) {
+            host_log("recorder: packets replayed in place as they are published (BBHOST_RECORDER_INLINE)");
+            return true;
+        }
         std::thread(recorder_thread).detach();
         host_log("recorder: draws are recorded on their own thread (BBHOST_RECORDER=0 records them in place)");
         return true;
@@ -355,6 +386,14 @@ void DrawCmds::publish() {
     packet_ = nullptr;
     if (g_open == this) g_open = nullptr;
     p.cmd = g.cmd_;
+    if (g_recorder_inline) {
+        replay(p);
+        const std::uint64_t n = g_published.load(std::memory_order_relaxed) + 1;
+        g_published.store(n, std::memory_order_relaxed);
+        g_done.store(n, std::memory_order_relaxed);
+        g_replayed.store(n, std::memory_order_relaxed);
+        return;
+    }
     // A release store, not a locked add: that would wait here for this
     // draw's stores (its params blocks among them) to drain. Without the
     // fence the recorder may go to sleep with this packet unseen; the next
