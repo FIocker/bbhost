@@ -1,9 +1,9 @@
 // The effect ribbons' writers (decomp/sfx/ribbons.cpp) against the game's own
-// code (tests/eboot_kit.h): sub_2cce7b0 and sub_2cceec0 run in the loaded
+// code (tests/decomp/eboot_kit.h): sub_2cce7b0 and sub_2cceec0 run in the loaded
 // eboot on the same random strips as ours, every byte of the vertices
 // compared, under the console's floating-point mode. Skips without the 1.09
 // eboot (BBHOST_EBOOT, or eboot-109-decrypted.bin in the checkout).
-#include "../src/decomp/sfx/ribbons.cpp"
+#include "decomp/sfx/ribbons.cpp"
 
 #include "eboot_kit.h"
 
@@ -113,11 +113,11 @@ int run(const char* name, void* game_fn, bool along, int cases) {
 }  // namespace
 
 int main() {
-    eboot_kit::load("sfx_ribbon_test");
+    eboot_kit::load("decomp_sfx_ribbons");
     std::uint8_t* facing = eboot_kit::at(0x2cce7b0);
     std::uint8_t* along = eboot_kit::at(0x2cceec0);
     if (std::memcmp(facing, kFacingEntry, sizeof kFacingEntry) != 0 || std::memcmp(along, kAlongEntry, sizeof kAlongEntry) != 0) {
-        std::printf("sfx_ribbon_test: the writers' entries are not where the decomp expects them\n");
+        std::printf("decomp_sfx_ribbons: the writers' entries are not where the decomp expects them\n");
         return 1;
     }
     int bad = 0;
@@ -127,6 +127,6 @@ int main() {
         bad += run("sub_2cce7b0", facing, false, kCases);
         bad += run("sub_2cceec0", along, true, kCases);
     }
-    std::printf("sfx_ribbon_test: %d strips each way (ordinary values, then special ones), %d differ\n", 2 * kCases, bad);
+    std::printf("decomp_sfx_ribbons: %d strips each way (ordinary values, then special ones), %d differ\n", 2 * kCases, bad);
     return bad ? 1 : 0;
 }

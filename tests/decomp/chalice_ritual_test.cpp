@@ -1,12 +1,12 @@
 // Chalice dungeons (decomp/chalice/ritual.cpp) against the game's own code
-// (tests/eboot_kit.h): the roll, a rite's pick, the map uid and the feature
+// (tests/decomp/eboot_kit.h): the roll, a rite's pick, the map uid and the feature
 // pairs run in the loaded eboot and as ours on the same inputs - synthetic
 // HolygrailExParam and DungeonSubFeatLotParam rows served by stubs both
 // call, a flag store holding the unlock flags, a scripted generator - and
 // every byte they write, every draw they make, compared. The game's roll and
 // pick keep their candidates on the thread's runtime heap; the test gives
 // the thread one (malloc behind the heap's vtable).
-#include "../src/decomp/chalice/ritual.cpp"
+#include "decomp/chalice/ritual.cpp"
 
 #include "eboot_kit.h"
 
@@ -212,11 +212,11 @@ void report(const char* what, int c, const void* a, const void* b, std::size_t n
 }  // namespace
 
 int main() {
-    eboot_kit::load("chalice_test");
+    eboot_kit::load("decomp_chalice_ritual");
     const std::uint8_t* code = eboot_kit::at(kRoll);
     static const std::uint8_t kExpect[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56};
     if (std::memcmp(code, kExpect, sizeof kExpect) != 0) {
-        std::printf("chalice_test: the roll is not where the decomp expects it\n");
+        std::printf("decomp_chalice_ritual: the roll is not where the decomp expects it\n");
         return 1;
     }
     eboot_kit::stub(kHolygrailRow, reinterpret_cast<const void*>(&holygrail_row));
@@ -295,7 +295,7 @@ int main() {
             ++picks;
         }
     }
-    std::printf("chalice_test: %d rolls (%d draws), %d picks, %d map uids, %d pair sets; %d differ\n", rolls, draws, picks,
+    std::printf("decomp_chalice_ritual: %d rolls (%d draws), %d picks, %d map uids, %d pair sets; %d differ\n", rolls, draws, picks,
                 uids, pairs, g_bad);
     return g_bad ? 1 : 0;
 }

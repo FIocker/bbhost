@@ -383,70 +383,36 @@ if(UNIX)
   target_include_directories(write_watch_test PRIVATE src)
   target_link_libraries(write_watch_test PRIVATE pthread)
   add_test(NAME write_watch_test COMMAND write_watch_test)
-  # The 1.09 eboot for tests that read or run the game's own code
-  # (tests/eboot_kit.h): bbhost's own loader, every import a trap. The tests
-  # built on it skip (77) without the eboot.
-  add_library(eboot_kit STATIC tests/eboot_kit.cpp src/core/elf.cpp src/core/memory.cpp src/core/sha256.cpp
+  # The decomp's tests (tests/decomp, docs/decomp.md "How one is checked"):
+  # the eboot kit loads the 1.09 eboot with bbhost's own loader, every import a
+  # trap, and a test runs the game's functions beside ours. They skip (77)
+  # without the eboot.
+  add_library(eboot_kit STATIC tests/decomp/eboot_kit.cpp src/core/elf.cpp src/core/memory.cpp src/core/sha256.cpp
               src/core/tls_rewrite.cpp)
-  target_include_directories(eboot_kit PUBLIC src tests)
+  target_include_directories(eboot_kit PUBLIC src include tests tests/decomp)
   target_compile_definitions(eboot_kit PRIVATE BBHOST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-  # decomp/insn.cpp over every function of the eboot.
-  add_executable(decomp_insn_eboot_test tests/decomp_insn_eboot_test.cpp src/decomp/insn.cpp)
-  target_link_libraries(decomp_insn_eboot_test PRIVATE eboot_kit)
-  add_test(NAME decomp_insn_eboot_test COMMAND decomp_insn_eboot_test)
-  set_tests_properties(decomp_insn_eboot_test PROPERTIES SKIP_RETURN_CODE 77)
-  # The item-lot roll against the game's code (skips without the eboot).
-  add_executable(item_lot_test tests/item_lot_test.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp
-                 src/host/main_wait.cpp)
-  target_compile_options(item_lot_test PRIVATE -ffp-contract=off)
-  target_link_libraries(item_lot_test PRIVATE eboot_kit pthread)
-  add_test(NAME item_lot_test COMMAND item_lot_test)
-  set_tests_properties(item_lot_test PROPERTIES SKIP_RETURN_CODE 77)
+  # decomp_<name>: tests/decomp/<name>_test.cpp, with SOURCES built beside it,
+  # LIBS linked, and ARGS for its run.
+  function(bbhost_decomp_test name)
+    cmake_parse_arguments(T "" "" "SOURCES;LIBS;ARGS" ${ARGN})
+    add_executable(decomp_${name} tests/decomp/${name}_test.cpp ${T_SOURCES})
+    target_compile_options(decomp_${name} PRIVATE -fno-stack-protector -ffp-contract=off)
+    target_link_libraries(decomp_${name} PRIVATE eboot_kit pthread ${T_LIBS})
+    add_test(NAME decomp_${name} COMMAND decomp_${name} ${T_ARGS})
+    set_tests_properties(decomp_${name} PROPERTIES SKIP_RETURN_CODE 77)
+  endfunction()
+  bbhost_decomp_test(insn SOURCES src/decomp/insn.cpp)
+  bbhost_decomp_test(insn_eboot SOURCES src/decomp/insn.cpp)
+  bbhost_decomp_test(event_interpreter SOURCES src/decomp/events/flag_store.cpp)
+  bbhost_decomp_test(player_data)
+  bbhost_decomp_test(item_lots SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
+  bbhost_decomp_test(talk_evaluator SOURCES src/engine/esd.cpp LIBS gcn)
+  bbhost_decomp_test(chalice_ritual)
+  bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp ARGS 2000)
+  bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)
-  # The player-data decomps against the game's code (skips without the eboot).
-  add_executable(player_data_test tests/player_data_test.cpp)
-  target_compile_options(player_data_test PRIVATE -ffp-contract=off -fno-stack-protector)
-  target_link_libraries(player_data_test PRIVATE eboot_kit)
-  add_test(NAME player_data_test COMMAND player_data_test)
-  set_tests_properties(player_data_test PROPERTIES SKIP_RETURN_CODE 77)
-  # The talk scripts' evaluator against the game's (skips without the eboot;
-  # the dump's scripts, BBHOST_APP0, join the random expressions when named).
-  add_executable(talk_script_test tests/talk_script_test.cpp src/engine/esd.cpp)
-  target_compile_options(talk_script_test PRIVATE -fno-stack-protector -ffp-contract=off)
-  target_compile_features(talk_script_test PRIVATE cxx_std_17)
-  target_link_libraries(talk_script_test PRIVATE eboot_kit gcn)
-  add_test(NAME talk_script_test COMMAND talk_script_test)
-  set_tests_properties(talk_script_test PROPERTIES SKIP_RETURN_CODE 77)
-  # The effect ribbons' writers against the game's code (skips without the eboot).
-  add_executable(sfx_ribbon_test tests/sfx_ribbon_test.cpp src/core/write_watch.cpp)
-  target_compile_options(sfx_ribbon_test PRIVATE -ffp-contract=off)
-  target_link_libraries(sfx_ribbon_test PRIVATE eboot_kit pthread)
-  add_test(NAME sfx_ribbon_test COMMAND sfx_ribbon_test)
-  set_tests_properties(sfx_ribbon_test PROPERTIES SKIP_RETURN_CODE 77)
-  # The decomp list's instruction decoder and relocator (decomp/insn.h).
-  add_executable(decomp_insn_test tests/decomp_insn_test.cpp src/decomp/insn.cpp)
-  target_include_directories(decomp_insn_test PRIVATE src)
-  add_test(NAME decomp_insn_test COMMAND decomp_insn_test)
-  # The event-script interpreter against the game's code (skips without the eboot).
-  add_executable(sprj_emk_test tests/sprj_emk_test.cpp src/decomp/events/flag_store.cpp)
-  target_include_directories(sprj_emk_test PRIVATE include)
-  target_compile_options(sprj_emk_test PRIVATE -fno-stack-protector)
-  target_link_libraries(sprj_emk_test PRIVATE eboot_kit pthread)
-  add_test(NAME sprj_emk_test COMMAND sprj_emk_test)
-  set_tests_properties(sprj_emk_test PROPERTIES SKIP_RETURN_CODE 77)
-  # Chalice dungeons' roll, pick, map uid and pairs against the game's code.
-  add_executable(chalice_test tests/chalice_test.cpp)
-  target_compile_options(chalice_test PRIVATE -ffp-contract=off)
-  target_link_libraries(chalice_test PRIVATE eboot_kit)
-  add_test(NAME chalice_test COMMAND chalice_test)
-  set_tests_properties(chalice_test PROPERTIES SKIP_RETURN_CODE 77)
-  # The follow camera's step against the game's code (skips without the eboot).
-  add_executable(follow_camera_test tests/follow_camera_test.cpp src/decomp/camera/follow_camera.cpp)
-  target_link_libraries(follow_camera_test PRIVATE eboot_kit)
-  add_test(NAME follow_camera_test COMMAND follow_camera_test 2000)
-  set_tests_properties(follow_camera_test PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(sync_test tests/sync_test.cpp src/hle/sync.cpp src/host/main_wait.cpp)
   target_include_directories(sync_test PRIVATE src)
   target_link_libraries(sync_test PRIVATE pthread)
