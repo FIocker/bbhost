@@ -333,11 +333,15 @@ for step in sys.argv[2:]:
     elif kind == 'type':
         x('type', '--delay', '40', arg)
     elif kind == 'pan':
-        dx, secs = arg.split(',')
+        # pan:dx,secs or pan:dx:dy,secs - a relative move every 20 ms
+        d, secs = arg.split(',')
+        dx, _, dy = d.partition(':')
         t0 = time.time()
+        n = 0
         while time.time() - t0 < float(secs):
-            x('mousemove_relative', '--', dx, '0'); time.sleep(0.02)
-        print('panned', dx, secs, flush=True)
+            x('mousemove_relative', '--', dx, dy or '0'); time.sleep(0.02)
+            n += 1
+        print('panned', dx, dy or '0', 'x', n, secs, flush=True)
     elif kind == 'keyhold':
         name, secs = arg.split(',')
         if os.environ.get('WID'): x('windowactivate', '--sync', os.environ['WID'])
