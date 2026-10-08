@@ -88,13 +88,19 @@ applies to the data formats bbhost edits:
 `src/decomp/decomp.h` keeps the list. Each entry gives the function's entry
 address, the instruction bytes expected there, and the replacement.
 
-- At load, once the executable's SHA-256 is the 1.09 build's, the first 14 or
-  more bytes of the function become a jump to the replacement. A function
-  whose bytes differ from what it was written against is refused and the
-  original stays.
-- Those bytes go into a trampoline that runs them and jumps back, so the
-  original remains callable - for a compare run, and for the replacement to
-  fall back on.
+- At load, once the executable's SHA-256 is the 1.09 build's, the first 5 or
+  more bytes of the function - whole instructions - become a jump to the
+  replacement. A function whose bytes differ from what it was written against
+  is refused and the original stays.
+- Those instructions go into a trampoline that runs them and jumps back, so
+  the original remains callable - for a compare run, and for the replacement
+  to fall back on. The trampoline sits within reach of the executable, so an
+  instruction that addresses memory relative to itself, or a relative branch,
+  is re-aimed at what it reached (`src/decomp/insn.h`); a short branch is
+  widened. Every one of the executable's 162,959 functions decodes to its end
+  (or to its first jump table, which it keeps in its code), and the entries of
+  148,238 of them can be taken this way (`tests/decomp_insn_eboot_test`); the
+  rest are shorter than the 5-byte jump.
 - A **leaf** is entered directly from the game's code, on the game's thread
   and stack. It touches only the game's memory and its own globals - no host
   thread-locals, locks, logging or allocation - and is compiled without the
@@ -119,6 +125,14 @@ run, and checks the memory afterwards. A function becomes the default once a
 long world session compares with zero differences, and a session with the
 replacement in place performs within noise of one without.
 
+A function that only computes - from its arguments and memory it reads - can
+also be checked without the game: `tests/eboot_kit.h` loads the executable
+into a test the way bbhost does (relocated, its thread-local reads moved, the
+console's floating-point mode, every system call a trap that names itself),
+so the original runs there on generated inputs beside the replacement, bit for
+bit. `tests/sfx_ribbon_test` is the model: 800,000 random strips through both
+of the effect ribbons' writers. These tests skip where there is no executable.
+
 Exactness is measured against the machine code, not a decompiler's reading of
 it: shift counts masked to 5 bits, 32-bit arithmetic that wraps, exactly the
 argument bits the original tests.
@@ -128,6 +142,9 @@ argument bits the original tests.
 1. Find the function in a disassembler and name it from evidence: the
    binary's strings, Dark Souls III's RTTI (the same engine, with class names),
    the PS3 build's debug symbols, or a plain descriptive name.
+   `tools/class_catalog.cpp` lists the 882 classes the executable registers by
+   name at start, each with the vtables that hold its `GetRuntimeClass` and the
+   functions that store them (constructors and destructors).
 2. Read its disassembly as well as a decompile, and list its callers.
 3. Write it in `src/decomp/<area>.cpp` with its entry bytes and a compare mode.
 4. Register it in `src/hle/runtime.cpp` before `decomp_install`.
@@ -144,3 +161,9 @@ argument bits the original tests.
   scaling, for balance changes params cannot express.
 - **The event system's condition checks**: event-script logic as source, and
   new conditions for mods.
+- **Chalice dungeon generation**: how a glyph's seed becomes a dungeon, as
+  source - checked against the original over many seeds without the game.
+- **Item lots and shop lineups**: what enemies and chests drop and what shops
+  sell, for drop-rate and shop mods beyond the params.
+- **The talk-script runtime**: the interpreter behind the NPCs' conversations
+  (its expressions, commands and functions), so mods can add talk commands.
