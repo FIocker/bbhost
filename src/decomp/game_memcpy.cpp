@@ -19,9 +19,7 @@
 // The game's version does not return the destination (its small-size path
 // leaves a jump-table address in rax), so no caller reads the result; where
 // source and destination overlap it copies forward in blocks, memmove
-// exactly. Its entry starts with a relative branch, so the trampoline the
-// list builds would not run: there is no fallback to the game's version and
-// no compare run - a copy is checked by what it copies.
+// exactly. There is no compare run: a copy is checked by what it copies.
 #include "decomp/decomp.h"
 
 #include "core/write_watch.h"
