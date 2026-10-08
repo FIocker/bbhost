@@ -198,6 +198,19 @@ struct Gpu {
     bool has_depth_bias_clamp = false;    // VkPhysicalDeviceFeatures::depthBiasClamp
     bool has_tessellation = false;        // VkPhysicalDeviceFeatures::tessellationShader
     std::uint32_t subgroup_stages = 0;    // VkPhysicalDeviceSubgroupProperties::supportedStages
+    // Pixel shaders at wave32 (gcn/wave.h):
+    // decided at device creation (gpu.cpp), given to each fragment stage by
+    // render.cpp's fragment_stage_wave. 0: the device's own subgroup size for
+    // every stage, as before (BBHOST_PS_WAVE32=0, or a device whose subgroups
+    // are 32 wide already or that cannot be asked); 32: a required size of 32
+    // for a program that computes the same in a 32-lane subgroup
+    // (TranslateResult::wave64_needs 0), the device's size required of the
+    // others; 1: the driver chooses between 32 and its default
+    // (BBHOST_PS_WAVE32=driver, ALLOW_VARYING_SUBGROUP_SIZE).
+    std::uint32_t ps_wave = 0;
+    std::uint32_t subgroup_size = 0;                 // VkPhysicalDeviceSubgroupProperties::subgroupSize: the default
+    std::uint32_t subgroup_min = 0, subgroup_max = 0;  // VkPhysicalDeviceSubgroupSizeControlProperties
+    std::uint32_t subgroup_required_stages = 0;      // ... ::requiredSubgroupSizeStages
     bool has_gpl = false;                 // VK_EXT_graphics_pipeline_library enabled, with fast linking
     bool has_sparse = false;              // sparseBinding + sparseResidencyBuffer on a queue with SPARSE_BINDING
     // Direct memory imported as dma-bufs of the memfd (/dev/udmabuf) rather

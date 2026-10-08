@@ -2,6 +2,7 @@
 
 #include "gcn/half.h"
 #include "gcn/spirv.h"
+#include "gcn/wave.h"
 
 #include <algorithm>
 #include <atomic>
@@ -512,6 +513,21 @@ struct Translator {
     // "not traceable", and its pipeline and every draw of it were refused.
     // Keyed by (VGPR, lane); any other write to the VGPR forgets its lanes.
     std::map<std::pair<int, int>, SymVal> lane_syms;
+    // The value itself (gcn/wave.h, spill cells): a v_readlane_b32 that only
+    // the v_writelane_b32s of its (VGPR, lane) can reach since the last other
+    // write to the VGPR reads the scalar they stored, not another invocation
+    // - which holds it only where lane L has a pixel. BBHOST_SPILL_CELLS=0:
+    // every read is a shuffle, as before.
+    SpillCells spill;
+    std::map<std::pair<int, int>, Id> cell_vars;
+    Id spill_cell(int vgpr, int lane) {
+        auto [it, fresh] = cell_vars.try_emplace({vgpr, lane}, 0);
+        if (fresh) {
+            it->second = m.local_variable(p_fn_u32, c_zero_u);
+            m.name(it->second, "cell_v" + std::to_string(vgpr) + "_" + std::to_string(lane));
+        }
+        return it->second;
+    }
     static bool const_lane(std::uint16_t code, int& lane) {
         if (code < 128 || code > 192) return false;  // an inline integer 0..64
         lane = code - 128;
@@ -1159,8 +1175,15 @@ struct Translator {
             return done_u(sel(bit, s1, s0));
         }
         case 1: {  // v_readlane_b32 sdst, vsrc, lane
-            const Id lane_sel = iand(s1, cu(63));
-            const Id v = m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), s0, lane_sel});
+            int cell_lane = 0;
+            Id v;
+            if (spill.reads.count(cur_offset) && in.src0 >= 256 &&
+                const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), cell_lane)) {
+                v = ld(spill_cell(in.src0 - 256, cell_lane));  // a spilled scalar: the cell its v_writelane_b32 filled
+            } else {
+                const Id lane_sel = iand(s1, cu(63));
+                v = m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), s0, lane_sel});
+            }
             write_s(in.dst, v);
             // A spilled scalar coming back (lane_syms): its resource path too.
             int ln = 0;
@@ -1175,6 +1198,10 @@ struct Translator {
             const Id var = vgpr_var(in.dst);
             m.store(var, sel(ieq(lane(), lane_sel), s0, ld(var)));
             int ln = 0;
+            if (cur_offset < kFetchBias && !spill.cells.empty() &&
+                const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), ln) && spill.cells.count({in.dst, ln})) {
+                m.store(spill_cell(in.dst, ln), s0);  // GCN's writelane ignores EXEC: so does the cell
+            }
             if (const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), ln)) {
                 const SymVal sv = in.src0 < 104 ? sym_of(in.src0) : SymVal{};
                 if (sv.kind != SymVal::Unknown) {
@@ -3255,6 +3282,7 @@ struct Translator {
         m.extension("SPV_KHR_physical_storage_buffer");
         m.memory_model(5348 /* PhysicalStorageBuffer64 */, 1 /* GLSL450 */);
         setup_types();
+        if (spill_cells_on()) spill = spill_cells(prog);
         native_rtz = native_half_rtz() && program_allows_native_half_rtz(prog);
         if (native_rtz) {
             m.capability(spv::CapFloat16);
@@ -4168,13 +4196,18 @@ TranslateResult translate(const Program& program, const TranslateOptions& option
             again.cb_ssbo_exclude.push_back(key);
         }
     }
+    // Whether the fragment stage may run in a 32-lane subgroup (gcn/wave.h):
+    // from the program alone, the same for either translation below.
+    const std::uint32_t wave64_needs = options.stage == Stage::Pixel ? pixel_wave64_needs(program, t.spill.reads) : kWave64NotPixel;
     if (again.cb_ssbo_exclude.size() == options.cb_ssbo_exclude.size()) {
         for (const auto& [why, n] : exclusions) t.res.walks[why] += n;
+        t.res.wave64_needs = wave64_needs;
         return std::move(t.res);
     }
     Translator t2(program, again);
     t2.run();
     for (const auto& [why, n] : exclusions) t2.res.walks[why] += n;
+    t2.res.wave64_needs = wave64_needs;
     return std::move(t2.res);
 }
 

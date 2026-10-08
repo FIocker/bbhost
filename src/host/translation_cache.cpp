@@ -42,7 +42,7 @@ static_assert(sizeof(gcn::LiftResult) == 104, "a new LiftResult field: add it to
 constexpr std::uint32_t kMagic = 0x43544242;  // "BBTC"
 // The file's own layout. The translator's changes are its fingerprint's;
 // this changes only when the entries are written differently.
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 2;  // 2: wave64_needs
 // What the file may hold (compressed; it is kept in memory while the game
 // runs): past it, the entries this run did not use go first. A world run's
 // ~9,000 translations and lifts are a few tens of MiB.
@@ -302,6 +302,7 @@ void write_result(Writer& w, const gcn::TranslateResult& r, bool with_spirv) {
     w.words(r.ps_inputs);
     w.i32(r.vs_clip_count);
     w.u8(r.vs_point_size ? 1 : 0);
+    w.u32(r.wave64_needs);  // what keeps a pixel program at 64 lanes (gcn/wave.h)
 }
 
 bool read_result(Reader& r, gcn::TranslateResult& t) {
@@ -357,6 +358,7 @@ bool read_result(Reader& r, gcn::TranslateResult& t) {
     r.words(t.ps_inputs);
     t.vs_clip_count = r.i32();
     t.vs_point_size = r.u8() != 0;
+    t.wave64_needs = r.u32();
     return r.ok && r.p == r.end;
 }
 

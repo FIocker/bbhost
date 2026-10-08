@@ -11,6 +11,7 @@
 #pragma once
 
 #include "gcn/isa.h"
+#include "gcn/wave.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -356,6 +357,14 @@ struct TranslateResult {
     std::vector<std::uint32_t> ps_inputs;  // pixel stage: the inputs the shader reads (input k at location k without ps_input_map)
     int vs_clip_count = 0;
     bool vs_point_size = false;
+    // Why the program needs the 64-lane subgroup GCN wrote it for (gcn/wave.h
+    // kWave64*): 0 = a pixel shader that computes the same in a 32-lane one,
+    // kWave64NotPixel for every other stage (not analysed) - and for a result
+    // translate() did not fill in, so nothing reaches wave32 unexamined. The
+    // renderer runs the fragment stage at wave32 when it is 0 (gcn/wave.h). A
+    // typed lift (gcn/lift.h) has no cross-lane
+    // operation at all: the renderer clears it for one.
+    std::uint32_t wave64_needs = kWave64NotPixel;
     bool ok() const { return errors.empty(); }
 };
 
