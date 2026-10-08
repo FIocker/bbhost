@@ -1,6 +1,7 @@
 #include "engine/frame_pool.h"
 #include "engine/key_prompts.h"
 #include "decomp/decomp.h"
+#include "engine/mouse_camera.h"
 #include "core/config.h"
 #include "core/portable.h"
 #include "core/thunk.h"
@@ -338,6 +339,7 @@ void exit_reports() {
     frame_pool_report();
     key_prompts_report();
     decomp_report();
+    mouse_camera_report();
 }
 
 #if !defined(_WIN32)

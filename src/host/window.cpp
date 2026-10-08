@@ -75,6 +75,9 @@ unsigned g_display_w = 0, g_display_h = 0;
 std::atomic<bool> g_mouse_visible{true};
 std::atomic<bool> g_mouse_relative{false};
 std::atomic<bool> g_mouse_relative_applied{false};
+// Relative motion while the mouse turns the camera, for the camera itself
+// (engine/mouse_camera.h), under g_mouse_mu: raw counts since its last take.
+float g_cam_dx = 0.0f, g_cam_dy = 0.0f;
 // BBHOST_IME_TEST: opens the text box once at startup and again on F11.
 std::atomic<bool> g_ime_test_reopen{true};
 
@@ -1240,6 +1243,11 @@ bool host_window_pump() {
         want != g_mouse_relative_applied.load(std::memory_order_relaxed)) {
         g_mouse_relative_applied.store(want, std::memory_order_relaxed);
         SDL_SetWindowRelativeMouseMode(g_window, want);
+        {
+            // Motion from before the switch was the pointer's, not the camera's.
+            std::lock_guard<std::mutex> lock(g_mouse_mu);
+            g_cam_dx = g_cam_dy = 0.0f;
+        }
         if (!want) {
             // Leaving camera mode, the absolute position is whatever SDL
             // restored the pointer to; take it now so the first menu frame
@@ -1372,6 +1380,10 @@ bool host_window_pump() {
                 // should not have to care which mode the window is in.
                 g_mouse.dx += e.motion.xrel;
                 g_mouse.dy += e.motion.yrel;
+                if (g_mouse_relative_applied.load(std::memory_order_relaxed)) {
+                    g_cam_dx += e.motion.xrel;
+                    g_cam_dy += e.motion.yrel;
+                }
                 if (!g_mouse_relative.load(std::memory_order_relaxed)) {
                     mouse_moved_locked(e.motion.x, e.motion.y);
                 } else {
@@ -1407,6 +1419,13 @@ bool host_window_pump() {
             }
             case SDL_EVENT_MOUSE_WHEEL: {
                 note_input(InputDevice::KeyboardMouse);
+                // Rebinding: the wheel is bindable too, up and down apart
+                // (host/bindings.h), and the notch is the capture's alone.
+                if (host_bind_capturing() >= 0 && e.wheel.y != 0.0f) {
+                    // The same sign the wheel's presses read (g_mouse.wheel).
+                    if (host_bind_capture_mouse(e.wheel.y > 0.0f ? 6 : 7)) host_options_save_now();
+                    break;
+                }
                 std::lock_guard<std::mutex> lock(g_mouse_mu);
                 g_mouse.wheel += e.wheel.y;
                 g_mouse_last_motion = std::chrono::steady_clock::now();
@@ -1818,6 +1837,13 @@ MouseState host_mouse_state() {
     g_mouse.moved = false;
     g_mouse.dx = g_mouse.dy = 0.0f;
     return m;
+}
+
+void host_mouse_take_camera(float& dx, float& dy) {
+    std::lock_guard<std::mutex> lock(g_mouse_mu);
+    dx = g_cam_dx;
+    dy = g_cam_dy;
+    g_cam_dx = g_cam_dy = 0.0f;
 }
 
 bool host_mouse_position(float& x, float& y) {

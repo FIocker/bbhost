@@ -71,7 +71,17 @@ copy its files over `<data>/saves/SPRJ0005`.
 A controller works as on the console. Without one, the keyboard and mouse
 take over and the button prompts follow: the mouse turns the camera and works
 in the menus, and every action can be rebound (F10 or the game's Key Bindings
-menu). F9 opens the plugin menu and F10 bbhost's own settings.
+menu) - to a key, any of five mouse buttons, or the wheel turned up or down
+(each notch a press). F9 opens the plugin menu and F10 bbhost's own settings.
+
+The mouse turns the camera the way Dark Souls III's PC version does: by an
+angle for each count the mouse reports, 0.25 degrees at the default
+sensitivity of 5 (0.1 at 0, 0.4 at 10), with no acceleration, no dead zone
+and no top speed, at any frame rate. The right stick turns it as on the
+console, and while the stick is moving the mouse waits. With a target locked
+on, a quick flick of the mouse switches targets. Mouse sensitivity and
+inverting either axis are on the game's PC Controls page; the game's own
+Camera settings are the stick's.
 
 The character's name, a chalice glyph and the network password are typed in
 a box over the game, which stands in for the console's on-screen keyboard:

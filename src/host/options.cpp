@@ -136,7 +136,8 @@ Setting g_set[kSettingCount] = {
     {"mouse_camera", "Mouse camera", {"On", "Off"}, 0,
      "The mouse turns the camera outside menus. Off leaves it to the pad.", false},
     // 0..10, the range of the game's own Camera Sensitivity slider, which is
-    // the widget the PC Controls screen draws it with.
+    // the widget the PC Controls screen draws it with, and DS3's: the same
+    // angle a count at each step (engine/mouse_camera.h), 5 its default.
     {"mouse_sens", "Mouse sensitivity", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
      "How far a given mouse movement turns the camera.", false},
     {"mouse_invert_x", "Mouse X-axis", {"Off", "On"}, 0,
@@ -712,16 +713,9 @@ void rebuild_settings() {
     }
     h.mouse_menu = on_of(kMouseMenu);
     h.mouse_camera = on_of(kMouseCamera);
-    {
-        // Stick deflection per pixel of mouse movement in one poll. The stick
-        // is a position and the mouse gives a rate, so this is a gain, not a
-        // 1:1 mapping - the game puts its own camera curve on top and the only
-        // useful calibration is how it feels. Each step is a quarter more
-        // than the one below it; 5 is the 1.1 the old "Medium" was, and
-        // 0..10 spans 0.36..3.4.
-        const int i = index_of(kMouseSens) < 0 || index_of(kMouseSens) > 10 ? 5 : index_of(kMouseSens);
-        h.mouse_gain = 1.1f * std::pow(1.254f, static_cast<float>(i - 5));
-    }
+    // DS3's mouse sensitivity (engine/mouse_camera.h): the same 0..10 and the
+    // same default, and the same angle a count at each step.
+    h.mouse_sens = index_of(kMouseSens) < 0 || index_of(kMouseSens) > 10 ? 5 : index_of(kMouseSens);
     h.mouse_invert_x = on_of(kMouseInvertX);
     h.mouse_invert_y = on_of(kMouseInvertY);
     h.draw_cursor = on_of(kDrawCursor);

@@ -86,6 +86,7 @@ add_executable(bbhost
   src/engine/live_resolution.cpp
   src/engine/loading.cpp
   src/engine/camera.cpp
+  src/engine/mouse_camera.cpp
   src/engine/fmod_probe.cpp
   src/engine/menu_memory.cpp
   src/engine/frame_rate.cpp

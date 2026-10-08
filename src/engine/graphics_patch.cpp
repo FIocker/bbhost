@@ -6,6 +6,7 @@
 #include "core/thunk.h"
 #include "engine/addr.h"
 #include "engine/camera.h"
+#include "engine/mouse_camera.h"
 #include "engine/fmod_probe.h"
 #include "engine/frame_rate.h"
 #include "engine/live_resolution.h"
@@ -1245,6 +1246,7 @@ void graphics_patch_install(ElfImage* image) {
     menu_memory_install(image);
     frame_rate_install(image);
     camera_install(image);
+    mouse_camera_install(image);
     fmod_probe_install(image);
     sf_heap_probe_install(image);
     probe_patch(image);
