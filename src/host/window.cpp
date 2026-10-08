@@ -1252,7 +1252,7 @@ void update_pad() {
     }
     // Each pad's buttons are or-ed together, and each stick axis and trigger
     // is whichever pad pushes it furthest, so two pads never fight.
-    bool touch_done = false;
+    bool touch_done = false, back_held = false;
     for (SDL_Gamepad* g_gamepad : g_pads) {
         p.connected = true;
         auto btn = [&](SDL_GamepadButton b, std::uint32_t bit) {
@@ -1269,7 +1269,7 @@ void update_pad() {
         btn(SDL_GAMEPAD_BUTTON_LEFT_STICK, kL3);
         btn(SDL_GAMEPAD_BUTTON_RIGHT_STICK, kR3);
         btn(SDL_GAMEPAD_BUTTON_START, kOptions);
-        btn(SDL_GAMEPAD_BUTTON_BACK, kTouchPad);
+        back_held |= SDL_GetGamepadButton(g_gamepad, SDL_GAMEPAD_BUTTON_BACK);  // below, after the touchpad's own fingers
         btn(SDL_GAMEPAD_BUTTON_TOUCHPAD, kTouchPad);
         btn(SDL_GAMEPAD_BUTTON_DPAD_UP, kUp);
         btn(SDL_GAMEPAD_BUTTON_DPAD_DOWN, kDown);
@@ -1325,6 +1325,21 @@ void update_pad() {
                 t.id = held_id[slot];
                 t.down = true;
             }
+        }
+    }
+    // Back / Select / Share is the touchpad's left side - Gestures - on pads
+    // without a touchpad and on those with one alike: the press, and a finger
+    // where the keyboard's Gestures key puts one (bindings.cpp), since the game
+    // reads the side from the finger. Its own stable id, so holding it is one
+    // touch and it can be held with the key.
+    if (back_held) {
+        p.buttons |= kTouchPad;
+        if (p.touch_count < 2) {
+            PadState::Touch& t = p.touch[p.touch_count++];
+            t.x = static_cast<std::uint16_t>(kPadTouchW / 4);
+            t.y = static_cast<std::uint16_t>(kPadTouchH / 2);
+            t.id = 201;
+            t.down = true;
         }
     }
     // The keyboard, DS3-shaped and rebindable (host/bindings.h): each action
