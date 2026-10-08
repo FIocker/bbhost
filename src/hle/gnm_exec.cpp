@@ -2008,7 +2008,7 @@ void cp_thread(Queue* q, int id) {
         // two three-minute soaks, and a walk that found every block still
         // waiting was an allocation that failed - a draw whose tables pointed
         // at address 0 (black frames, black icons, particles pulled across the
-        // screen: decomp/gx_block_reclaim.cpp). Submitting every job: none, at
+        // screen: decomp/gx/block_reclaim.cpp). Submitting every job: none, at
         // no measurable cost (main-loop work 10.74 and 11.35 ms a frame
         // against 11.48 and 11.03, pinned). When this
         // merged (77e6dc5, 2026-09-12) each submission cost ~7 s per 300 world

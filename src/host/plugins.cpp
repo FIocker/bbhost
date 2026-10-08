@@ -10,7 +10,7 @@
 #include "engine/frame_rate.h"
 #include "engine/graphics_patch.h"
 #include "engine/image_text.h"
-#include "decomp/sprj_event_flag_man.h"
+#include "decomp/events/flag_store.h"
 #include "gcn/container.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"

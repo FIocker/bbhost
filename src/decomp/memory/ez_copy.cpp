@@ -12,7 +12,7 @@
 // the write-watch faults already gone, ~800-1,000 ms before).
 //
 // Ours copies at once on the calling thread - the destination's watched
-// pages released first, as decomp/game_memcpy.cpp does - and hands back no
+// pages released first, as decomp/memory/game_memcpy.cpp does - and hands back no
 // group, which the caller already takes for "nothing to wait for": the job
 // is queued as before, its data in place.
 #include "decomp/decomp.h"

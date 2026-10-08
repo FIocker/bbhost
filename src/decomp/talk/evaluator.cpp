@@ -6,7 +6,7 @@
 //
 // An expression is bytecode (engine/esd.h writes it): one byte per opcode,
 // literals inline, ended by 0xa1. It runs on a context the machine's Update
-// keeps on its stack (decomp/talk_script.h): 64 values, 8 registers, a stack
+// keeps on its stack (decomp/talk/evaluator.h): 64 values, 8 registers, a stack
 // pointer. The game dispatches each opcode through a table of 256 handlers
 // (0x56c8880); ours is one switch over the same handlers' semantics:
 //
@@ -50,7 +50,7 @@
 //          saved register): ours gives the call room for eight
 // The 68 handlers at 0xbc-0xff (push an int, then its "%d" as a string) are
 // used by no script; ours runs the game's own handler for them.
-#include "decomp/talk_script.h"
+#include "decomp/talk/evaluator.h"
 
 #include "core/tls_rewrite.h"
 #include "decomp/decomp.h"
@@ -719,7 +719,7 @@ void report() {
 }  // namespace
 }  // namespace talk_script
 
-void decomp_talk_script_add() {
+void decomp_talk_evaluator_add() {
     using namespace talk_script;
     DecompFunction f{"sub_2b73910", "Talk (NPCs)", 0x2b73910, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&evaluate),
                      DecompKind::Leaf, &g_game, reinterpret_cast<void*>(&compare), &g_cmp};

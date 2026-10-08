@@ -1,9 +1,9 @@
-// The effect ribbons' writers (decomp/sfx_ribbon.cpp) against the game's own
+// The effect ribbons' writers (decomp/sfx/ribbons.cpp) against the game's own
 // code (tests/eboot_kit.h): sub_2cce7b0 and sub_2cceec0 run in the loaded
 // eboot on the same random strips as ours, every byte of the vertices
 // compared, under the console's floating-point mode. Skips without the 1.09
 // eboot (BBHOST_EBOOT, or eboot-109-decrypted.bin in the checkout).
-#include "../src/decomp/sfx_ribbon.cpp"
+#include "../src/decomp/sfx/ribbons.cpp"
 
 #include "eboot_kit.h"
 
