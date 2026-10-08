@@ -15,9 +15,6 @@
 
 #include <sys/mman.h>
 
-std::uint64_t g_decomp_slide = 0x400000;
-void decomp_add(const DecompFunction&) {}
-bool decomp_comparing() { return false; }
 
 namespace {
 
@@ -40,10 +37,10 @@ void reset() {
     g_used = 0;
 }
 
-i32 any_int() {
+s32 any_int() {
     switch (g_rng.range(0, 9)) {
     case 0: return 0;
-    case 1: return static_cast<i32>(g_rng.u32());
+    case 1: return static_cast<s32>(g_rng.u32());
     case 2: return g_rng.range(-3, 3);
     case 3: return kEchoCap - g_rng.range(-3, 3);
     case 4: return g_rng.chance(0.5) ? INT32_MAX - g_rng.range(0, 3) : INT32_MIN + g_rng.range(0, 3);
@@ -60,23 +57,23 @@ u32 any_flag() {
 // An effects holder with 0-6 nodes; `kinds` are the stateInfos to mix in.
 u64 effects() {
     const u64 holder = alloc(0x40);
-    st<u8>(holder + 0x21, static_cast<u8>(g_rng.chance(0.8) ? 0x70 & g_rng.u32() : g_rng.u32()));
-    st<u8>(holder + 0x22, static_cast<u8>(g_rng.chance(0.8) ? 0xe0 & g_rng.u32() : g_rng.u32()));
+    store<u8>(holder + 0x21, static_cast<u8>(g_rng.chance(0.8) ? 0x70 & g_rng.u32() : g_rng.u32()));
+    store<u8>(holder + 0x22, static_cast<u8>(g_rng.chance(0.8) ? 0xe0 & g_rng.u32() : g_rng.u32()));
     u64* link = reinterpret_cast<u64*>(holder + kFirst);
     const int n = g_rng.chance(0.15) ? 0 : g_rng.range(1, 6);
     for (int i = 0; i < n; ++i) {
         const u64 node = alloc(0x60);
-        st<u32>(node + kState, g_rng.chance(0.7) ? 0 : (g_rng.chance(0.5) ? g_rng.u32() : (1u << g_rng.range(0, 31))));
+        store<u32>(node + kState, g_rng.chance(0.7) ? 0 : (g_rng.chance(0.5) ? g_rng.u32() : (1u << g_rng.range(0, 31))));
         if (!g_rng.chance(0.2)) {
             const u64 p = alloc(0x200);
-            st<float>(p + kSoulRate, g_rng.value(-1, 4));
-            st<float>(p + kHaveSoulRate, g_rng.value(-1, 4));
+            store<float>(p + kSoulRate, g_rng.value(-1, 4));
+            store<float>(p + kHaveSoulRate, g_rng.value(-1, 4));
             static const u16 kKinds[] = {kStateDiscovery, kStateGathering, 0, 0x41, 0x43, 0x71, 0x73};
-            st<u16>(p + kStateInfo,
+            store<u16>(p + kStateInfo,
                     g_rng.chance(0.8) ? kKinds[g_rng.range(0, 6)] : static_cast<u16>(g_rng.u32()));
-            st<u8>(p + kClearBonusByte, static_cast<u8>(g_rng.u32()));
-            st<float>(p + kItemDropRate, g_rng.value(-1, 2));
-            st<u64>(node + kParam, p);
+            store<u8>(p + kClearBonusByte, static_cast<u8>(g_rng.u32()));
+            store<float>(p + kItemDropRate, g_rng.value(-1, 2));
+            store<u64>(node + kParam, p);
         }
         *link = node;
         link = reinterpret_cast<u64*>(node + kNext);
@@ -98,14 +95,14 @@ extern "C" u64 stub_is_local(u64 self) {
     g_calls.push_back({1, self, 0, 0, 0});
     return g_local_rax;
 }
-extern "C" void stub_gain(u64 self, i32 amount, i32 third, u32 rates) {
+extern "C" void stub_gain(u64 self, s32 amount, s32 third, u32 rates) {
     g_calls.push_back({2, self, static_cast<u32>(amount), static_cast<u32>(third), rates});
 }
 extern "C" u64 stub_kill_record(u64 a, u64 b, u32 c, u32 d) {
     g_calls.push_back({3, a, b, c, d});
     return g_kill_rax;
 }
-extern "C" void stub_param_row(ParamRef* out, i32 id) {
+extern "C" void stub_param_row(ParamRef* out, s32 id) {
     g_calls.push_back({4, static_cast<u32>(id), 0, 0, 0});
     out->id = id;
     out->row = g_row;
@@ -127,25 +124,25 @@ void redirect(u64 bn, void* to) {
 // a record or none.
 u64 player(u64 holder, u64 rec) {
     const u64 vt = alloc(0x800);
-    st<u64>(vt + 0x1b8, reinterpret_cast<u64>(&stub_is_local));
-    st<u64>(vt + 0x3d0, reinterpret_cast<u64>(&stub_gain));
+    store<u64>(vt + 0x1b8, reinterpret_cast<u64>(&stub_is_local));
+    store<u64>(vt + 0x3d0, reinterpret_cast<u64>(&stub_gain));
     const u64 p = alloc(0x400);
-    st<u64>(p, vt);
-    st<u64>(p + 0x1c8, holder);
-    st<u64>(p + 0x3c0, rec);
+    store<u64>(p, vt);
+    store<u64>(p + 0x1c8, holder);
+    store<u64>(p + 0x3c0, rec);
     return p;
 }
 
 u64 record() {
     const u64 r = alloc(0x100);
-    st<i32>(r + kInsight, g_rng.chance(0.5) ? g_rng.range(0, 99) : any_int());
-    st<i32>(r + kEchoes, any_int());
-    st<u64>(r + kEchoesEver, g_rng.chance(0.5) ? static_cast<u64>(static_cast<u32>(any_int())) : g_rng.next());
-    st<i32>(r + kEchoesGathered, any_int());
+    store<s32>(r + kInsight, g_rng.chance(0.5) ? g_rng.range(0, 99) : any_int());
+    store<s32>(r + kEchoes, any_int());
+    store<u64>(r + kEchoesEver, g_rng.chance(0.5) ? static_cast<u64>(static_cast<u32>(any_int())) : g_rng.next());
+    store<s32>(r + kEchoesGathered, any_int());
     return r;
 }
 
-void slot(u64 bn, u64 value) { st<u64>(bn, value); }
+void slot(u64 bn, u64 value) { store<u64>(bn, value); }
 
 // ---- One case: the game's, then ours, from the same state -------------------
 
@@ -189,10 +186,10 @@ bool same_case(const char* name, int c, Game game, Ours ours) {
 }
 
 using DiscoveryGame = float (*)(u64, float);
-using GainGame = void (*)(u64, i32, i32, u32);
+using GainGame = void (*)(u64, s32, s32, u32);
 using KillGame = u64 (*)(u64, u64, u32, u32, float);
-using PenaltyGame = u64 (*)(u64, i32, float);
-using PriceGame = u64 (*)(u64, const i32*, const i32*);
+using PenaltyGame = u64 (*)(u64, s32, float);
+using PriceGame = u64 (*)(u64, const s32*, const s32*);
 
 int discovery_cases(int n) {
     int bad = 0;
@@ -214,12 +211,12 @@ int gain_cases(int n) {
     for (int c = 0; c < n; ++c) {
         reset();
         const u64 menu = alloc(0x300);
-        st<i32>(menu + 0x20c, any_int());
-        st<i32>(menu + 0x210, any_int());
+        store<s32>(menu + 0x20c, any_int());
+        store<s32>(menu + 0x210, any_int());
         slot(kMenuMan, menu);
         const u64 p = player(effects(), g_rng.chance(0.1) ? 0 : record());
         g_local_rax = (g_rng.next() & ~0xffull) | (g_rng.chance(0.8) ? 1 : (g_rng.chance(0.5) ? 0 : 0x80));
-        const i32 amount = any_int(), third = any_int();
+        const s32 amount = any_int(), third = any_int();
         const u32 rates = any_flag();
         bad += !same_case("PlayerIns::vf122", c, [&](Run&) { eboot_kit::fn<GainGame>(0x1cfc600)(p, amount, third, rates); },
                           [&](Run&) { add_echoes(p, amount, third, rates); });
@@ -232,14 +229,14 @@ int kill_cases(int n) {
     for (int c = 0; c < n; ++c) {
         reset();
         const u64 man = alloc(0x100);
-        static const i32 kClears[] = {0, 1, 2, 3, 4, 5, 6, 7, 9, -1, INT32_MIN, INT32_MAX};
-        st<i32>(man + 0x68, kClears[g_rng.range(0, 11)]);
+        static const s32 kClears[] = {0, 1, 2, 3, 4, 5, 6, 7, 9, -1, INT32_MIN, INT32_MAX};
+        store<s32>(man + 0x68, kClears[g_rng.range(0, 11)]);
         slot(kGameDataMan, man);
         const u64 p = player(effects(), record());
         u64 victim = 0;
         if (!g_rng.chance(0.1)) {
             victim = alloc(0x400);
-            st<u64>(victim + 0x1c8, effects());
+            store<u64>(victim + 0x1c8, effects());
         }
         g_kill_rax = g_rng.next();
         const u32 coop = any_flag(), halve = any_flag();
@@ -256,11 +253,11 @@ int penalty_cases(int n) {
     for (int c = 0; c < n; ++c) {
         reset();
         const u64 man = alloc(0x100);
-        st<u64>(man + 0x8, g_rng.chance(0.1) ? 0 : record());
+        store<u64>(man + 0x8, g_rng.chance(0.1) ? 0 : record());
         slot(kGameDataMan, man);
         slot(kLuaEventMan, g_rng.chance(0.1) ? 0 : alloc(0x10));
         const u64 a0 = g_rng.next();
-        const i32 insight = g_rng.chance(0.6) ? g_rng.range(0, 10) : any_int();
+        const s32 insight = g_rng.chance(0.6) ? g_rng.range(0, 10) : any_int();
         const float share = g_rng.chance(0.6) ? 1.0f : g_rng.value(-0.5f, 1.5f);
         bad += !same_case("lua_cli_ExcutePenalty", c,
                           [&](Run& r) { r.ret = eboot_kit::fn<PenaltyGame>(0x1734e40)(a0, insight, share); },
@@ -275,43 +272,43 @@ int price_cases(int n) {
         reset();
         const u64 man = alloc(0x100);
         const u64 rec = record();
-        st<u64>(man + 0x8, rec);
+        store<u64>(man + 0x8, rec);
         slot(kGameDataMan, man);
         const u64 screen = alloc(0x1000);
-        st<i32>(screen + 0xe94, g_rng.chance(0.8) ? g_rng.range(1, 700) : any_int());
-        st<i32>(screen + 0xeb0, g_rng.chance(0.5) ? 0 : any_int());
+        store<s32>(screen + 0xe94, g_rng.chance(0.8) ? g_rng.range(1, 700) : any_int());
+        store<s32>(screen + 0xeb0, g_rng.chance(0.5) ? 0 : any_int());
         const u64 floor = alloc(0x10);
-        st<i32>(floor, g_rng.range(0, 99));
+        store<s32>(floor, g_rng.range(0, 99));
         const u64 ctx = alloc(0x20);
-        st<u64>(ctx + 0x8, screen);
-        st<u64>(ctx + 0x10, floor);
+        store<u64>(ctx + 0x8, screen);
+        store<u64>(ctx + 0x10, floor);
         g_row = 0;
         if (!g_rng.chance(0.15)) {
             g_row = alloc(0x60);
-            st<float>(g_row + 0x3c, g_rng.value(-2, 2));
-            st<float>(g_row + 0x40, g_rng.value(-100, 5000));
-            st<float>(g_row + 0x44, g_rng.value(-1, 1));
-            st<float>(g_row + 0x48, g_rng.value(-100, 300));
+            store<float>(g_row + 0x3c, g_rng.value(-2, 2));
+            store<float>(g_row + 0x40, g_rng.value(-100, 5000));
+            store<float>(g_row + 0x44, g_rng.value(-1, 1));
+            store<float>(g_row + 0x48, g_rng.value(-100, 300));
         }
         const u64 from = alloc(0x10), to = alloc(0x10);
-        st<i32>(from, g_rng.chance(0.9) ? g_rng.range(0, 99) : any_int());
-        st<i32>(to, g_rng.chance(0.9) ? g_rng.range(0, 101) : any_int());
-        const auto* f = reinterpret_cast<const i32*>(from);
-        const auto* t = reinterpret_cast<const i32*>(to);
+        store<s32>(from, g_rng.chance(0.9) ? g_rng.range(0, 99) : any_int());
+        store<s32>(to, g_rng.chance(0.9) ? g_rng.range(0, 101) : any_int());
+        const auto* f = reinterpret_cast<const s32*>(from);
+        const auto* t = reinterpret_cast<const s32*>(to);
         const auto game = eboot_kit::fn<PriceGame>(0x1f2f5e0);
         // Where the answer turns: the fewest echoes the game's version calls
         // enough (a binary search on its own answers), so ours is checked at
         // the price itself and either side of it, not only far from it.
         if (*t > *f && *t <= 99 && g_rng.chance(0.5)) {
-            st<i32>(screen + 0xeb0, 0);
+            store<s32>(screen + 0xeb0, 0);
             std::int64_t lo = INT32_MIN, hi = INT32_MAX;
             while (lo < hi) {
                 const std::int64_t mid = lo + (hi - lo) / 2;
-                st<i32>(rec + kEchoes, static_cast<i32>(mid));
+                store<s32>(rec + kEchoes, static_cast<s32>(mid));
                 if (static_cast<u32>(game(ctx, f, t)) == static_cast<u32>(*t)) hi = mid;
                 else lo = mid + 1;
             }
-            st<i32>(rec + kEchoes, static_cast<i32>(lo + g_rng.range(lo > INT32_MIN ? -1 : 0, lo < INT32_MAX ? 1 : 0)));
+            store<s32>(rec + kEchoes, static_cast<s32>(lo + g_rng.range(lo > INT32_MIN ? -1 : 0, lo < INT32_MAX ? 1 : 0)));
             ++g_price_edges;
         }
         bad += !same_case("sub_1f2f5e0", c, [&](Run& r) { r.ret = game(ctx, f, t); },

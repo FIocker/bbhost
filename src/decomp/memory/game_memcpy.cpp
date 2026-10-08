@@ -21,6 +21,7 @@
 // source and destination overlap it copies forward in blocks, memmove
 // exactly. There is no compare run: a copy is checked by what it copies.
 #include "decomp/decomp.h"
+#include "decomp/guest.h"
 
 #include "core/write_watch.h"
 
@@ -30,9 +31,9 @@
 
 #include "log.h"
 
-namespace {
+using namespace decomp;
 
-using ull = unsigned long long;
+namespace {
 
 // cmp rdx, 0x201; jb +0x29; mov rax, rdi; and rax, 0xf (16 bytes, whole
 // instructions; the jb is why `original` stays unset).
