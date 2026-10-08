@@ -753,6 +753,32 @@ void hle_video_set_fps_cap(int fps) {
     g_fps_cap.store(fps);
 }
 
+// A loading screen's flips complete at once, so the loaders, which step once a
+// frame, run as fast as the machine allows (engine/loading.h; KyoPS4x #225,
+// #235, #238). The window needs none of the extra frames, and each one shown
+// was a blit and a present: ~300 a second through a load on the Radeon 8060S,
+// bb-present at 53-58% of a core and the load's seconds at 450-540% CPU. So
+// a loading frame is shown at most once a frame period of the game's pace
+// (the display's refresh when it runs uncapped); the rest complete unshown.
+// Their work is on the GPU already (the command processor submits after
+// every job), only the copy to the window is left out.
+static std::atomic<std::uint64_t> g_loading_shown_ns{0};
+static std::atomic<std::uint64_t> g_loading_unshown{0};
+static bool loading_show_due(std::uint64_t now_ns) {
+    const int pace = g_game_pace.load(std::memory_order_relaxed);
+    float hz = pace > 0 ? static_cast<float>(pace) : host_window_refresh_hz();
+    if (hz < 30.0f) hz = 60.0f;
+    const auto period = static_cast<std::uint64_t>(1e9f / hz);
+    // An eighth of slack: frames ~3 ms apart still land a 60 pace on 60.
+    if (now_ns - g_loading_shown_ns.load(std::memory_order_relaxed) < period - period / 8) {
+        g_loading_unshown.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    g_loading_shown_ns.store(now_ns, std::memory_order_relaxed);
+    return true;
+}
+std::uint64_t hle_video_loading_unshown() { return g_loading_unshown.load(std::memory_order_relaxed); }
+
 void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool recorded) {
     // Called from the CP thread once it has recorded the frame's GPU work
     // (not once the GPU has run it: BBHOST_FLIP_AFTER_GPU). The flip is
@@ -835,7 +861,10 @@ void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool record
         dw = p->display_w;
         dh = p->display_h;
     }
-    present_flip(buffer, display_va, dw, dh, count, mark, false, flip);
+    // BBHOST_UNCAP's flips (benchmarks) are all shown; a loading screen's when
+    // due (loading_show_due). `shown` true: present_flip leaves the window be.
+    const bool unshown = !g_flip_uncapped.load() && !loading_show_due(flip.arrived_ns);
+    present_flip(buffer, display_va, dw, dh, count, mark, unshown, flip);
 }
 
 void hle_video_detach_equeue(HostEqueue* eq) {
