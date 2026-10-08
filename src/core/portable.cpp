@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <vector>
 
@@ -73,6 +74,21 @@ std::uint64_t host_process_cpu_ms() {
     getrusage(RUSAGE_SELF, &ru);
     return static_cast<std::uint64_t>(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000 +
            static_cast<std::uint64_t>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) / 1000;
+#endif
+}
+
+std::uint64_t host_thread_cpu_ns() {
+#if defined(_WIN32)
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+    const auto to64 = [](const FILETIME& f) {
+        return (static_cast<std::uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime;
+    };
+    return (to64(k) + to64(u)) * 100;  // 100 ns units
+#else
+    timespec ts{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(ts.tv_nsec);
 #endif
 }
 

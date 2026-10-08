@@ -371,6 +371,10 @@ struct Gpu {
     VkDescriptorPool bindless_pool = VK_NULL_HANDLE;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;
     bool present_capable = false;
+    // VK_KHR_present_mode_fifo_latest_ready (or its EXT original) with its
+    // feature on: the presenter may ask for FIFO_LATEST_READY (window.cpp).
+    // The extension's name, or null.
+    const char* fifo_latest_ready_ext = nullptr;
     // Stage parameter ring: one block per queued dispatch/draw stage.
     VkBuffer ubo = VK_NULL_HANDLE;
     VkDeviceMemory ubo_mem = VK_NULL_HANDLE;

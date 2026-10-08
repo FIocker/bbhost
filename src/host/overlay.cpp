@@ -9,6 +9,7 @@
 #include "host/overlay_font.h"
 #include "host/overlay_spv.h"
 
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -21,8 +22,16 @@ struct Vertex {
     float r, g, b, a;
 };
 
+// Two lists: the window's pump builds the next one in g_verts from
+// host_overlay_reset() on, and host_overlay_commit() hands it to the presenter
+// as g_shown. With one list a present that landed between the reset and the
+// rebuild found it empty, and the FPS counter blinked out for that frame.
+// g_shown_count lets a present with nothing to draw find that out without the
+// lock: what a hidden overlay costs the presenter is one atomic load.
 std::mutex g_mu;
-std::vector<Vertex> g_verts;  // rebuilt every frame by the game-side callers
+std::vector<Vertex> g_verts;  // being built by the pump (under g_mu)
+std::vector<Vertex> g_shown;  // what presents draw (under g_mu)
+std::atomic<std::size_t> g_shown_count{0};
 
 // Presenter-owned, created once for the swapchain's format.
 VkDevice g_device = VK_NULL_HANDLE;
@@ -85,10 +94,13 @@ void host_overlay_reset() {
     g_verts.clear();
 }
 
-bool host_overlay_empty() {
+void host_overlay_commit() {
     std::lock_guard<std::mutex> lk(g_mu);
-    return g_verts.empty();
+    g_shown.swap(g_verts);
+    g_shown_count.store(g_shown.size(), std::memory_order_release);
 }
+
+bool host_overlay_empty() { return g_shown_count.load(std::memory_order_acquire) == 0; }
 
 void host_overlay_tri(float x0, float y0, float x1, float y1, float x2, float y2, std::uint32_t rgba) {
     std::lock_guard<std::mutex> lk(g_mu);
@@ -411,19 +423,38 @@ void host_overlay_shutdown(VkDevice device) {
     g_atlas_mem = VK_NULL_HANDLE;
 }
 
+std::uint32_t host_overlay_record(VkCommandBuffer cmd, VkRect2D area, float display_w, float display_h) {
+    if (host_overlay_empty() || !g_pipeline || !g_vbo_map || display_w <= 0.0f || display_h <= 0.0f) return 0;
+    std::uint32_t count = 0;
+    {
+        // Straight into the vertex buffer: the presenter's fence says the GPU
+        // is done with what the last frame drew from it.
+        std::lock_guard<std::mutex> lk(g_mu);
+        const VkDeviceSize bytes = g_shown.size() * sizeof(Vertex);
+        if (g_shown.empty() || bytes > g_vbo_bytes) return 0;
+        std::memcpy(g_vbo_map, g_shown.data(), bytes);
+        count = static_cast<std::uint32_t>(g_shown.size());
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout, 0, 1, &g_dset, 0, nullptr);
+    VkViewport vp{static_cast<float>(area.offset.x), static_cast<float>(area.offset.y), static_cast<float>(area.extent.width),
+                  static_cast<float>(area.extent.height), 0.0f, 1.0f};
+    VkRect2D sc = area;
+    vkCmdSetViewport(cmd, 0, 1, &vp);
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+    const float inv[2] = {1.0f / display_w, 1.0f / display_h};
+    vkCmdPushConstants(cmd, g_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(inv), inv);
+    const VkDeviceSize off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &g_vbo, &off);
+    vkCmdDraw(cmd, count, 1, 0, 0);
+    return count;
+}
+
 bool host_overlay_draw(VkDevice device, VkCommandBuffer cmd, VkImage image, VkImageView view, VkExtent2D extent, VkRect2D area,
                        float display_w, float display_h) {
     (void)image;
-    std::vector<Vertex> verts;
-    {
-        std::lock_guard<std::mutex> lk(g_mu);
-        verts = g_verts;
-    }
-    if (verts.empty() || !g_pipeline || !g_vbo_map || display_w <= 0.0f || display_h <= 0.0f) return false;
-    const VkDeviceSize bytes = verts.size() * sizeof(Vertex);
-    if (bytes > g_vbo_bytes) return false;
-    std::memcpy(g_vbo_map, verts.data(), bytes);
-
+    (void)device;
+    if (host_overlay_empty() || !g_pipeline || !g_vbo_map || display_w <= 0.0f || display_h <= 0.0f) return false;
     VkRenderingAttachmentInfo att{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     att.imageView = view;
     att.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -436,19 +467,7 @@ bool host_overlay_draw(VkDevice device, VkCommandBuffer cmd, VkImage image, VkIm
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &att;
     vkCmdBeginRendering(cmd, &ri);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout, 0, 1, &g_dset, 0, nullptr);
-    VkViewport vp{static_cast<float>(area.offset.x), static_cast<float>(area.offset.y), static_cast<float>(area.extent.width),
-                  static_cast<float>(area.extent.height), 0.0f, 1.0f};
-    VkRect2D sc = area;
-    vkCmdSetViewport(cmd, 0, 1, &vp);
-    vkCmdSetScissor(cmd, 0, 1, &sc);
-    const float inv[2] = {1.0f / display_w, 1.0f / display_h};
-    vkCmdPushConstants(cmd, g_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(inv), inv);
-    const VkDeviceSize off = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &g_vbo, &off);
-    vkCmdDraw(cmd, static_cast<std::uint32_t>(verts.size()), 1, 0, 0);
+    const bool drew = host_overlay_record(cmd, area, display_w, display_h) != 0;
     vkCmdEndRendering(cmd);
-    (void)device;
-    return true;
+    return drew;
 }
