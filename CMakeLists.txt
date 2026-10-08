@@ -77,6 +77,7 @@ add_executable(bbhost
   src/engine/five_players.cpp
   src/engine/maiden_events.cpp
   src/decomp/decomp.cpp
+  src/decomp/insn.cpp
   src/decomp/sprj_event_flag_man.cpp
   src/decomp/gx_flush_wait.cpp
   src/decomp/gx_block_reclaim.cpp
@@ -370,14 +371,31 @@ if(UNIX)
   target_include_directories(write_watch_test PRIVATE src)
   target_link_libraries(write_watch_test PRIVATE pthread)
   add_test(NAME write_watch_test COMMAND write_watch_test)
+  # The 1.09 eboot for tests that read or run the game's own code
+  # (tests/eboot_kit.h): bbhost's own loader, every import a trap. The tests
+  # built on it skip (77) without the eboot.
+  add_library(eboot_kit STATIC tests/eboot_kit.cpp src/core/elf.cpp src/core/memory.cpp src/core/sha256.cpp
+              src/core/tls_rewrite.cpp)
+  target_include_directories(eboot_kit PUBLIC src tests)
+  target_compile_definitions(eboot_kit PRIVATE BBHOST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  # decomp/insn.cpp over every function of the eboot.
+  add_executable(decomp_insn_eboot_test tests/decomp_insn_eboot_test.cpp src/decomp/insn.cpp)
+  target_link_libraries(decomp_insn_eboot_test PRIVATE eboot_kit)
+  add_test(NAME decomp_insn_eboot_test COMMAND decomp_insn_eboot_test)
+  set_tests_properties(decomp_insn_eboot_test PROPERTIES SKIP_RETURN_CODE 77)
+  # The engine's classes by the names they register (tools/class_catalog.cpp).
+  add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
+  target_link_libraries(class_catalog PRIVATE eboot_kit)
   # The effect ribbons' writers against the game's code (skips without the eboot).
-  add_executable(sfx_ribbon_test tests/sfx_ribbon_test.cpp src/core/write_watch.cpp src/core/sha256.cpp)
-  target_include_directories(sfx_ribbon_test PRIVATE src)
-  target_compile_definitions(sfx_ribbon_test PRIVATE BBHOST_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+  add_executable(sfx_ribbon_test tests/sfx_ribbon_test.cpp src/core/write_watch.cpp)
   target_compile_options(sfx_ribbon_test PRIVATE -ffp-contract=off)
-  target_link_libraries(sfx_ribbon_test PRIVATE pthread)
+  target_link_libraries(sfx_ribbon_test PRIVATE eboot_kit pthread)
   add_test(NAME sfx_ribbon_test COMMAND sfx_ribbon_test)
   set_tests_properties(sfx_ribbon_test PROPERTIES SKIP_RETURN_CODE 77)
+  # The decomp list's instruction decoder and relocator (decomp/insn.h).
+  add_executable(decomp_insn_test tests/decomp_insn_test.cpp src/decomp/insn.cpp)
+  target_include_directories(decomp_insn_test PRIVATE src)
+  add_test(NAME decomp_insn_test COMMAND decomp_insn_test)
   add_executable(sync_test tests/sync_test.cpp src/hle/sync.cpp src/host/main_wait.cpp)
   target_include_directories(sync_test PRIVATE src)
   target_link_libraries(sync_test PRIVATE pthread)
