@@ -26,6 +26,10 @@ void hle_fs_set_generated_root(const char* dir);
 // (engine/change_appearance.h): a feature that is off adds none. At start,
 // before the game reads a file.
 void hle_fs_add_generated_root(const char* dir);
+// The /app0 lookups since the last call and how many went to the disk for a
+// generated overlay or were answered by its index (hle/fs.cpp, OverlayIndex),
+// for the 300-flip report; empty when there were none.
+std::string hle_fs_overlay_report();
 // A plugin's overlay (plugins' overlay_file): read behind the player's mods
 // and ahead of the generated files and the dump. Plugins added first win.
 void hle_fs_add_plugin_overlay(const char* dir);

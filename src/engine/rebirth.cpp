@@ -15,7 +15,10 @@
 #include "hle/fs.h"
 #include "log.h"
 
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -52,6 +55,25 @@ Build g_snapshot;          // the hunter before the rebirth, for "Undo Rebirth"
 std::uint64_t g_menu = 0;  // the level-up menu's step, while we hold a reference
 int g_menu_wait = 0;
 int g_said = 0;
+
+// The tick costs what the feature is used for. The altar's talk script is in
+// m24_02's talk archive, so the handshake's flags are only ever set while the
+// hunter is in that map (kAltarBlock): anywhere else a frame reads where the
+// hunter is (three guarded reads) and nothing more. It used to read three
+// flags every frame of the game, wherever the hunter was - each a walk of the
+// event-flag store's map through host_read_safe, which is ReadProcessMemory
+// on Windows (~0.4 us a call, a few dozen calls a walk). In the altar's map
+// the three share one walk (event_flags_get). Coming into the map clears the
+// four flags, as every load still does (a request a save carried over is
+// not one), and leaving it ends a handshake as a load does.
+// BBHOST_REBIRTH_EVERYWHERE=1: every frame in every map, as before.
+const bool g_everywhere = [] {
+    const char* e = std::getenv("BBHOST_REBIRTH_EVERYWHERE");
+    return e && e[0] == '1';
+}();
+bool g_at_altar = false;  // the last frame with a world was in the altar's map
+std::atomic<std::uint64_t> g_frames_read{0}, g_frames_skipped{0};
+int g_moves_said = 0;
 
 std::uint64_t slot(std::uint64_t bn) { return g_slide + (bn - kPreferredGuestSlide); }
 void* code(std::uint64_t a) { return reinterpret_cast<void*>(static_cast<std::uintptr_t>(a)); }
@@ -206,22 +228,56 @@ void rebirth_tick() {
         return;
     }
     using namespace rebirth;
-    if (g_loading) {  // a world came (back): a request a save carried over is not one
-        g_loading = false;
+    // The handshake starts over: its flags cleared, the undo forgotten, the
+    // level-up menu let go.
+    const auto start_over = [] {
         for (const std::uint32_t id : {kReqReset, kReqUndo, kFail, kMenu}) set_flag(id, false);
         g_have_snapshot = false;
         if (g_menu) menu_step_release(g_menu), g_menu = 0;
+    };
+    const bool here = block == kAltarBlock;
+    const auto arrive = [here, block] {
+        if (here != g_at_altar && !g_everywhere && g_moves_said++ < 16) {
+            host_log(here ? "rebirth: in the Altar of Despair's map (0x%08x) - its talk script's flags are read each frame"
+                          : "rebirth: out of the Altar of Despair's map (now 0x%08x) - its flags are not read",
+                     block);
+        }
+        g_at_altar = here;
+    };
+    if (g_loading) {  // a world came (back): a request a save carried over is not one
+        g_loading = false;
+        arrive();
+        start_over();
         return;
     }
-    if (flag(kReqReset)) {
-        if (block != kAltarBlock || !reset()) set_flag(kFail, true);
+    if (!g_everywhere) {
+        if (here != g_at_altar) {  // walked into the map or out of it
+            arrive();
+            start_over();
+            return;
+        }
+        if (!here) {
+            g_frames_skipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    g_frames_read.fetch_add(1, std::memory_order_relaxed);
+    const std::uint32_t ids[3] = {kReqReset, kReqUndo, kMenu};
+    bool on[3] = {false, false, false};
+    if (g_everywhere) {
+        for (int i = 0; i < 3; ++i) on[i] = flag(ids[i]);
+    } else if (!event_flags_get(ids, 3, on)) {
+        return;  // the store has no such block (yet): nothing was asked
+    }
+    if (on[0]) {
+        if (!here || !reset()) set_flag(kFail, true);
         set_flag(kReqReset, false);
     }
-    if (flag(kReqUndo)) {
+    if (on[1]) {
         undo();
         set_flag(kReqUndo, false);
     }
-    if (flag(kMenu)) {
+    if (on[2]) {
         if (!g_menu && made && *menu_step_count(made) >= 1) {
             menu_step_hold(made);  // ours: when it is the last, the menu has closed
             g_menu = made;
@@ -240,6 +296,20 @@ void rebirth_tick() {
         menu_step_release(g_menu);
         g_menu = 0;
     }
+}
+
+std::string rebirth_report() {
+    static std::uint64_t last_read = 0, last_skipped = 0;
+    const std::uint64_t read = g_frames_read.load(std::memory_order_relaxed);
+    const std::uint64_t skipped = g_frames_skipped.load(std::memory_order_relaxed);
+    if (read == last_read && skipped == last_skipped) return {};
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), "rebirth: the altar's flags read in %llu frames (its map%s), not read in %llu (other maps)",
+                  static_cast<unsigned long long>(read - last_read), g_everywhere ? ", or every map: BBHOST_REBIRTH_EVERYWHERE=1" : "",
+                  static_cast<unsigned long long>(skipped - last_skipped));
+    last_read = read;
+    last_skipped = skipped;
+    return buf;
 }
 
 void rebirth_install(ElfImage* image) {
@@ -303,5 +373,6 @@ void rebirth_install(ElfImage* image) {
     }
     hle_fs_add_generated_root(out.string().c_str());
     g_on = true;
-    host_log("rebirth: the Altar of Despair offers Rebirth in the Nightmare (with the Yharnam Stone)");
+    host_log("rebirth: the Altar of Despair offers Rebirth in the Nightmare (with the Yharnam Stone); its flags are read %s",
+             g_everywhere ? "every frame in every map (BBHOST_REBIRTH_EVERYWHERE=1)" : "only while the hunter is in its map");
 }

@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #if defined(_WIN32)
@@ -420,6 +421,81 @@ const PostPoke g_post_poke = [] {
     return p;
 }();
 
+// What Bloom does to YEBIS's glare, read from the eboot (2026-10-08). The
+// executor of the pass this hook records (sub_25d5f80) hands the block's
+// glare luminance (+0xdc) to YEBIS (0x25d72eb -> sub_fd4b60, which keeps it
+// at +0x6bc of YEBIS's context), and YEBIS's glare (sub_fdd560) draws a
+// camera's glare - the bright pass, the blurred pyramid and its sum - only
+// when that camera's glare is enabled and the luminance is above 0: at
+// 0xfdd688 `0 >= luminance` skips the camera's whole glare. Anywhere else the
+// luminance is one factor of a shader constant (0xfed5f5, divided by +0x710).
+// So:
+//   - Bloom 0 is the game's own no-glare path: none of the glare's passes
+//     run, and the frame is cheaper by all of them. That is the whole
+//     difference players see between 0 and the rest.
+//   - Bloom 1-9 is the same passes as 10, at another strength: it costs what
+//     the game's own glare costs, no more.
+//   - Neither a change of the setting nor the area's own value easing from one
+//     lighting set to the next (a new value every view for a second or so)
+//     makes YEBIS rebuild anything: the value is stored and read, and this
+//     hook only multiplies it in place.
+// What it did cost: the log line below, on every change of either value - so
+// the first transition used up its 24 lines in under a second and nothing
+// after it said what Bloom was doing. A line now comes once per value that
+// settles (unchanged for kGlareSettle views) or per setting changed, with the
+// views since the last and how many had no glare; the 300-flip report
+// counts them too (graphics_glare_report).
+constexpr int kGlareSettle = 30;     // views a value holds before it is logged
+constexpr int kGlareLogLines = 200;  // per run
+std::atomic<std::uint64_t> g_glare_views{0}, g_glare_skipped{0};
+
+struct GlareLog {
+    float seen_glare = -1, seen_power = -1;  // the area's values in the last view
+    int stable = 0;                          // views they have held
+    float glare = -1, power = -1;            // as last logged
+    float bloom = -1;
+    bool vignette = true;
+    int lines = 0;
+    std::uint64_t views = 0, skipped = 0;  // the counters at the last line
+};
+GlareLog g_glare_log;  // the YEBIS record hook's
+std::atomic_flag g_glare_log_busy = ATOMIC_FLAG_INIT;  // one render thread records the views; a second skips the line
+
+void log_glare(float glare, float power, float bloom, bool vignette) {
+    if (g_glare_log_busy.test_and_set(std::memory_order_acquire)) return;
+    struct Release {
+        ~Release() { g_glare_log_busy.clear(std::memory_order_release); }
+    } release;
+    GlareLog& l = g_glare_log;
+    if (glare != l.seen_glare || power != l.seen_power) {
+        l.seen_glare = glare;
+        l.seen_power = power;
+        l.stable = 0;
+    } else if (l.stable < kGlareSettle) {
+        ++l.stable;
+    }
+    const bool first = l.lines == 0;
+    if (!first && (l.stable < kGlareSettle || l.lines >= kGlareLogLines)) return;
+    if (!first && glare == l.glare && power == l.power && bloom == l.bloom && vignette == l.vignette) return;
+    const std::uint64_t views = g_glare_views.load(std::memory_order_relaxed);
+    const std::uint64_t skipped = g_glare_skipped.load(std::memory_order_relaxed);
+    const float sent = glare * bloom;
+    // The area's own values, as they arrive: 0 vignette means the place has
+    // none, which is why turning it off there changes nothing.
+    host_log("graphics: area glare luminance %g (bloom %d/10: YEBIS gets %g%s), vignette power %g (%s); "
+             "%llu views since the last line, %llu of them with no glare",
+             glare, static_cast<int>(bloom * 10.0f + 0.5f), sent, sent > 0.0f ? "" : " - its glare passes skipped", power,
+             vignette ? "on" : "off", static_cast<unsigned long long>(views - l.views),
+             static_cast<unsigned long long>(skipped - l.skipped));
+    if (++l.lines == kGlareLogLines) host_log("graphics: no more glare lines this run (the 300-flip report still counts them)");
+    l.glare = glare;
+    l.power = power;
+    l.bloom = bloom;
+    l.vignette = vignette;
+    l.views = views;
+    l.skipped = skipped;
+}
+
 // sub_25d4860's entry: the YEBIS object in rdi.
 GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* saved) {
     refresh_settings();
@@ -437,16 +513,9 @@ GUEST_ABI std::int64_t yebis_record_hook(std::uint64_t, const std::uint64_t* sav
     float glare = 0, power = 0;
     std::memcpy(&glare, g_post_block + kGlareLuminance, 4);
     std::memcpy(&power, g_post_block + kVignettePower, 4);
-    static float logged_glare = -1, logged_power = -1;
-    static std::atomic<int> logs{0};
-    if ((glare != logged_glare || power != logged_power) && logs.fetch_add(1) < 24) {
-        // The area's own values, as they arrive: 0 vignette means the place
-        // has none, which is why turning it off there changes nothing.
-        host_log("graphics: area glare luminance %g (bloom %d/10), vignette power %g (%s)", glare,
-                 static_cast<int>(bloom * 10.0f + 0.5f), power, vignette ? "on" : "off");
-        logged_glare = glare;
-        logged_power = power;
-    }
+    g_glare_views.fetch_add(1, std::memory_order_relaxed);
+    if (!(glare * bloom > 0.0f)) g_glare_skipped.fetch_add(1, std::memory_order_relaxed);
+    log_glare(glare, power, bloom, vignette);
     if (bloom != 1.0f) {
         glare *= bloom;
         std::memcpy(g_post_block + kGlareLuminance, &glare, 4);
@@ -1252,6 +1321,24 @@ bool engine_prologue_hook_variadic(ElfImage* image, std::uint64_t at, const std:
 }
 
 std::uint64_t engine_scene_view_flip() { return g_scene_view_flip.load(std::memory_order_relaxed); }
+
+std::string graphics_glare_report() {
+    static std::uint64_t last_views = 0, last_skipped = 0;
+    const std::uint64_t views = g_glare_views.load(std::memory_order_relaxed);
+    const std::uint64_t skipped = g_glare_skipped.load(std::memory_order_relaxed);
+    if (views == last_views) return {};
+    char buf[224];
+    std::snprintf(buf, sizeof(buf),
+                  "glare: bloom %d/10; %llu YEBIS views, %llu with a glare luminance above 0, %llu with none (YEBIS's "
+                  "no-glare path: its glare passes skipped)",
+                  static_cast<int>(g_bloom.load(std::memory_order_relaxed) * 10.0f + 0.5f),
+                  static_cast<unsigned long long>(views - last_views),
+                  static_cast<unsigned long long>((views - last_views) - (skipped - last_skipped)),
+                  static_cast<unsigned long long>(skipped - last_skipped));
+    last_views = views;
+    last_skipped = skipped;
+    return buf;
+}
 
 void graphics_patch_install(ElfImage* image) {
     resolution_patch(image, live_resolution_install(image));
