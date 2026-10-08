@@ -441,6 +441,14 @@ TranslateResult translate(const Program& program, const TranslateOptions& option
 void set_runtime_sample_offsets(bool on);
 bool runtime_sample_offsets();
 
+// Every process-wide switch a translation reads besides its TranslateOptions -
+// the device features the host sets above (half.h's too) and the BBHOST_*
+// variables the translator looks at - as one string. The host's translation
+// cache (host/translation_cache.cpp) keys each entry on it, so a run with
+// another setting never takes a translation made under this one: a switch
+// added to the translator belongs here.
+std::string translation_switches();
+
 // The two stages of a tessellated draw that carry no GCN code.
 //
 // The game's patches are one control point each, and the hull shader behind

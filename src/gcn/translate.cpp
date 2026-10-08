@@ -19,6 +19,19 @@ std::atomic<bool> g_runtime_sample_offsets{false};
 void set_runtime_sample_offsets(bool on) { g_runtime_sample_offsets.store(on, std::memory_order_relaxed); }
 bool runtime_sample_offsets() { return g_runtime_sample_offsets.load(std::memory_order_relaxed); }
 
+std::string translation_switches() {
+    // The variables as given rather than what each decides: two spellings of
+    // one setting only cost a second entry.
+    const auto env = [](const char* name) {
+        const char* e = std::getenv(name);
+        return std::string(name) + "=" + (e ? e : "") + ";";
+    };
+    std::string s = std::string("offsets=") + (runtime_sample_offsets() ? "1" : "0") + ";half_rtz=" + (native_half_rtz() ? "1" : "0") +
+                    ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_min_form() ? "min" : "select") + ";";
+    for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH"}) s += env(name);
+    return s;
+}
+
 std::string ResourcePath::str() const {
     std::string s = "user_sgpr[" + std::to_string(user_sgpr) + "]";
     for (const ResourceStep& l : loads) {
