@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 struct ElfImage;
 
@@ -38,6 +39,11 @@ void graphics_patch_install(ElfImage* image);
 // The flip count when the scene's view (sub_269e990) was last drawn, plus
 // one; 0 before any. The title, loading screens and movies draw none.
 std::uint64_t engine_scene_view_flip();
+// For the 300-flip report: the Bloom setting, the YEBIS views since the last
+// call and how many had a glare luminance above 0 (YEBIS draws a camera's
+// glare only then; Bloom 0 makes it 0 in every view); empty when no view was
+// recorded.
+std::string graphics_glare_report();
 
 // A hook at a guest function's entry (core/thunk.h's prologue stub): `host`
 // runs with the argument registers first. `prologue` is the `n` (>= 14) bytes
