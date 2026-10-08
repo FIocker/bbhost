@@ -7,6 +7,8 @@
 #include "engine/addr.h"
 #include "hle/guest_fs.h"
 
+#include "core/plt_names.inc"
+
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +30,7 @@ std::vector<std::uint8_t> g_bytes;
 std::vector<Function> g_functions;
 ElfImage g_image;
 bool g_loaded = false;
+void* g_tcb = nullptr;
 
 struct Segment {
     std::uint64_t va, off, filesz;
@@ -189,12 +192,27 @@ void load(const char* test) {
         auto* tcb = reinterpret_cast<GuestTcb*>(block + kGuestTls);
         tcb->self = tcb;
         tcb->magic = kTcbMagic;
+        g_tcb = tcb;
         auto* teb = static_cast<std::uint8_t*>(std::calloc(1, kTebStandInSize));
         std::memcpy(teb + tls_gs_disp(), &tcb, sizeof(tcb));
         syscall(SYS_arch_prctl, ARCH_SET_GS, reinterpret_cast<unsigned long>(teb));
     }
     guest_fp();
     g_loaded = true;
+}
+
+void* tcb() { return g_tcb; }
+
+void stub(std::uint64_t bn, const void* host) {
+    const std::uint64_t page = bn & ~0xfffull, end = (bn + 14 + 0xfff) & ~0xfffull;
+    mprotect(reinterpret_cast<void*>(page), end - page, PROT_READ | PROT_WRITE | PROT_EXEC);
+    std::uint8_t* p = at(bn);
+    p[0] = 0xff;
+    p[1] = 0x25;  // jmp [rip+0]
+    std::memset(p + 2, 0, 4);
+    const auto to = reinterpret_cast<std::uint64_t>(host);
+    std::memcpy(p + 6, &to, 8);
+    mprotect(reinterpret_cast<void*>(page), end - page, PROT_READ | PROT_EXEC);
 }
 
 const std::vector<Relocated>& relocated() {
@@ -220,8 +238,22 @@ float Rng::value(float lo, float hi) {
 // What the loader binds imports with (core/imports.h), for a test: traps.
 std::string lookup_nid_name(std::string_view nid) { return std::string(nid); }
 
-std::uint64_t bind_import(const std::string& name, const std::string& nid, std::uint64_t, int) {
+std::uint64_t bind_import(const std::string& nid_name, const std::string& nid, std::uint64_t, int plt_index) {
     using namespace eboot_kit;
+    // The PLT's order names the slot the game calls (core/imports.cpp).
+    const std::string name =
+        plt_index >= 0 && plt_index < kPltNameCount && kPltNames[plt_index] ? std::string(kPltNames[plt_index]) : nid_name;
+    static const struct {
+        const char* name;
+        const void* fn;
+    } kHost[] = {
+        {"memset", reinterpret_cast<const void*>(&::memset)},   {"memcpy", reinterpret_cast<const void*>(&::memcpy)},
+        {"memmove", reinterpret_cast<const void*>(&::memmove)}, {"memcmp", reinterpret_cast<const void*>(&::memcmp)},
+        {"strlen", reinterpret_cast<const void*>(&::strlen)},   {"strcmp", reinterpret_cast<const void*>(&::strcmp)},
+        {"strncmp", reinterpret_cast<const void*>(&::strncmp)}, {"strcpy", reinterpret_cast<const void*>(&::strcpy)},
+    };
+    for (const auto& h : kHost)
+        if (name == h.name) return reinterpret_cast<std::uint64_t>(h.fn);
     const std::uint32_t i = static_cast<std::uint32_t>(g_imports.size());
     if ((i + 1) * kStub > kStubSpace) return 0;
     g_imports.push_back({name, nid});
