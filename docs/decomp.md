@@ -16,11 +16,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 10 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 14 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 117 |
-| **Taken over in all** | **131** |
-| With any code byte changed (including byte patches and redirected calls) | 154; 236 at 60 fps |
+| **Taken over in all** | **135** |
+| With any code byte changed (including byte patches and redirected calls) | 158; 240 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -43,6 +43,10 @@ when there is a reason to change them, not for their own sake.
 | parallel resource copy (`sub_23bde30`) | `0x23bde30` | the copy of streamed resource data across the engine's worker pool | copies on the calling thread; removes a ~1 s wait per area tour |
 | effect ribbon tail, facing the eye (`sub_2cce7b0`) | `0x2cce7b0` | the last one to three points of an effect ribbon as vertices, the strip turned to the camera | 400,000 random strips against the game's own code (`tests/sfx_ribbon_test.cpp`), 21 calls compared in a world session: 0 differences |
 | effect ribbon tail, along normals (`sub_2cceec0`) | `0x2cceec0` | the same for a ribbon laid along its points' normals | 400,000 random strips, 426 calls compared in a world session: 0 differences |
+| chalice roll (`dungeon_ritual_config_initialize`) | `0x1eaeec0` | a chalice ritual's dungeon: which of its prebuilt layouts (the open unlock ranges weighted by size) and its rites | 20,000 rolls against the game's own code over generated params, flags and draws (`tests/chalice_test.cpp`); in the game, 1,500 rolls through the real rows, flags and heap on a copy of the game's generator: 0 differences |
+| a rite's pick (`sub_2316e70`) | `0x2316e70` | one of a DungeonSubFeatLotParam row's ten rates, by weight | 20,000 picks against the game's own code |
+| chalice map uid (`sub_231fbc0`) | `0x231fbc0` | the setup's map uid: `m29_AA_BB_CC` from the layout, or the row's own for a fixed chalice | 60,000 against the game's own code; 6,000 compared in the game, 0 differences |
+| chalice feature pairs (`sub_1eaf9d0`) | `0x1eaf9d0` | the nine (lot, feature) pairs the dungeon loads with | 40,000 sets against the game's own code; 1,500 compared in the game, 0 differences |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -54,6 +58,13 @@ its own pointers back as zero and crashed at `0x2cce9b5` (the crash the
 community's "Intel 12th Gen+ SFX workaround" patch avoids by not drawing
 those effects). The rewrites keep nothing below the stack pointer. Linux
 skips the red zone when it delivers a signal, so only Windows crashed.
+
+Chalice dungeons are not generated: each root dungeon is one of 100 or 200
+layouts built ahead of time, and a ritual rolls which one, and its rites, when
+the altar's menu opens - from the game's random generator, seeded from the
+clock, so no glyph-like seed reproduces a roll in the game itself (glyphs are
+the online server's keywords). With the roll as source, a mod can pick any
+layout and any rites, or open every range.
 
 The four event-flag functions are every read and write the game makes through
 its flag store - event scripts, Lua, talk scripts, the online session. With
