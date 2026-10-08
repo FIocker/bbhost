@@ -727,6 +727,22 @@ std::atomic<bool> g_dump_patches{false};
 std::uint64_t g_frames_watched = 0, g_frames_bright = 0;  // BBHOST_DUMP_ON_BRIGHT
 std::atomic<std::uint64_t> g_tess_draws{0}, g_tess_patches{0}, g_tess_refused{0}, g_tess_vertices{0};
 std::atomic<std::uint32_t> g_tess_max_patches{0}, g_tess_max_level{0};
+// The draws the game's own hull shader ran for (tess_draw_one), and their patches.
+std::atomic<std::uint64_t> g_tess_hull_draws{0}, g_tess_hull_patches{0};
+// TranslateOptions::tess_lds_bound for every stage that reads or writes the
+// buffer standing in for LDS: each access checked against its patch's window
+// or the region the LS pass gave the draw, 0 read and the write dropped past
+// it. An AMD card lost the device on the first hull draw of the Forbidden
+// Woods without it (an RX 7600 XT, AMD's Windows driver: a read 4 GiB-odd
+// past the ring). BBHOST_TESS_LDS_BOUND=0 leaves the accesses unchecked, as
+// before 2026-10-08.
+bool tess_lds_bound() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_TESS_LDS_BOUND");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 void note_stage_params(int st, const gcn::StageParams& params, bool set_repeated) {
     const std::uint64_t h = fnv1a(&params, sizeof(params), fnv1a(&st, sizeof(st)));
     static std::uint64_t last[2] = {};
@@ -3318,6 +3334,7 @@ VkShaderModule tess_hull_module(const DrawState& s, const std::string& dump_name
     o.rsrc2 = s.hs_rsrc2;
     o.tess_patch_control_points = s.tess_control_points;
     o.tess_window = s.tess_window;
+    o.tess_lds_bound = tess_lds_bound();
     o.tess_quads = s.tess_quads;
     o.tess_spacing = s.tess_spacing;
     o.tess_cw = s.tess_cw;
@@ -3553,6 +3570,7 @@ gcn::TranslateOptions vs_translate_options(const VsStageInputs& in, const gcn::P
         vo.tess_spacing = in.tess_spacing;
         vo.tess_cw = in.tess_cw;
         vo.tess_window = in.tess_window;
+        vo.tess_lds_bound = tess_lds_bound();
         // The control point arrives as an attribute rather than through a
         // buffer, so the stage reads its own patch and nothing else.
         vo.tess_lds_attributes = in.tess_attrs;
@@ -3560,6 +3578,7 @@ gcn::TranslateOptions vs_translate_options(const VsStageInputs& in, const gcn::P
     } else if (in.domain_level) {
         vo.tess_role = gcn::TranslateOptions::TessRole::Domain;
         vo.domain_level = in.domain_level;
+        vo.tess_lds_bound = tess_lds_bound();
         static const float near_cull = [] {
             const char* e = std::getenv("BBHOST_TESS_NEAR_CULL");
             return e ? static_cast<float>(std::atof(e)) : 0.0f;
@@ -6960,6 +6979,10 @@ void render_report() {
                  static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_tess_patches.load()),
                  static_cast<unsigned long long>(g_tess_vertices.load()), g_tess_max_patches.load(), g_tess_max_level.load(),
                  static_cast<unsigned long long>(g_tess_refused.load()));
+        host_log("render: tessellated draws the game's hull shader ran for %llu (%llu patches); LDS buffer accesses %s",
+                 static_cast<unsigned long long>(g_tess_hull_draws.load()), static_cast<unsigned long long>(g_tess_hull_patches.load()),
+                 tess_lds_bound() ? "bounded to their window and region (BBHOST_TESS_LDS_BOUND=0: unchecked)"
+                                  : "unchecked (BBHOST_TESS_LDS_BOUND=0)");
     }
     host_log("render: targets re-created in another format: %llu with their pixels carried over, %llu with them lost (another size "
              "or texel size), %llu of those starting with the fill their old image had last taken; new targets nothing "
@@ -9581,6 +9604,9 @@ struct TessDraw {
     std::uint32_t ls_rsrc1 = 0, ls_rsrc2 = 0;
     std::uint32_t ls_user[16] = {};
     std::uint64_t lds_address = 0, hs_va = 0;
+    // The bytes of the ring from lds_address this draw was given: the end
+    // its stages' LDS accesses are checked against (StageParams::lds_bytes).
+    std::uint32_t lds_bytes = 0;
     float clamp_lo = 1.0f, clamp_hi = 1.0f;  // VGT_HOS_MIN/MAX_TESS_LEVEL
     // What the domain prologue needs to leave a patch out (tess_patch_cull):
     // the row of the projection in the domain shader's own constants that
@@ -10207,6 +10233,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
         o.cs_threads[0] = 64;
         o.fetch = fetch ? &fprog : nullptr;
         o.exec_known = g.exec_known;
+        o.tess_lds_bound = tess_lds_bound();
         if (t.hull) {
             o.tess_window = t.window;
             o.tess_patch_control_points = t.control_points;
@@ -10298,6 +10325,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
         }
     }
     t.lds_address = ring.address + static_cast<std::uint64_t>(region - regions) * kRegionBytes + region->off;
+    t.lds_bytes = static_cast<std::uint32_t>(bytes);  // at most a region (checked above)
     region->off = (region->off + bytes + 255) & ~255ull;
     {
         std::lock_guard<std::mutex> lk(g_tess_lds_mu);
@@ -10332,6 +10360,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     gcn::StageParams params{};
     params.l1_table = g.l1.address;
     params.lds_address = t.lds_address;
+    params.lds_bytes = t.lds_bytes;
     std::memcpy(params.user_sgpr, user, sizeof(params.user_sgpr));
     params.vertex_formats[gcn::kTessIndexLo] = static_cast<std::uint32_t>(d.index_va);
     params.vertex_formats[gcn::kTessIndexHi] = static_cast<std::uint32_t>(d.index_va >> 32);
@@ -10627,7 +10656,15 @@ static bool tess_draw_one(const GpuDraw& d, TessDraw& t) {
     }();
     {
         std::lock_guard<GpuMutex> lock(g.mu);
-        if (!init_locked() || !tess_ls_pass_locked(d, t)) {
+        // A device that is gone draws nothing, and its draws are not the LS
+        // pass's failures: the RX 7600 XT's log put the 23,314 tessellated
+        // draws the game made after its device loss under "tessellation LS
+        // pass", which read as draws left out while the LS compiled.
+        if (!init_locked()) {
+            draw_failed(kFailGpuGone);
+            return false;
+        }
+        if (!tess_ls_pass_locked(d, t)) {
             if (hull_trace && t.hull) {
                 host_log("tess hull: flip %llu HS 0x%llx %u points: LS pass failed", static_cast<unsigned long long>(hle_video_flip_count()),
                          static_cast<unsigned long long>(t.hs_va), t.count);
@@ -10676,6 +10713,21 @@ static bool tess_draw_one(const GpuDraw& d, TessDraw& t) {
     g.draw_calls.fetch_sub(1, std::memory_order_relaxed);  // draw_impl counted it again
     g_tess_draws.fetch_add(1, std::memory_order_relaxed);
     g_tess_patches.fetch_add(t.hull ? t.count * t.instances / t.control_points : t.count, std::memory_order_relaxed);
+    if (t.hull) {
+        // Where the game's hull draws keep their windows, the first times: a
+        // device loss on one names the draw (AMD's markers), and this its
+        // patches against the region its stages are held inside.
+        const std::uint32_t patches = t.count * t.instances / t.control_points;
+        g_tess_hull_draws.fetch_add(1, std::memory_order_relaxed);
+        g_tess_hull_patches.fetch_add(patches, std::memory_order_relaxed);
+        static std::atomic<int> logs{0};
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+            host_log("render: the game's hull draws %u patches (%u points x %u instances) into %u bytes of LDS ring, windows of %u bytes, "
+                     "accesses %s: %s",
+                     patches, t.count, t.instances, t.lds_bytes, t.window, tess_lds_bound() ? "bounded" : "unchecked (BBHOST_TESS_LDS_BOUND=0)",
+                     ok ? "drawn" : "draw failed");
+        }
+    }
     return ok;
 }
 
@@ -12136,6 +12188,7 @@ static bool draw_impl(const GpuDraw& d) {
         std::memcpy(params.user_sgpr, st == 0 ? s.vs_user : s.ps_user, sizeof(params.user_sgpr));
         if (st == 0 && t_tess) {
             params.lds_address = t_tess->lds_address;
+            params.lds_bytes = t_tess->lds_bytes;
             std::memcpy(params.patch_cull_w, t_tess->cull_w, sizeof(params.patch_cull_w));
             params.patch_stride = t_tess->patch_stride;
             params.patch_base = t_tess->patch_base;

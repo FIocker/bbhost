@@ -1,10 +1,13 @@
 // gcn/translate.cpp: in the game's own hull draws every stage keeps the LDS
 // in a buffer, a window a patch (TranslateOptions::tess_window). An access
 // past the window reached memory the GPU had not mapped and lost the device
-// (an RX 9070 XT, 2026-10-08), so each LDS address is clamped into the
-// window: the LS pass, the hull shader and the domain shader each translate
-// to valid SPIR-V with that clamp - a UMin against the window's last dword -
-// and a stage without a window has none.
+// (an RX 9070 XT and an RX 7600 XT, 2026-10-08), so each LDS access is checked
+// as the GCN LDS behaves (TranslateOptions::tess_lds_bound): an offset inside
+// the window - or, without one, inside the draw's region of the ring
+// (StageParams::lds_bytes) - is used, a read past it gives 0 and a write is
+// dropped. The LS pass, the hull shader and the domain shader each translate
+// to valid SPIR-V with that check - an unsigned compare against the window's
+// size where there is a window - and a stage without a window is bounded too.
 #include "gcn/isa.h"
 #include "gcn/translate.h"
 
@@ -35,19 +38,18 @@ void ds(std::vector<std::uint32_t>& w, std::uint32_t op, std::uint32_t offset, s
     w.push_back((dst << 24) | (data0 << 8) | addr);
 }
 
-// The word a GLSL.std.450 UMin with the constant `bound` as one operand
-// names, if the module has one.
-bool has_umin_with(const std::vector<std::uint32_t>& spv, std::uint32_t bound) {
-    std::uint32_t glsl = 0;
+// Whether the module compares something unsigned-less-than against a 32-bit
+// constant equal to `bound` (bound != 0), or against anything (bound == 0).
+bool has_ult_with(const std::vector<std::uint32_t>& spv, std::uint32_t bound) {
     std::vector<std::uint32_t> consts;  // ids of 32-bit constants equal to `bound`
     for (std::size_t i = 5; i < spv.size();) {
         const std::uint32_t op = spv[i] & 0xffff, len = spv[i] >> 16;
         if (!len || i + len > spv.size()) break;
-        if (op == 11 && len >= 3) glsl = spv[i + 1];                                   // OpExtInstImport
-        if (op == 43 && len == 4 && spv[i + 3] == bound) consts.push_back(spv[i + 2]); // OpConstant
-        if (op == 12 && len >= 7 && spv[i + 3] == glsl && spv[i + 4] == 38) {          // OpExtInst UMin
+        if (op == 43 && len == 4 && spv[i + 3] == bound) consts.push_back(spv[i + 2]);  // OpConstant
+        if (op == 176 && len == 5) {                                                     // OpULessThan
+            if (!bound) return true;
             for (const std::uint32_t c : consts) {
-                if (spv[i + 5] == c || spv[i + 6] == c) return true;
+                if (spv[i + 4] == c) return true;
             }
         }
         i += len;
@@ -95,12 +97,15 @@ int main() {
         const gcn::TranslateResult t = gcn::translate(prog, o);
         msg.clear();
         const bool valid = t.ok() && tools.Validate(t.spirv);
-        const bool clamped = has_umin_with(t.spirv, kWindow - 4);
+        const bool windowed = has_ult_with(t.spirv, kWindow);   // offsets checked against the window
+        const bool bounded = has_ult_with(t.spirv, 0);         // some bound, the window's or the ring's
         std::printf("gcn_lds_window_test: %s: %s, %zu words%s%s\n", r.name, t.ok() ? "translated" : t.errors[0].c_str(), t.spirv.size(),
-                    valid ? ", valid" : (", invalid: " + msg).c_str(), clamped ? ", LDS clamped to the window" : "");
+                    valid ? ", valid" : (", invalid: " + msg).c_str(),
+                    windowed ? ", LDS bounded by the window" : bounded ? ", LDS bounded by the ring" : "");
         CHECK(t.ok());
         CHECK(valid);
-        CHECK(clamped == (r.window != 0));
+        CHECK(windowed == (r.window != 0));
+        CHECK(bounded);
     }
     if (g_fail) {
         std::printf("%d failed\n", g_fail);

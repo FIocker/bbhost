@@ -30,8 +30,8 @@ namespace {
 // depends on something the key does not hold would be handed to the wrong
 // program, and a result field the entry does not hold would come back empty.
 #if defined(__GLIBCXX__) && defined(__x86_64__)
-static_assert(sizeof(gcn::TranslateOptions) == 312, "a new TranslateOptions field: add it to hash_options");
-static_assert(sizeof(gcn::TranslateResult) == 416, "a new TranslateResult field: add it to write_result and read_result");
+static_assert(sizeof(gcn::TranslateOptions) == 312, "a new TranslateOptions field: add it to hash_options");  // a bool can land in padding: check the list too
+static_assert(sizeof(gcn::TranslateResult) == 424, "a new TranslateResult field: add it to write_result and read_result");
 static_assert(sizeof(gcn::ResourcePath) == 40 && sizeof(gcn::ResourceStep) == 8, "a new ResourcePath field: add it to the entry");
 static_assert(sizeof(gcn::ImageBinding) == 64 && sizeof(gcn::SamplerBinding) == 56 && sizeof(gcn::BufferBinding) == 56,
               "a new binding field: add it to the entry");
@@ -148,6 +148,7 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     h.flag(o.tess_lds_attributes);
     h.u32(o.tess_attr_vec4s);
     h.u32(o.tess_window);
+    h.flag(o.tess_lds_bound);
     h.flag(o.tess_quads);
     h.i32(o.tess_spacing);
     h.flag(o.tess_cw);

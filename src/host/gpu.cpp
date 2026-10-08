@@ -6033,7 +6033,8 @@ void host_gpu_report() {
                                                     "primitive type",    "no vertex shader",   "vertex shader",
                                                     "pixel shader",      "fetch shader",       "pipeline build",
                                                     "descriptor set",    "set allocation",     "fallback bindings",
-                                                    "pipeline creation", "index buffer",       "indirect arguments"};
+                                                    "pipeline creation", "index buffer",       "indirect arguments",
+                                                    "no GPU (device lost)"};
         std::string line;
         for (int k = 0; k < kFailCount; ++k) {
             if (const std::uint64_t n = g.draw_fail_why[k].load()) {
