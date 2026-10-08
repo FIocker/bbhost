@@ -74,7 +74,7 @@ const char* stream::op_name(stream::Op op) {
                                         "copy order",     "pass barrier", "end rendering",  "begin rendering", "fill",     "copy",
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
-                                        "dispatch",       "clear depth",  "copy image",     "dispatch indirect"};
+                                        "dispatch",       "clear depth",  "copy image",     "dispatch indirect", "marker"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -133,6 +133,11 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
     VkDeviceSize vb_offset[kMaxVertexBindings] = {};
     DrawCall call{};
     bool draw = false;
+    // AMD's buffer markers just before the draw, on a start after a lost
+    // device (gpu_write_markers): here, so such a start still records its
+    // draws on the recorder.
+    bool marker = false;
+    std::uint32_t marker_value = 0;
     // Pass changes, replayed after the descriptor writes and before the binds.
     bool end_pass = false, begin_pass = false;
     bool end_pass_barrier = true;  // the end's barrier with it (lazy pass barriers leave it out)
@@ -168,7 +173,7 @@ struct alignas(64) DrawPacket {  // a line of its own: the recorder reads the on
         write_buffer.clear();
         write_image.clear();
         pipeline = VK_NULL_HANDLE;
-        library = bind_sets = viewport = scissor = bounds = stencil = blend = index = draw = false;
+        library = bind_sets = viewport = scissor = bounds = stencil = blend = index = draw = marker = false;
         end_pass = begin_pass = false;
         end_pass_barrier = true;
         pass_barrier = false;
@@ -346,6 +351,7 @@ void replay_packet(DrawPacket& p, VkCommandBuffer cmd) {
     if (p.blend) vkCmdSetBlendConstants(cmd, p.blend_const);
     if (p.index) vkCmdBindIndexBuffer(cmd, p.index_buffer, p.index_offset, p.index_type);
     if (p.vertex_buffers) vkCmdBindVertexBuffers(cmd, 0, p.vertex_buffers, p.vb, p.vb_offset);
+    if (p.marker) gpu_write_markers(cmd, p.marker_value);
     if (p.draw) record_draw_call(cmd, p.call);
 }
 
@@ -536,6 +542,10 @@ void replay_block(const Block& b) {
             const auto* r = reinterpret_cast<const stream::ClearDepth*>(p);
             const std::uint8_t* q = p + round8(sizeof(*r));
             vkCmdClearDepthStencilImage(cmd, r->image, r->layout, &r->value, r->n, tail<VkImageSubresourceRange>(q, r->n));
+            break;
+        }
+        case Op::kMarker: {
+            gpu_write_markers(cmd, reinterpret_cast<const stream::Marker*>(p)->value);
             break;
         }
         case Op::kCopyImage: {
@@ -1220,6 +1230,14 @@ void Rec::dispatch(std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     after_op();
 }
 
+void Rec::marker(std::uint32_t value) {
+    if (!stream_on()) return gpu_write_markers(in_place(REC_SITE), value);
+    before_op(REC_SITE);
+    std::uint8_t* at = append_record(Op::kMarker, sizeof(stream::Marker));
+    *put_struct<stream::Marker>(at) = stream::Marker{value, 0};
+    after_op();
+}
+
 void Rec::clear_depth_stencil_image(VkImage image, VkImageLayout layout, const VkClearDepthStencilValue& value, std::uint32_t n,
                                     const VkImageSubresourceRange* ranges) {
     if (!stream_on()) return vkCmdClearDepthStencilImage(in_place(REC_SITE), image, layout, &value, n, ranges);
@@ -1500,6 +1518,16 @@ void DrawCmds::index_buffer(VkBuffer buffer, VkDeviceSize offset, VkIndexType ty
     p.index_buffer = buffer;
     p.index_offset = offset;
     p.index_type = type;
+}
+
+void DrawCmds::marker(std::uint32_t value) {
+    if (!packet_) {
+        gpu_write_markers(g_cmd(), value);
+        return;
+    }
+    DrawPacket& p = *static_cast<DrawPacket*>(packet_);
+    p.marker = true;
+    p.marker_value = value;
 }
 
 void DrawCmds::vertex_buffers(std::uint32_t n, const VkBuffer* buffers, const VkDeviceSize* offsets) {
