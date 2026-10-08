@@ -414,6 +414,7 @@ void hle_patch_guest(ElfImage* image) {
     decomp_sprj_emk_add();
     decomp_item_lot_add();
     decomp_player_data_add();
+    decomp_chalice_add();
     decomp_install(image);
 
     // The command-arena acquire (guest 0x2ad3b80) becomes hle_gx_arena_acquire

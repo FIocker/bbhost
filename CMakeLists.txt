@@ -87,6 +87,7 @@ add_executable(bbhost
   src/decomp/sprj_emk.cpp
   src/decomp/item_lot.cpp
   src/decomp/player_data.cpp
+  src/decomp/chalice.cpp
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
@@ -318,6 +319,7 @@ set_source_files_properties(src/decomp/sfx_ribbon.cpp PROPERTIES COMPILE_OPTIONS
 # The item-lot roll weighs its slots in floats as the game does.
 set_source_files_properties(src/decomp/item_lot.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/player_data.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
+set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/chalice.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
 
 if(MSVC)
   target_compile_options(bbhost PRIVATE /W4)
@@ -423,6 +425,12 @@ if(UNIX)
   target_link_libraries(sprj_emk_test PRIVATE eboot_kit pthread)
   add_test(NAME sprj_emk_test COMMAND sprj_emk_test)
   set_tests_properties(sprj_emk_test PROPERTIES SKIP_RETURN_CODE 77)
+  # Chalice dungeons' roll, pick, map uid and pairs against the game's code.
+  add_executable(chalice_test tests/chalice_test.cpp)
+  target_compile_options(chalice_test PRIVATE -ffp-contract=off)
+  target_link_libraries(chalice_test PRIVATE eboot_kit)
+  add_test(NAME chalice_test COMMAND chalice_test)
+  set_tests_properties(chalice_test PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(sync_test tests/sync_test.cpp src/hle/sync.cpp src/host/main_wait.cpp)
   target_include_directories(sync_test PRIVATE src)
   target_link_libraries(sync_test PRIVATE pthread)
