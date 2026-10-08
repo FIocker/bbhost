@@ -145,6 +145,15 @@ fixes it:
 KERNEL=="udmabuf", TAG+="uaccess"
 ```
 
+**AMD on Windows, slower in a window.** Play in fullscreen (Fullscreen in PC
+Settings, or Window mode in F10). In a window the desktop composites the
+picture, and AMD's driver then never completes the game's occlusion queries -
+the same as when the window is not focused - so the game, getting no answers,
+stops culling hidden geometry. On a Radeon 8060S at 1920x1080 that is 112 fps
+uncapped in a window against 161 in fullscreen, and at 60 fps the GPU 55% busy
+against 37%. The log's `occlusion:` line, every 300 flips, then says `0 dumps`
+or `left not ready (N queries unavailable)`.
+
 **Steam Deck.** Start bbhost from Steam (as a non-Steam game), in Game Mode or
 Desktop Mode; otherwise Steam's desktop controls send keys alongside the pad
 and every press acts twice. `tools/steamdeck/STEAMDECK.md` has the setup.
