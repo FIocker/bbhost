@@ -75,3 +75,19 @@ bool host_foreign_hooks_obs() {
     }
     return false;
 }
+
+std::string host_graphics_modules() {
+#if defined(_WIN32)
+    // D3D12Core.dll comes with d3d12.dll once a D3D12 device is made.
+    static const char* const kModules[] = {"dxgi.dll", "d3d11.dll", "d3d12.dll", "D3D12Core.dll", "dcomp.dll"};
+    std::string out;
+    for (const char* m : kModules) {
+        if (!loaded(m)) continue;
+        if (!out.empty()) out += " ";
+        out += m;
+    }
+    return out;
+#else
+    return {};
+#endif
+}

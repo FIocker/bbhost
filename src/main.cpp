@@ -842,6 +842,37 @@ int main(int argc, char** argv) {
                      static_cast<double>(ms.ullTotalPageFile) / kGiB, static_cast<double>(ms.ullAvailPageFile) / kGiB);
         }
     }
+    {
+        // The process's standing with Windows' schedulers, left as Windows
+        // makes it unless asked.
+        // BBHOST_PRIORITY_CLASS=above|high|normal: the priority class - shadPS4
+        // sets above normal for itself at start, bbhost leaves normal.
+        // BBHOST_POWER_THROTTLING=0: out of Windows' execution-speed throttling
+        // (EcoQoS), which its power policy may put on a process it takes for
+        // background work - a headless run has no window; =1 into it.
+        const char* pc = std::getenv("BBHOST_PRIORITY_CLASS");
+        if (pc && *pc) {
+            const std::string v = pc;
+            const DWORD cls = v == "above" ? ABOVE_NORMAL_PRIORITY_CLASS : v == "high" ? HIGH_PRIORITY_CLASS : v == "normal" ? NORMAL_PRIORITY_CLASS : 0;
+            if (!cls) {
+                host_log("process: BBHOST_PRIORITY_CLASS=%s is not above, high or normal; ignored", pc);
+            } else if (SetPriorityClass(GetCurrentProcess(), cls)) {
+                host_log("process: priority class %s (BBHOST_PRIORITY_CLASS)", pc);
+            } else {
+                host_log("process: priority class %s refused: error %lu", pc, GetLastError());
+            }
+        }
+        const char* pt = std::getenv("BBHOST_POWER_THROTTLING");
+        if (pt && (pt[0] == '0' || pt[0] == '1')) {
+            PROCESS_POWER_THROTTLING_STATE st{};
+            st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            st.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+            st.StateMask = pt[0] == '1' ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0;
+            const bool ok = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof(st));
+            host_log("process: execution-speed throttling %s (BBHOST_POWER_THROTTLING=%c)%s", pt[0] == '1' ? "on" : "off", pt[0],
+                     ok ? "" : ", refused");
+        }
+    }
 #else
     host_log("bbhost %s (%s, Linux x86-64)", BBHOST_VERSION, BBHOST_GIT_REV);
     log_cpu();

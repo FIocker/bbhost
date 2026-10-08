@@ -8,6 +8,11 @@ void host_gpu_queue_lock() {}
 void host_gpu_queue_unlock() {}
 std::uint64_t host_gpu_submit_presenter(void*, void*, std::uint32_t, void*, void*) { return 0; }
 void host_gpu_wait_submitted(std::uint64_t) {}
+GpuBusy host_gpu_busy() { return {}; }
+void host_gpu_busy_present_begin(void*) {}
+void host_gpu_busy_present_end(void*) {}
+void host_gpu_busy_present_done() {}
+std::string host_gpu_busy_report() { return {}; }
 void host_gpu_queue_lock_only() {}
 bool host_gpu_dispatch(const GpuDispatch&) { return false; }
 bool host_gpu_draw(const GpuDraw&) { return false; }

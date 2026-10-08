@@ -40,6 +40,7 @@ def main():
             rows.append({k: float(v) for k, v in kv.items()})
     # Frame statistics lines after the world: one a second.
     fps = []
+    busy = []  # ms a second our command buffers kept the GPU busy (host/gpu_busy.cpp)
     seen_world = False
     for l in lines:
         if 'world: the first in-game frame' in l:
@@ -48,7 +49,10 @@ def main():
             m = re.search(r'\(([0-9.]+)/s\)', l)
             if m:
                 fps.append(float(m.group(1)))
+                g = re.search(r'gpu busy ([0-9.]+) ms/s', l)
+                busy.append(float(g.group(1)) if g else None)
     fps = fps[int(after):]
+    busy = [b for b in busy[int(after):] if b is not None]
     if rows:
         def avg(k):
             return statistics.mean(r[k] for r in rows)
@@ -65,7 +69,14 @@ def main():
     if fps:
         print('  fps mean %.2f, min %.1f, seconds under 58: %d of %d' % (statistics.mean(fps), min(fps),
                                                                         sum(1 for f in fps if f < 58), len(fps)))
-    for key in ('gpu: memory by heap', 'gpu: memory by site', 'image heap:', 'gpu profile', 'gpu: frame'):
+    if busy:
+        # bbhost's own GPU busy (the union of its command buffers on the GPU's
+        # clock): the per-process 3D column above stays at 0 on AMD's driver.
+        b = sorted(busy)
+        print('  gpu busy (bbhost\'s timestamps) mean %.0f ms/s (%.1f%%), p95 %.0f, max %.0f; %.2f ms a flip'
+              % (statistics.mean(b), statistics.mean(b) / 10.0, b[min(len(b) - 1, int(0.95 * len(b)))], b[-1],
+                 statistics.mean(b) / statistics.mean(fps) if fps and statistics.mean(fps) > 0 else 0.0))
+    for key in ('gpu: memory by heap', 'gpu: memory by site', 'image heap:', 'gpu profile', 'gpu: frame', 'gpu busy:'):
         last = [l for l in lines if key in l]
         if last:
             print('  ' + last[-1].strip()[:600])
