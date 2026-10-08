@@ -2,9 +2,12 @@
 
 #include "core/thunk.h"
 #include "decomp/decomp.h"
+#include "decomp/guest.h"
 #include "log.h"
 
 #include <atomic>
+
+using namespace decomp;
 
 namespace sprj_event_flag {
 namespace {
@@ -131,8 +134,6 @@ DECOMP_LEAF void SetEventFlagValue(std::uint64_t man, std::uint32_t first, std::
 // ---- Compare runs: the game's version does the work, ours must agree -----
 
 namespace {
-
-using ull = unsigned long long;
 
 void* g_game_is = nullptr;
 void* g_game_set = nullptr;

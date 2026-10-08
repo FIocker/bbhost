@@ -30,6 +30,7 @@
 // tests/follow_camera_test.cpp runs the game's version and ours in the
 // eboot kit over generated cameras, frame after frame.
 #include "decomp/decomp.h"
+#include "decomp/guest.h"
 
 #include "log.h"
 
@@ -40,29 +41,13 @@
 #include <utility>
 #include <immintrin.h>
 
-namespace {
+using namespace decomp;
 
-using u8 = std::uint8_t;
-using u16 = std::uint16_t;
-using u32 = std::uint32_t;
-using u64 = std::uint64_t;
-using s32 = std::int32_t;
-using s64 = std::int64_t;
+namespace {
 
 constexpr u64 kUpdate = 0x183ac60, kUpdateEnd = 0x183facd;
 
-inline u64 G(u64 bn) { return decomp_guest(bn); }
-template <class T>
-inline T ld(u64 a) {
-    T v;
-    std::memcpy(&v, reinterpret_cast<const void*>(a), sizeof v);
-    return v;
-}
-template <class T>
-inline void st(u64 a, T v) {
-    std::memcpy(reinterpret_cast<void*>(a), &v, sizeof v);
-}
-inline float ldf(u64 bn) { return ld<float>(G(bn)); }
+inline float ldf(u64 bn) { return load<float>(game_address(bn)); }
 
 std::atomic<u64> g_frames{0};
 
@@ -393,12 +378,12 @@ inline float series_asin(float r) {
 // The game's sine and cosine, _FSin(x, quadrant offset), and its tangent and
 // arctangent, through their import stubs.
 inline float game_fsin(u32 quadrant, float x) {
-    return reinterpret_cast<float(GUEST_ABI*)(u32, u32, float)>(G(0x2fbe518))(quadrant, 0, x);
+    return reinterpret_cast<float(GUEST_ABI*)(u32, u32, float)>(game_address(0x2fbe518))(quadrant, 0, x);
 }
 inline float game_sin(float x) { return game_fsin(0, x); }
 inline float game_cos(float x) { return game_fsin(1, x); }
-inline float game_tanf(float x) { return reinterpret_cast<float(GUEST_ABI*)(float)>(G(0x2fbe648))(x); }
-inline float game_atan2f(float y, float x) { return reinterpret_cast<float(GUEST_ABI*)(float, float)>(G(0x2fbe698))(y, x); }
+inline float game_tanf(float x) { return reinterpret_cast<float(GUEST_ABI*)(float)>(game_address(0x2fbe648))(x); }
+inline float game_atan2f(float y, float x) { return reinterpret_cast<float(GUEST_ABI*)(float, float)>(game_address(0x2fbe698))(y, x); }
 
 // The game's vector library: a quaternion from an axis and an angle, one from
 // Euler angles, and a matrix from a position, a rotation and a scale.
@@ -406,11 +391,11 @@ struct Transform {
     Vec position, rotation, scale;
 };
 inline void quat_from_axis_angle(Vec* out, const Vec* axis, float angle) {
-    reinterpret_cast<void(GUEST_ABI*)(Vec*, const Vec*, float)>(G(0x848e80))(out, axis, angle);
+    reinterpret_cast<void(GUEST_ABI*)(Vec*, const Vec*, float)>(game_address(0x848e80))(out, axis, angle);
 }
-inline void quat_from_euler(Vec* out, Vec angles) { reinterpret_cast<void(GUEST_ABI*)(Vec*, Vec)>(G(0x1e4d420))(out, angles); }
+inline void quat_from_euler(Vec* out, Vec angles) { reinterpret_cast<void(GUEST_ABI*)(Vec*, Vec)>(game_address(0x1e4d420))(out, angles); }
 inline void matrix_from_transform(const Transform* transform, Matrix* out) {
-    reinterpret_cast<void(GUEST_ABI*)(const Transform*, Matrix*)>(G(0x83d4d0))(transform, out);
+    reinterpret_cast<void(GUEST_ABI*)(const Transform*, Matrix*)>(game_address(0x83d4d0))(transform, out);
 }
 constexpr u64 kYAxis = 0x597be80;  // the engine's Y axis, set at start-up
 
@@ -421,14 +406,14 @@ constexpr u64 kYAxis = 0x597be80;  // the engine's Y axis, set at start-up
 constexpr u32 kCameraCastFilter = 0x25;
 inline bool sphere_cast(void* world, const Vec* from, const Vec* delta, Vec* hit, Vec* normal, float radius, float* fraction) {
     using Cast = u8(GUEST_ABI*)(void*, u32, const Vec*, const Vec*, Vec*, Vec*, float, float*);
-    return reinterpret_cast<Cast>(G(0x1c090e0))(world, kCameraCastFilter, from, delta, hit, normal, radius, fraction) != 0;
+    return reinterpret_cast<Cast>(game_address(0x1c090e0))(world, kCameraCastFilter, from, delta, hit, normal, radius, fraction) != 0;
 }
 
 // DL_PANIC for a missing singleton, as the game's GetInstance does it.
 constexpr u64 kDlPanic = 0x24b55b0, kSingletonFile = 0x4d3b369, kSingletonFormat = 0x4d3b3bd;
 void panic_singleton(u64 name) {
     using Panic = void(GUEST_ABI*)(u64, u64, u64, u64, ...);
-    reinterpret_cast<Panic>(G(kDlPanic))(G(kSingletonFile), 0xb1, G(kSingletonFormat), G(name));
+    reinterpret_cast<Panic>(game_address(kDlPanic))(game_address(kSingletonFile), 0xb1, game_address(kSingletonFormat), game_address(name));
 }
 
 // ---- The world it reads -----------------------------------------------------
@@ -440,7 +425,7 @@ constexpr u64 kSoloParamRepository = 0x5940340, kSoloParamRepositoryName = 0x4d3
 // on, the camera steers around walls with its side probes (P17); off, it
 // casts back from them (P16).
 constexpr u64 kEnableNewCamera = 0x5527a94;
-inline bool new_camera() { return ld<u8>(G(kEnableNewCamera)) != 0; }
+inline bool new_camera() { return load<u8>(game_address(kEnableNewCamera)) != 0; }
 
 // What the run-time patches rewrite, read where the game reads it.
 constexpr u64 kFovUncapSite = 0x183af4e;          // cmovbe rax, rsi; the fov-uncap patch makes it mov rax, rsi
@@ -454,11 +439,11 @@ const u8* param_row(const u8* file, u32 index) {
     const u8 layout = file[0x2d];
     u64 offset;
     if (layout == 2)
-        offset = ld<u32>(reinterpret_cast<u64>(file) + 0x34 + index * 0xc);
+        offset = load<u32>(reinterpret_cast<u64>(file) + 0x34 + index * 0xc);
     else if (layout <= 3 || !(file[0x2e] & 2))
-        offset = ld<u32>(reinterpret_cast<u64>(file) + 0x40 + index * 0xc + 4);
+        offset = load<u32>(reinterpret_cast<u64>(file) + 0x40 + index * 0xc + 4);
     else
-        offset = ld<u64>(reinterpret_cast<u64>(file) + 0x40 + index * 0x18 + 8);
+        offset = load<u64>(reinterpret_cast<u64>(file) + 0x40 + index * 0x18 + 8);
     return reinterpret_cast<const u8*>(reinterpret_cast<u64>(file) + offset);
 }
 
@@ -489,18 +474,18 @@ struct Step {
 // alternate (+0x328, or the other override) when the alternate is asked for
 // and set; the top override (+0x320) when set. Both overrides are consumed.
 s32 camera_param_id(FollowCam& cam) {
-    const u64 gsm = ld<u64>(G(kGameStateMan));
+    const u64 gsm = load<u64>(game_address(kGameStateMan));
     s32 id = cam.default_param_id;
     s32 normal = cam.param_id;
-    if (normal < 0) normal = ld<s32>(gsm + 0x14);
+    if (normal < 0) normal = load<s32>(gsm + 0x14);
     if (normal >= 0) id = normal;
     if (cam.alternate_param) {
         s32 alternate = cam.alternate_param_id;
-        if (alternate < 0) alternate = ld<s32>(ld<u64>(G(kGameStateMan)) + 0x18);
+        if (alternate < 0) alternate = load<s32>(load<u64>(game_address(kGameStateMan)) + 0x18);
         if (alternate >= 0) id = alternate;
     }
     if (cam.param_override >= 0) id = cam.param_override;
-    st<u64>(ld<u64>(G(kGameStateMan)) + 0x14, ~0ull);
+    store<u64>(load<u64>(game_address(kGameStateMan)) + 0x14, ~0ull);
     return id;
 }
 
@@ -508,25 +493,25 @@ s32 camera_param_id(FollowCam& cam) {
 // back to a row with id 0 found by an odd walk - halving the count until an
 // entry's id is 0 - which ours keeps.
 const u8* lock_cam_row(s32 id) {
-    u64 repo = ld<u64>(G(kSoloParamRepository));
+    u64 repo = load<u64>(game_address(kSoloParamRepository));
     if (!repo) {
         panic_singleton(kSoloParamRepositoryName);
-        repo = ld<u64>(G(kSoloParamRepository));
+        repo = load<u64>(game_address(kSoloParamRepository));
     }
-    if (!ld<u32>(repo + 0x9b8)) return nullptr;
-    const u64 cap = ld<u64>(repo + 0x9c0);
+    if (!load<u32>(repo + 0x9b8)) return nullptr;
+    const u64 cap = load<u64>(repo + 0x9c0);
     if (!cap) return nullptr;
-    const u64 file = ld<u64>(ld<u64>(cap + 0x70) + 0x70);
+    const u64 file = load<u64>(load<u64>(cap + 0x70) + 0x70);
     if (!file) return nullptr;
-    const u64 index = file + static_cast<u64>(static_cast<s64>(static_cast<s32>((ld<u32>(file - 0x10) + 0xf) & 0xfffffff0u)));
-    const s32 count = ld<u16>(file + 0xa);
+    const u64 index = file + static_cast<u64>(static_cast<s64>(static_cast<s32>((load<u32>(file - 0x10) + 0xf) & 0xfffffff0u)));
+    const s32 count = load<u16>(file + 0xa);
     const auto at = [&](s32 i) { return index + static_cast<u64>(static_cast<s64>(i)) * 8; };
     s32 lo = 0, hi = count - 1;
     while (lo <= hi) {
         const s32 mid = (lo + hi) >> 1;
-        const u32 key = ld<u32>(at(mid));
+        const u32 key = load<u32>(at(mid));
         if (key == static_cast<u32>(id)) {
-            const s32 row = ld<s32>(at(mid) + 4);
+            const s32 row = load<s32>(at(mid) + 4);
             if (row >= 0) {
                 const u8* p = param_row(reinterpret_cast<const u8*>(file), static_cast<u32>(row));
                 if (p) return p;
@@ -538,8 +523,8 @@ const u8* lock_cam_row(s32 id) {
     }
     for (s32 n = count; n > 0;) {
         n = (n - 1) >> 1;
-        if (ld<u32>(at(n)) != 0) continue;
-        const s32 row = ld<s32>(at(n) + 4);
+        if (load<u32>(at(n)) != 0) continue;
+        const s32 row = load<s32>(at(n) + 4);
         if (row < 0) return nullptr;
         return param_row(reinterpret_cast<const u8*>(file), static_cast<u32>(row));
     }
@@ -554,7 +539,7 @@ float ease(float from, float to, float k) { return from + (to - from) * k; }
 // 0.6632251 radians) and capped at 48 - unless the fov-uncap patch is in,
 // which ours sees at the cap's own instruction.
 void ease_toward_lock_cam_param(FollowCam& cam, const u8* row) {
-    const auto field = [row](u64 at) { return ld<float>(reinterpret_cast<u64>(row) + at); };
+    const auto field = [row](u64 at) { return load<float>(reinterpret_cast<u64>(row) + at); };
     const float k = cam.param_ease;
     cam.eased_distance = ease(cam.eased_distance, field(0x0), k);
     cam.pitch_min = ease(cam.pitch_min, field(0x4) * kOneDegree, k);
@@ -563,7 +548,7 @@ void ease_toward_lock_cam_param(FollowCam& cam, const u8* row) {
     const float fov = field(0x14);
     float wanted;
     if (!(38.0f > fov)) {  // NaN takes the capped path
-        const bool uncapped = ld<u32>(G(kFovUncapSite)) == 0x90f08948u;
+        const bool uncapped = load<u32>(game_address(kFovUncapSite)) == 0x90f08948u;
         const float capped = (uncapped || !(fov > 48.0f)) ? fov : 48.0f;
         wanted = capped * kOneDegree;
     } else {
@@ -591,10 +576,10 @@ void ease_distance_and_speeds(FollowCam& cam) {
 // Where the character stands, from its physics: ChrIns +0x58 -> +0x8 -> +0x3b0
 // -> +0x68, the vector at +0x1e0.
 Vec chr_physics_position(const u8* chr) {
-    u64 p = ld<u64>(reinterpret_cast<u64>(chr) + 0x58);
-    p = ld<u64>(p + 0x8);
-    p = ld<u64>(p + 0x3b0);
-    p = ld<u64>(p + 0x68);
+    u64 p = load<u64>(reinterpret_cast<u64>(chr) + 0x58);
+    p = load<u64>(p + 0x8);
+    p = load<u64>(p + 0x3b0);
+    p = load<u64>(p + 0x68);
     return *reinterpret_cast<const Vec*>(p + 0x1e0);
 }
 
@@ -663,9 +648,9 @@ void take_wanted_distance(FollowCam& cam, Step& step) {
 // input (+0x334), a zero vector otherwise.
 Vec read_stick(const FollowCam& cam, const u8* chr) {
     if (!cam.input_enabled) return kZero;
-    const u64 owner = ld<u64>(reinterpret_cast<u64>(chr) + 0x58);
-    u64 pad = ld<u64>(owner + 0x280);
-    if (!pad) pad = ld<u64>(owner + 0x80);
+    const u64 owner = load<u64>(reinterpret_cast<u64>(chr) + 0x58);
+    u64 pad = load<u64>(owner + 0x280);
+    if (!pad) pad = load<u64>(owner + 0x80);
     return *reinterpret_cast<const Vec*>(pad + 0x40);
 }
 
@@ -715,11 +700,11 @@ bool stick_turns_camera(FollowCam& cam, Vec stick, float dt) {
 // a reset is asked for, goes only part of the way there, by the character
 // chase rate (+0x198). Returns where the frame itself is.
 Vec follow_character_frame(FollowCam& cam, const u8* chr, const Step& step) {
-    const u64 physics = ld<u64>(ld<u64>(reinterpret_cast<u64>(chr) + 0x3b0) + 0x68);
+    const u64 physics = load<u64>(load<u64>(reinterpret_cast<u64>(chr) + 0x3b0) + 0x68);
     const Vec angles = *reinterpret_cast<const Vec*>(physics + 0x1d0);
     Transform transform;
-    if (ld<u8>(physics + 0x326))
-        quat_from_axis_angle(&transform.rotation, reinterpret_cast<const Vec*>(G(kYAxis)), angles[1]);
+    if (load<u8>(physics + 0x326))
+        quat_from_axis_angle(&transform.rotation, reinterpret_cast<const Vec*>(game_address(kYAxis)), angles[1]);
     else
         quat_from_euler(&transform.rotation, angles);
     transform.position = xyz(*reinterpret_cast<const Vec*>(physics + 0x1e0)) + kE3;
@@ -1201,7 +1186,7 @@ void steer_around_walls(FollowCam& cam, const Step& step, void* world) {
         // With the 60 fps patch this path reaches the chase-rate pick with
         // the flag's address where the probes' result is kept; its low byte
         // (0x94) is not 0, so the escape rates are taken.
-        if (ld<u16>(G(kSixtyFpsJumpSite)) == 0x05d6) pick_chase_rates(cam, true);
+        if (load<u16>(game_address(kSixtyFpsJumpSite)) == 0x05d6) pick_chase_rates(cam, true);
         return;
     }
     if (cam.input_was_active || cam.auto_turn || cam.lock_on || cam.reset_request) cam.wall_escape = 0;
@@ -1224,7 +1209,7 @@ void steer_around_walls(FollowCam& cam, const Step& step, void* world) {
         cam.probe_a = fraction_a;
         cam.probe_b = fraction_b;
         if (!hit_a && !hit_b) {
-            cam.wall_escape = ld<u8>(G(kWallEscapeOnMissSite));
+            cam.wall_escape = load<u8>(game_address(kWallEscapeOnMissSite));
         } else if (hit_a != hit_b) {
             float correction = cam.yaw_correction;
             if (hit_a) {
@@ -1429,41 +1414,41 @@ constexpr u64 kDrawShape = 0x135d810;  // (the lists, the shape's 3x4 matrix)
 // list's shape 2, each change flagged at +0x8 - and drawn scaled by the
 // radius at the center.
 void draw_keep_out_sphere(Vec center, float radius) {
-    u64 rendman = ld<u64>(G(kRendMan));
+    u64 rendman = load<u64>(game_address(kRendMan));
     if (!rendman) {
         panic_singleton(kRendManName);
-        rendman = ld<u64>(G(kRendMan));
+        rendman = load<u64>(game_address(kRendMan));
     }
-    const u64 lists = ld<u64>(rendman + 0x20);
+    const u64 lists = load<u64>(rendman + 0x20);
     const auto current_shape = [lists] {
-        const u64 list = ld<u64>(lists + 0x10 + 8 * static_cast<s64>(ld<s32>(lists + 0x20)));
-        return ld<u64>(list + 0x40);
+        const u64 list = load<u64>(lists + 0x10 + 8 * static_cast<s64>(load<s32>(lists + 0x20)));
+        return load<u64>(list + 0x40);
     };
     const u64 shape = current_shape();
-    reinterpret_cast<void(GUEST_ABI*)(u64, s32)>(ld<u64>(ld<u64>(shape) + 0x28))(shape, -1);
+    reinterpret_cast<void(GUEST_ABI*)(u64, s32)>(load<u64>(load<u64>(shape) + 0x28))(shape, -1);
     const u64 now = current_shape();
-    if (ld<s32>(now + 0x70) != 2) {
-        st<s32>(now + 0x70, 2);
-        st<u8>(now + 0x8, ld<u8>(now + 0x8) | 0x80);
+    if (load<s32>(now + 0x70) != 2) {
+        store<s32>(now + 0x70, 2);
+        store<u8>(now + 0x8, load<u8>(now + 0x8) | 0x80);
     }
     const Vec colour = {0.25f, 0.0f, 0.25f, 0.4f};
     for (const auto& [at, flag] : {std::pair{0x20, 0x10}, std::pair{0x30, 0x20}}) {
-        if (_mm_movemask_ps(_mm_cmpeq_ps(ld<Vec>(shape + at), colour)) == 0xf) continue;
-        st<Vec>(shape + at, colour);
-        st<u8>(shape + 0x8, ld<u8>(shape + 0x8) | flag);
+        if (_mm_movemask_ps(_mm_cmpeq_ps(load<Vec>(shape + at), colour)) == 0xf) continue;
+        store<Vec>(shape + at, colour);
+        store<u8>(shape + 0x8, load<u8>(shape + 0x8) | flag);
     }
-    if (ld<s32>(shape + 0x1c) != 1) {
-        st<s32>(shape + 0x1c, 1);
-        st<u8>(shape + 0x8, ld<u8>(shape + 0x8) | 0x8);
+    if (load<s32>(shape + 0x1c) != 1) {
+        store<s32>(shape + 0x1c, 1);
+        store<u8>(shape + 0x8, load<u8>(shape + 0x8) | 0x8);
     }
-    if (ld<s32>(shape + 0x18) != 2) {
-        st<s32>(shape + 0x18, 2);
-        st<u8>(shape + 0x8, ld<u8>(shape + 0x8) | 0x4);
+    if (load<s32>(shape + 0x18) != 2) {
+        store<s32>(shape + 0x18, 2);
+        store<u8>(shape + 0x8, load<u8>(shape + 0x8) | 0x4);
     }
     const Vec rows[3] = {_mm_setr_ps(0.0f, 0.0f, 0.0f, center[0]) + _mm_setr_ps(radius, 0.0f, 0.0f, 0.0f),
                          _mm_setr_ps(0.0f, 0.0f, 0.0f, center[1]) + _mm_setr_ps(0.0f, radius, 0.0f, 0.0f),
                          _mm_setr_ps(0.0f, 0.0f, 0.0f, center[2]) + _mm_setr_ps(0.0f, 0.0f, radius, 0.0f)};
-    reinterpret_cast<void(GUEST_ABI*)(u64, const Vec*)>(G(kDrawShape))(lists, rows);
+    reinterpret_cast<void(GUEST_ABI*)(u64, const Vec*)>(game_address(kDrawShape))(lists, rows);
 }
 
 // With keep-out on (+0x2d0) the camera stays out of the keep-out spheres.
@@ -1476,7 +1461,7 @@ void keep_out_of_spheres(FollowCam& cam, void* world) {
     cam.work_basis_y = cam.basis_y;
     cam.work_basis_z = cam.basis_z;
     cam.work_position = cam.position;
-    const auto* sphere = reinterpret_cast<const KeepOutSphere*>(ld<u64>(ld<u64>(G(kKeepOutSpheres)) + 0x8));
+    const auto* sphere = reinterpret_cast<const KeepOutSphere*>(load<u64>(load<u64>(game_address(kKeepOutSpheres)) + 0x8));
     for (; sphere; sphere = sphere->next) {
         if (!(sphere->flags & 2)) continue;
         const Vec center = sphere->center;
@@ -1592,7 +1577,7 @@ bool follow_camera_body_ok(const std::uint8_t* entry) {
     h = 0xcbf29ce484222325ull;
     for (const Span& span : kConstants) {
         for (u64 a = span.at; a < span.at + span.n; ++a) {
-            u8 b = ld<u8>(G(a));
+            u8 b = load<u8>(game_address(a));
             for (const u64 at : kReadAtRunTime)
                 if (a >= at && a < at + 4) b = 0;
             h = fnv1a(h, b);
@@ -1637,18 +1622,18 @@ GUEST_ABI void update_compare(u8* cam, u8* chr, void* world, float dt) {
     }
     alignas(16) u8 ours[0x350];
     std::memcpy(ours, cam, sizeof ours);
-    const u64 gsm = ld<u64>(G(0x5956678));
+    const u64 gsm = load<u64>(game_address(0x5956678));
     u64 overrides = 0, after_game = 0, after_ours = 0;
-    if (gsm) overrides = ld<u64>(gsm + 0x14);
+    if (gsm) overrides = load<u64>(gsm + 0x14);
     game(cam, chr, world, dt);
     if (gsm) {
-        after_game = ld<u64>(gsm + 0x14);
-        st<u64>(gsm + 0x14, overrides);
+        after_game = load<u64>(gsm + 0x14);
+        store<u64>(gsm + 0x14, overrides);
     }
     follow_cam_update(ours, chr, world, dt);
     if (gsm) {
-        after_ours = ld<u64>(gsm + 0x14);
-        st<u64>(gsm + 0x14, after_game);
+        after_ours = load<u64>(gsm + 0x14);
+        store<u64>(gsm + 0x14, after_game);
     }
     g_counts.calls.fetch_add(1, std::memory_order_relaxed);
     std::size_t at = 0;

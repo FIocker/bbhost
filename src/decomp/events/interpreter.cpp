@@ -49,6 +49,7 @@
 // event end.
 #include "decomp/decomp.h"
 #include "decomp/events/flag_store.h"
+#include "decomp/guest.h"
 
 #include "bbhost/engine/fd4.hpp"
 #include "bbhost/engine/sprj/emk_system.hpp"
@@ -61,14 +62,14 @@
 #include <cstdint>
 #include <cstring>
 
+using namespace decomp;
+
 namespace {
 
 using Ev = bb::SprjEmkEventIns;
 using Holder = bb::SprjEmkConditionHolder;
 using Group = bb::SprjEmkConditionGroup;
 using Cond = bb::SprjEmkConditionCore;
-using u8 = std::uint8_t;
-using ull = unsigned long long;
 
 static_assert(offsetof(Ev, core) + offsetof(bb::SprjEmkEventCore, conditions) == 0x30, "the holder at event +0x30");
 static_assert(offsetof(Holder, current_instruction) == 0x18 && offsetof(Holder, remote_instruction) == 0x1c,
@@ -112,14 +113,9 @@ constexpr std::uint64_t kHigh[14] = {0x1bc8030, 0, 0x1bc53b0, 0x1bc0420, 0x1bba6
                                      0x1bc37a0, 0x1bb97d0, 0x1bc5d90, 0x1bc6ad0, 0x1bc31e0, 0, 0x16eb3b0};
 constexpr std::int32_t kLabelBank = 1014, kDrawBank = 2012;
 
-template <class F>
-F game(std::uint64_t bn) {
-    return reinterpret_cast<F>(static_cast<std::uintptr_t>(decomp_guest(bn)));
-}
-
 template <class T>
 T* slot(std::uint64_t bn) {
-    return *reinterpret_cast<T**>(static_cast<std::uintptr_t>(decomp_guest(bn)));
+    return *reinterpret_cast<T**>(static_cast<std::uintptr_t>(game_address(bn)));
 }
 
 using HolderUpdateFn = GUEST_ABI void (*)(Holder*, const bb::FD4Time*, Ev*);
@@ -146,9 +142,9 @@ F virt(const void* object, std::size_t at) {
 }
 
 void panic(std::uint64_t name) {
-    game<PanicFn>(kDlPanic)(reinterpret_cast<const char*>(decomp_guest(kPanicFile)), kPanicLine,
-                            reinterpret_cast<const char*>(decomp_guest(kPanicFormat)),
-                            reinterpret_cast<const char*>(decomp_guest(name)));
+    game_function<PanicFn>(kDlPanic)(reinterpret_cast<const char*>(game_address(kPanicFile)), kPanicLine,
+                            reinterpret_cast<const char*>(game_address(kPanicFormat)),
+                            reinterpret_cast<const char*>(game_address(name)));
 }
 
 inline bool effective(const Cond* c) {
@@ -230,7 +226,7 @@ DECOMP_LEAF u8 emevd_dispatch_instruction(void* d, Ev* ev, float dt) {
             }
             std::int32_t id;
             std::memcpy(&id, args, 4);
-            game<DrawFn>(kSetDrawEnable)(id, args[4] != 0);
+            game_function<DrawFn>(kSetDrawEnable)(id, args[4] != 0);
             return 1;
         }
         fn = kHigh[bank - 2000];
@@ -239,7 +235,7 @@ DECOMP_LEAF u8 emevd_dispatch_instruction(void* d, Ev* ev, float dt) {
         g_unknown.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
-    return game<DispatchFn>(fn)(d, ev, dt);
+    return game_function<DispatchFn>(fn)(d, ev, dt);
 }
 
 // 0x16ec380: every group's update (its conditions'), oldest first, then the
@@ -276,7 +272,7 @@ DECOMP_LEAF bool SprjEmkConditionGroup_Query(const Group* g) { return satisfied(
 // 0x16ecdc0: the interpreter loop (above). `time` is the frame's FD4Time.
 DECOMP_LEAF void SprjEmkEventIns_Update(Ev* ev, const bb::FD4Time* time) {
     Holder* h = &ev->core.conditions;
-    game<HolderUpdateFn>(kHolderUpdate)(h, time, ev);
+    game_function<HolderUpdateFn>(kHolderUpdate)(h, time, ev);
     for (;;) {
         const std::int32_t r = main_state(h);
         if (r <= 0) return;
@@ -286,15 +282,15 @@ DECOMP_LEAF void SprjEmkEventIns_Update(Ev* ev, const bb::FD4Time* time) {
             if (g->group_id != 0) continue;
             if (g->conditions) {
                 if (r == 1) {
-                    game<LatchFn>(kLatch)(h, nullptr, ev);
+                    game_function<LatchFn>(kLatch)(h, nullptr, ev);
                     if (!ev->suppress_callback_once) {
                         ev->core.network_source = 10000;
-                        game<EventFn>(kBroadcast)(ev);
+                        game_function<EventFn>(kBroadcast)(ev);
                     } else {
                         ev->suppress_callback_once = 0;
                     }
                 }
-                game<ClearFn>(kHolderClear)(h);
+                game_function<ClearFn>(kHolderClear)(h);
             }
             break;
         }
@@ -310,9 +306,9 @@ DECOMP_LEAF void SprjEmkEventIns_Update(Ev* ev, const bb::FD4Time* time) {
         }
         void* d = *reinterpret_cast<void**>(system + offsetof(bb::SprjEmkSystem, dispatcher));
         if (!d) return;
-        game<DispatchFn>(kDispatch)(d, ev, time->time);
+        game_function<DispatchFn>(kDispatch)(d, ev, time->time);
         u8 more = 1;
-        const u8 ok = game<AdvanceFn>(kAdvance)(&ev->runtime_data, &more);
+        const u8 ok = game_function<AdvanceFn>(kAdvance)(&ev->runtime_data, &more);
         h->current_instruction = ev->instruction_index;
         if (!ok) {
             virt<EndFn>(ev, 0x30)(ev, 0);
@@ -341,7 +337,7 @@ DECOMP_LEAF void SprjEmkEventIns_EndOrRestart(Ev* ev, std::uint32_t restart) {
     ((restart & 0xff) ? g_restarted : g_ended).fetch_add(1, std::memory_order_relaxed);
     if (restart & 0xff) {
         *ev->core.state = 0;
-        game<ClearFn>(kHolderClear)(&ev->core.conditions);
+        game_function<ClearFn>(kHolderClear)(&ev->core.conditions);
         const std::int32_t index = ev->instruction_index;
         if (index > 0) {
             ev->instruction_delta = -index;
@@ -367,7 +363,7 @@ DECOMP_LEAF void SprjEmkEventIns_EndOrRestart(Ev* ev, std::uint32_t restart) {
                 void* heap2 = slot<void>(kDefaultHeapSlot);
                 void* copy = virt<AllocFn>(heap2, 0x58)(heap2, size, 0x10);
                 std::memcpy(rec + 0x10, &copy, 8);
-                game<MemcpyFn>(kMemcpy)(copy, args, size);
+                game_function<MemcpyFn>(kMemcpy)(copy, args, size);
             }
             std::memcpy(rec + 0x20, &ev->runtime_data, 8);
             void* system = slot<void>(kEmkSystemSlot);
@@ -375,7 +371,7 @@ DECOMP_LEAF void SprjEmkEventIns_EndOrRestart(Ev* ev, std::uint32_t restart) {
                 panic(kSystemName);
                 system = slot<void>(kEmkSystemSlot);
             }
-            game<EnqueueFn>(kEnqueueRestart)(system, rec);
+            game_function<EnqueueFn>(kEnqueueRestart)(system, rec);
         }
         const std::uint32_t count = ev->event ? ev->event->instruction_count : 0;
         ev->instruction_delta = static_cast<std::int32_t>(count - static_cast<std::uint32_t>(ev->instruction_index));

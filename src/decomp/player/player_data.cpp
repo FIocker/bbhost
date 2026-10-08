@@ -34,6 +34,7 @@
 // ours too. All five are leaves: each runs on the game's thread, calls only
 // the game's own code, and costs what the game's did.
 #include "decomp/decomp.h"
+#include "decomp/guest.h"
 
 #include "log.h"
 
@@ -42,23 +43,9 @@
 #include <cstring>
 #include <xmmintrin.h>
 
+using namespace decomp;
+
 namespace {
-
-using u8 = std::uint8_t;
-using u16 = std::uint16_t;
-using u32 = std::uint32_t;
-using i32 = std::int32_t;
-using u64 = std::uint64_t;
-using ull = unsigned long long;
-
-template <class T>
-T ld(u64 p) {
-    return *reinterpret_cast<const T*>(static_cast<std::uintptr_t>(p));
-}
-template <class T>
-void st(u64 p, T v) {
-    *reinterpret_cast<T*>(static_cast<std::uintptr_t>(p)) = v;
-}
 
 // Where the game keeps what these read (Binary Ninja addresses).
 constexpr u64 kGameDataMan = 0x593b130;  // GameDataMan*: +0x8 the local player's record, +0x68 the clear count
@@ -76,7 +63,7 @@ constexpr u64 kGainOne = 0x4d27eb8;                                             
 constexpr u64 kKillOne = 0x4d27ebc, kKillHalf = 0x4d27ec0, kKillCoop = 0x4d27ec4, kKillRoundUp = 0x4d27ec8;  // 1, 0.5, 1.2, 5e-6
 constexpr u64 kPriceHalf = 0x4d289c0;                                                             // 0.5
 
-float k(u64 bn) { return ld<float>(decomp_leaf_guest(bn)); }
+float k(u64 bn) { return load<float>(game_address(bn)); }
 
 // The effects list (above).
 constexpr u64 kFirst = 0x8, kState = 0x1c, kParam = 0x48, kNext = 0x58;
@@ -87,21 +74,21 @@ constexpr u16 kStateDiscovery = 0x42, kStateGathering = 0x72;
 
 // The record (above).
 constexpr u64 kInsight = 0x84, kEchoes = 0x94, kEchoesEver = 0x98, kEchoesGathered = 0xfc;
-constexpr i32 kEchoCap = 999999999;
+constexpr s32 kEchoCap = 999999999;
 
-i32 wrap_add(i32 a, i32 b) { return static_cast<i32>(static_cast<u32>(a) + static_cast<u32>(b)); }
-i32 wrap_sub(i32 a, i32 b) { return static_cast<i32>(static_cast<u32>(a) - static_cast<u32>(b)); }
+s32 wrap_add(s32 a, s32 b) { return static_cast<s32>(static_cast<u32>(a) + static_cast<u32>(b)); }
+s32 wrap_sub(s32 a, s32 b) { return static_cast<s32>(static_cast<u32>(a) - static_cast<u32>(b)); }
 // cvttss2si: out of range or NaN is 0x80000000.
-i32 truncate(float f) { return _mm_cvttss_si32(_mm_set_ss(f)); }
+s32 truncate(float f) { return _mm_cvttss_si32(_mm_set_ss(f)); }
 // A sum the game keeps in [0, cap]: a wrapped (negative) sum is 0.
-i32 capped(i32 sum) { return sum < 0 ? 0 : (sum <= kEchoCap ? sum : kEchoCap); }
+s32 capped(s32 sum) { return sum < 0 ? 0 : (sum <= kEchoCap ? sum : kEchoCap); }
 
 // The node of the first effect in effect with that stateInfo, or 0.
 u64 effect_with(u64 first, u16 state) {
-    for (u64 n = first; n; n = ld<u64>(n + kNext)) {
-        if (ld<u32>(n + kState) & kNotInEffect) continue;
-        const u64 p = ld<u64>(n + kParam);
-        if (p && ld<u16>(p + kStateInfo) == state) return n;
+    for (u64 n = first; n; n = load<u64>(n + kNext)) {
+        if (load<u32>(n + kState) & kNotInEffect) continue;
+        const u64 p = load<u64>(n + kParam);
+        if (p && load<u16>(p + kStateInfo) == state) return n;
     }
     return 0;
 }
@@ -118,13 +105,13 @@ std::atomic<u64> g_discoveries{0}, g_gains{0}, g_kills{0}, g_penalties{0}, g_pri
 DECOMP_LEAF float item_discovery(u64 effects, float arcane) {
     g_discoveries.fetch_add(1, std::memory_order_relaxed);
     float bonus = 0.0f;
-    if (effects && (ld<u8>(effects + 0x21) & 0x70)) {
-        const u64 first = ld<u64>(effects + kFirst);
+    if (effects && (load<u8>(effects + 0x21) & 0x70)) {
+        const u64 first = load<u64>(effects + kFirst);
         if (effect_with(first, kStateDiscovery)) {
-            for (u64 n = first; n; n = ld<u64>(n + kNext)) {
-                if (ld<u32>(n + kState) & kNotInEffect) continue;
-                const u64 p = ld<u64>(n + kParam);
-                bonus = bonus + (p ? ld<float>(p + kItemDropRate) : 0.0f);
+            for (u64 n = first; n; n = load<u64>(n + kNext)) {
+                if (load<u32>(n + kState) & kNotInEffect) continue;
+                const u64 p = load<u64>(n + kParam);
+                bonus = bonus + (p ? load<float>(p + kItemDropRate) : 0.0f);
             }
         }
     }
@@ -157,36 +144,36 @@ DECOMP_LEAF float item_discovery(u64 effects, float arcane) {
 
 using LocalFn = GUEST_ABI u64 (*)(u64);
 
-DECOMP_LEAF void add_echoes(u64 player, i32 amount, i32, u32 rates) {
+DECOMP_LEAF void add_echoes(u64 player, s32 amount, s32, u32 rates) {
     g_gains.fetch_add(1, std::memory_order_relaxed);
     float rate = 0.0f;
     if (rates & 0xff) {
         rate = k(kGainOne);
-        for (u64 n = ld<u64>(ld<u64>(player + 0x1c8) + kFirst); n; n = ld<u64>(n + kNext)) {
-            if (ld<u32>(n + kState) & kNotInEffect) continue;
-            const u64 p = ld<u64>(n + kParam);
-            rate = rate * (p ? ld<float>(p + kSoulRate) : k(kGainOne));
+        for (u64 n = load<u64>(load<u64>(player + 0x1c8) + kFirst); n; n = load<u64>(n + kNext)) {
+            if (load<u32>(n + kState) & kNotInEffect) continue;
+            const u64 p = load<u64>(n + kParam);
+            rate = rate * (p ? load<float>(p + kSoulRate) : k(kGainOne));
         }
     }
-    if (!ld<u64>(player + 0x3c0)) return;
-    const auto local = reinterpret_cast<LocalFn>(static_cast<std::uintptr_t>(ld<u64>(ld<u64>(player) + 0x1b8)));
+    if (!load<u64>(player + 0x3c0)) return;
+    const auto local = reinterpret_cast<LocalFn>(static_cast<std::uintptr_t>(load<u64>(load<u64>(player) + 0x1b8)));
     if (!static_cast<u8>(local(player))) return;
-    const i32 add = (rates & 0xff) ? truncate(static_cast<float>(amount) * rate) : amount;
-    const u64 rec = ld<u64>(player + 0x3c0);
-    const i32 was = ld<i32>(rec + kEchoes);
-    const i32 now = capped(wrap_add(was, add));
-    st<i32>(rec + kEchoes, now);
-    const i32 rose = wrap_sub(now, was);
-    if (rose > 0) st<std::int64_t>(rec + kEchoesEver, capped(wrap_add(ld<i32>(rec + kEchoesEver), rose)));
-    const u64 holder = ld<u64>(player + 0x1c8);
-    i32 gathered = 0;
-    if ((ld<u8>(holder + 0x22) & 0xe0) && effect_with(ld<u64>(holder + kFirst), kStateGathering))
-        gathered = wrap_add(ld<i32>(rec + kEchoesGathered), add);
-    st<i32>(rec + kEchoesGathered, gathered);
+    const s32 add = (rates & 0xff) ? truncate(static_cast<float>(amount) * rate) : amount;
+    const u64 rec = load<u64>(player + 0x3c0);
+    const s32 was = load<s32>(rec + kEchoes);
+    const s32 now = capped(wrap_add(was, add));
+    store<s32>(rec + kEchoes, now);
+    const s32 rose = wrap_sub(now, was);
+    if (rose > 0) store<std::int64_t>(rec + kEchoesEver, capped(wrap_add(load<s32>(rec + kEchoesEver), rose)));
+    const u64 holder = load<u64>(player + 0x1c8);
+    s32 gathered = 0;
+    if ((load<u8>(holder + 0x22) & 0xe0) && effect_with(load<u64>(holder + kFirst), kStateGathering))
+        gathered = wrap_add(load<s32>(rec + kEchoesGathered), add);
+    store<s32>(rec + kEchoesGathered, gathered);
     if (!add) return;
-    const u64 menu = ld<u64>(decomp_leaf_guest(kMenuMan));
-    st<i32>(menu + 0x210, wrap_add(ld<i32>(menu + 0x210), add));
-    st<i32>(menu + 0x20c, wrap_add(ld<i32>(menu + 0x20c), rose));
+    const u64 menu = load<u64>(game_address(kMenuMan));
+    store<s32>(menu + 0x210, wrap_add(load<s32>(menu + 0x210), add));
+    store<s32>(menu + 0x20c, wrap_add(load<s32>(menu + 0x20c), rose));
 }
 
 // ---- The echoes a kill gives (sub_1cfc860) --------------------------------
@@ -200,28 +187,28 @@ DECOMP_LEAF void add_echoes(u64 player, i32 amount, i32, u32 rates) {
 // truncated amount is returned.
 
 struct KillAmount {
-    i32 truncated, rounded;
+    s32 truncated, rounded;
 };
 
 KillAmount kill_amount(u64 victim, u32 coop, u32 halve, float base) {
     float rate = k(kKillOne);
     if (victim) {
-        const u64 first = ld<u64>(ld<u64>(victim + 0x1c8) + kFirst);
+        const u64 first = load<u64>(load<u64>(victim + 0x1c8) + kFirst);
         if (first) {
-            const u64 man = ld<u64>(decomp_leaf_guest(kGameDataMan));
-            for (u64 n = first; n; n = ld<u64>(n + kNext)) {
-                if (ld<u32>(n + kState) & kNotInEffect) continue;
-                const u64 p = ld<u64>(n + kParam);
+            const u64 man = load<u64>(game_address(kGameDataMan));
+            for (u64 n = first; n; n = load<u64>(n + kNext)) {
+                if (load<u32>(n + kState) & kNotInEffect) continue;
+                const u64 p = load<u64>(n + kParam);
                 float m = k(kKillOne);
                 if (p) {
-                    const float have = ld<float>(p + kHaveSoulRate);
-                    if (!(ld<u8>(p + kClearBonusByte) & kClearBonusBit)) {
+                    const float have = load<float>(p + kHaveSoulRate);
+                    if (!(load<u8>(p + kClearBonusByte) & kClearBonusBit)) {
                         m = have;
                     } else {
-                        i32 clears = ld<i32>(man + 0x68);
+                        s32 clears = load<s32>(man + 0x68);
                         if (clears > 6) clears = 6;
                         const std::int64_t i = clears < 0 ? 0 : clears;
-                        if (i) m = have * ld<float>(decomp_leaf_guest(kClearScale) + 4 * static_cast<u64>(i));
+                        if (i) m = have * load<float>(game_address(kClearScale) + 4 * static_cast<u64>(i));
                     }
                 }
                 rate = rate * m;
@@ -233,20 +220,20 @@ KillAmount kill_amount(u64 victim, u32 coop, u32 halve, float base) {
     float x = rate * base;
     x = half * x;
     x = co * x;
-    const i32 t = truncate(x);
+    const s32 t = truncate(x);
     const float cut = x - static_cast<float>(t);
     return {t, wrap_add(cut > k(kKillRoundUp) ? 1 : 0, t)};
 }
 
-using GainFn = GUEST_ABI void (*)(u64, i32, i32, u32);
+using GainFn = GUEST_ABI void (*)(u64, s32, s32, u32);
 using KillRecordFn = GUEST_ABI u64 (*)(u64, u64, u32, u32);
 
 DECOMP_LEAF u64 kill_echoes(u64 player, u64 victim, u32 coop, u32 halve, float base) {
     g_kills.fetch_add(1, std::memory_order_relaxed);
     const KillAmount a = kill_amount(victim, coop, halve, base);
     if (a.rounded <= 0) return static_cast<u32>(a.truncated);
-    reinterpret_cast<GainFn>(static_cast<std::uintptr_t>(ld<u64>(ld<u64>(player) + 0x3d0)))(player, a.rounded, 0, 1);
-    return reinterpret_cast<KillRecordFn>(static_cast<std::uintptr_t>(decomp_leaf_guest(kKillRecord)))(player + 0x2a0, victim,
+    reinterpret_cast<GainFn>(static_cast<std::uintptr_t>(load<u64>(load<u64>(player) + 0x3d0)))(player, a.rounded, 0, 1);
+    return reinterpret_cast<KillRecordFn>(static_cast<std::uintptr_t>(game_address(kKillRecord)))(player + 0x2a0, victim,
                                                                                                        coop & 0xff, 0);
 }
 
@@ -257,19 +244,19 @@ DECOMP_LEAF u64 kill_echoes(u64 player, u64 victim, u32 coop, u32 halve, float b
 // insight loses `insight` (never below 0). What it returns is what the game's
 // left in rax: the manager's slot, 0, or the record.
 
-DECOMP_LEAF u64 ExcutePenalty(u64, i32 insight, float share) {
+DECOMP_LEAF u64 ExcutePenalty(u64, s32 insight, float share) {
     g_penalties.fetch_add(1, std::memory_order_relaxed);
-    const u64 slot = decomp_leaf_guest(kLuaEventMan);
-    if (!ld<u64>(slot)) return slot;
-    const u64 rec = ld<u64>(ld<u64>(decomp_leaf_guest(kGameDataMan)) + 0x8);
+    const u64 slot = game_address(kLuaEventMan);
+    if (!load<u64>(slot)) return slot;
+    const u64 rec = load<u64>(load<u64>(game_address(kGameDataMan)) + 0x8);
     if (!rec) return 0;
-    const i32 echoes = ld<i32>(rec + kEchoes);
-    i32 left = wrap_sub(echoes, truncate(static_cast<float>(echoes) * share));
+    const s32 echoes = load<s32>(rec + kEchoes);
+    s32 left = wrap_sub(echoes, truncate(static_cast<float>(echoes) * share));
     if (left < 0) left = 0;
-    st<i32>(rec + kEchoes, left <= kEchoCap ? left : kEchoCap);
-    i32 sane = wrap_sub(ld<i32>(rec + kInsight), insight);
+    store<s32>(rec + kEchoes, left <= kEchoCap ? left : kEchoCap);
+    s32 sane = wrap_sub(load<s32>(rec + kInsight), insight);
     if (sane < 0) sane = 0;
-    st<i32>(rec + kInsight, sane);
+    store<s32>(rec + kInsight, sane);
     return rec;
 }
 
@@ -284,29 +271,29 @@ DECOMP_LEAF u64 ExcutePenalty(u64, i32 insight, float share) {
 // the screen opened with (*(ctx+0x10)).
 
 struct ParamRef {
-    i32 id;
+    s32 id;
     u32 pad;
     u64 row;
 };
-using ParamRowFn = GUEST_ABI void (*)(ParamRef*, i32);
+using ParamRowFn = GUEST_ABI void (*)(ParamRef*, s32);
 
-DECOMP_LEAF u64 level_price_check(u64 ctx, const i32* from, const i32* to) {
+DECOMP_LEAF u64 level_price_check(u64 ctx, const s32* from, const s32* to) {
     g_price_checks.fetch_add(1, std::memory_order_relaxed);
-    const i32 was = *from, want = *to;
+    const s32 was = *from, want = *to;
     if (want > was) {
-        const u64 screen = ld<u64>(ctx + 0x8);
-        const i32 level = ld<i32>(screen + 0xe94);
+        const u64 screen = load<u64>(ctx + 0x8);
+        const s32 level = load<s32>(screen + 0xe94);
         ParamRef ref{-1, 0, 0};
-        reinterpret_cast<ParamRowFn>(static_cast<std::uintptr_t>(decomp_leaf_guest(kParamRow)))(&ref, 0xc8);
+        reinterpret_cast<ParamRowFn>(static_cast<std::uintptr_t>(game_address(kParamRow)))(&ref, 0xc8);
         const float x = static_cast<float>(wrap_add(level, 81));
         float curve, price;
         if (ref.row) {
-            float t = x - ld<float>(ref.row + 0x48);
+            float t = x - load<float>(ref.row + 0x48);
             t = 0.0f > t ? 0.0f : t;  // vmaxss(0, t): a NaN t stays
-            t = t * ld<float>(ref.row + 0x44);
-            t = t + ld<float>(ref.row + 0x3c);
+            t = t * load<float>(ref.row + 0x44);
+            t = t + load<float>(ref.row + 0x3c);
             curve = (x * x) * t;
-            price = ld<float>(ref.row + 0x40);
+            price = load<float>(ref.row + 0x40);
         } else {
             float t = 0.0f > x ? 0.0f : x;
             t = t * 0.0f;
@@ -315,15 +302,15 @@ DECOMP_LEAF u64 level_price_check(u64 ctx, const i32* from, const i32* to) {
             price = 0.0f;
         }
         if (want > 99) return static_cast<u32>(was);
-        const i32 have = wrap_sub(ld<i32>(ld<u64>(ld<u64>(decomp_leaf_guest(kGameDataMan)) + 0x8) + kEchoes),
-                                  ld<i32>(screen + 0xeb0));
+        const s32 have = wrap_sub(load<s32>(load<u64>(load<u64>(game_address(kGameDataMan)) + 0x8) + kEchoes),
+                                  load<s32>(screen + 0xeb0));
         const float half = k(kPriceHalf);
-        i32 c = truncate((curve + price) + half);
+        s32 c = truncate((curve + price) + half);
         c = truncate(static_cast<float>(c) + half);
-        const i32 cost = static_cast<i32>(_mm_cvttss_si64(_mm_set_ss(static_cast<float>(c))));
+        const s32 cost = static_cast<s32>(_mm_cvttss_si64(_mm_set_ss(static_cast<float>(c))));
         return static_cast<u32>(cost > have ? was : want);
     }
-    if (want < was && ld<i32>(ld<u64>(ctx + 0x10)) > want) return static_cast<u32>(was);
+    if (want < was && load<s32>(load<u64>(ctx + 0x10)) > want) return static_cast<u32>(was);
     return static_cast<u32>(want);
 }
 
@@ -364,27 +351,27 @@ GUEST_ABI float compare_discovery(u64 effects, float arcane) {
 
 // What a gain writes, to put back and compare.
 struct GainState {
-    i32 echoes, gathered, hud_210, hud_20c;
+    s32 echoes, gathered, hud_210, hud_20c;
     std::int64_t ever;
 };
 GainState gain_state(u64 rec, u64 menu) {
     GainState s{};
-    s.echoes = ld<i32>(rec + kEchoes);
-    s.gathered = ld<i32>(rec + kEchoesGathered);
-    s.ever = ld<std::int64_t>(rec + kEchoesEver);
+    s.echoes = load<s32>(rec + kEchoes);
+    s.gathered = load<s32>(rec + kEchoesGathered);
+    s.ever = load<std::int64_t>(rec + kEchoesEver);
     if (menu) {
-        s.hud_210 = ld<i32>(menu + 0x210);
-        s.hud_20c = ld<i32>(menu + 0x20c);
+        s.hud_210 = load<s32>(menu + 0x210);
+        s.hud_20c = load<s32>(menu + 0x20c);
     }
     return s;
 }
 void set_gain_state(u64 rec, u64 menu, const GainState& s) {
-    st<i32>(rec + kEchoes, s.echoes);
-    st<i32>(rec + kEchoesGathered, s.gathered);
-    st<std::int64_t>(rec + kEchoesEver, s.ever);
+    store<s32>(rec + kEchoes, s.echoes);
+    store<s32>(rec + kEchoesGathered, s.gathered);
+    store<std::int64_t>(rec + kEchoesEver, s.ever);
     if (menu) {
-        st<i32>(menu + 0x210, s.hud_210);
-        st<i32>(menu + 0x20c, s.hud_20c);
+        store<s32>(menu + 0x210, s.hud_210);
+        store<s32>(menu + 0x20c, s.hud_20c);
     }
 }
 bool same(const GainState& a, const GainState& b) {
@@ -396,15 +383,15 @@ bool same(const GainState& a, const GainState& b) {
 struct SeenGain {
     bool seen;
     u64 player;
-    i32 amount;
+    s32 amount;
     u32 rates;
 };
 SeenGain g_seen_gain{};
 
-GUEST_ABI void compare_gain(u64 player, i32 amount, i32 third, u32 rates) {
+GUEST_ABI void compare_gain(u64 player, s32 amount, s32 third, u32 rates) {
     g_seen_gain = {true, player, amount, rates};
-    const u64 rec = ld<u64>(player + 0x3c0);
-    const u64 menu = ld<u64>(decomp_leaf_guest(kMenuMan));
+    const u64 rec = load<u64>(player + 0x3c0);
+    const u64 menu = load<u64>(game_address(kMenuMan));
     if (!rec) {
         reinterpret_cast<GainFn>(g_game_gain)(player, amount, third, rates);
         return;
@@ -436,26 +423,26 @@ GUEST_ABI u64 compare_kill(u64 player, u64 victim, u32 coop, u32 halve, float ba
     return theirs;
 }
 
-using PenaltyFn = GUEST_ABI u64 (*)(u64, i32, float);
-GUEST_ABI u64 compare_penalty(u64 a0, i32 insight, float share) {
-    const u64 rec = ld<u64>(decomp_leaf_guest(kLuaEventMan)) ? ld<u64>(ld<u64>(decomp_leaf_guest(kGameDataMan)) + 0x8) : 0;
+using PenaltyFn = GUEST_ABI u64 (*)(u64, s32, float);
+GUEST_ABI u64 compare_penalty(u64 a0, s32 insight, float share) {
+    const u64 rec = load<u64>(game_address(kLuaEventMan)) ? load<u64>(load<u64>(game_address(kGameDataMan)) + 0x8) : 0;
     if (!rec) return reinterpret_cast<PenaltyFn>(g_game_penalty)(a0, insight, share);
-    const i32 echoes = ld<i32>(rec + kEchoes), sane = ld<i32>(rec + kInsight);
+    const s32 echoes = load<s32>(rec + kEchoes), sane = load<s32>(rec + kInsight);
     const u64 theirs = reinterpret_cast<PenaltyFn>(g_game_penalty)(a0, insight, share);
-    const i32 their_echoes = ld<i32>(rec + kEchoes), their_sane = ld<i32>(rec + kInsight);
-    st<i32>(rec + kEchoes, echoes);
-    st<i32>(rec + kInsight, sane);
+    const s32 their_echoes = load<s32>(rec + kEchoes), their_sane = load<s32>(rec + kInsight);
+    store<s32>(rec + kEchoes, echoes);
+    store<s32>(rec + kInsight, sane);
     const u64 ours = ExcutePenalty(a0, insight, share);
-    const bool ok = ours == theirs && ld<i32>(rec + kEchoes) == their_echoes && ld<i32>(rec + kInsight) == their_sane;
-    st<i32>(rec + kEchoes, their_echoes);
-    st<i32>(rec + kInsight, their_sane);
+    const bool ok = ours == theirs && load<s32>(rec + kEchoes) == their_echoes && load<s32>(rec + kInsight) == their_sane;
+    store<s32>(rec + kEchoes, their_echoes);
+    store<s32>(rec + kInsight, their_sane);
     count(g_cmp_penalty, ok, "lua_cli_ExcutePenalty", static_cast<u32>(echoes), static_cast<u32>(their_echoes),
-          static_cast<u32>(ld<i32>(rec + kEchoes)));
+          static_cast<u32>(load<s32>(rec + kEchoes)));
     return theirs;
 }
 
-using PriceFn = GUEST_ABI u64 (*)(u64, const i32*, const i32*);
-GUEST_ABI u64 compare_price(u64 ctx, const i32* from, const i32* to) {
+using PriceFn = GUEST_ABI u64 (*)(u64, const s32*, const s32*);
+GUEST_ABI u64 compare_price(u64 ctx, const s32* from, const s32* to) {
     const u64 ours = level_price_check(ctx, from, to);
     const u64 theirs = reinterpret_cast<PriceFn>(g_game_price)(ctx, from, to);
     count(g_cmp_price, static_cast<u32>(theirs) == static_cast<u32>(ours), "sub_1f2f5e0", static_cast<u32>(*to),

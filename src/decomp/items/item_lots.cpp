@@ -4,7 +4,7 @@
 // step MapItemMan's drops and awards go through (0x1e8b080), and a debug
 // menu preview (0x1bcd17c) - pass a context:
 //
-//   +0x00 i32  the first row: the roll reads it and every row after it until
+//   +0x00 s32  the first row: the roll reads it and every row after it until
 //              one is missing
 //   +0x04 f32  item discovery, for the slots that ask for it (enableLuck)
 //   +0x08 u8   1: a slot whose flag is on is passed over, and the results
@@ -52,6 +52,7 @@
 
 #include "core/thunk.h"
 #include "decomp/events/flag_store.h"
+#include "decomp/guest.h"
 #include "hle/guest_fs.h"
 #include "log.h"
 
@@ -64,18 +65,14 @@
 
 #include <xmmintrin.h>
 
+using namespace decomp;
+
 namespace {
 
-using u8 = std::uint8_t;
-using u16 = std::uint16_t;
-using i32 = std::int32_t;
-using u32 = std::uint32_t;
 using i64 = std::int64_t;
-using u64 = std::uint64_t;
-using ull = unsigned long long;
 
 constexpr u64 kRoll = 0x1bceaf0;
-constexpr u64 kLotRow = 0x2320640;       // ItemLotParam's row by id: (out {i32, row*}, id)
+constexpr u64 kLotRow = 0x2320640;       // ItemLotParam's row by id: (out {s32, row*}, id)
 constexpr u64 kLvdepRow = 0x23202a0;     // ItemLotLvdepParam's row by id and level
 constexpr u64 kTwist = 0x1c1e5c0;        // the generator's refill
 constexpr u64 kCountUp = 0x1bd11f0;      // a counter's eight flags one up, to 255
@@ -91,7 +88,7 @@ constexpr u8 kEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0
                          0x41, 0x54, 0x53, 0x48, 0x81, 0xe4, 0xe0, 0xff, 0xff, 0xff};
 
 struct Context {
-    i32 lot;
+    s32 lot;
     float discovery;
     u8 honour_flags;
     u8 flag_offset;
@@ -103,14 +100,14 @@ struct Context {
 static_assert(sizeof(Context) == 0x18, "the callers' context, as far as the roll reads it");
 
 struct ResultItem {
-    i32 id;
-    i32 category;
+    s32 id;
+    s32 category;
     u8 num;
     u8 slot;
     u16 pad;
 };
 struct Result {
-    i32 flag;
+    s32 flag;
     u8 rarity;
     u8 count;
     u16 pad;
@@ -118,29 +115,23 @@ struct Result {
 };
 static_assert(sizeof(Result) == 0x50, "a result entry");
 
-template <class T>
-T& at(u64 a) {
-    return *reinterpret_cast<T*>(static_cast<std::uintptr_t>(a));
-}
-
-void* game(u64 bn) { return reinterpret_cast<void*>(static_cast<std::uintptr_t>(decomp_guest(bn))); }
-void* vfunc(u64 object, u64 slot) { return reinterpret_cast<void*>(static_cast<std::uintptr_t>(at<u64>(at<u64>(object) + slot))); }
+void* vfunc(u64 object, u64 slot) { return reinterpret_cast<void*>(static_cast<std::uintptr_t>(ref<u64>(ref<u64>(object) + slot))); }
 
 struct RowOut {
-    i32 index = -1;
-    i32 pad = 0;
+    s32 index = -1;
+    s32 pad = 0;
     u64 row = 0;
 };
 
-u64 lot_row(i32 id) {
+u64 lot_row(s32 id) {
     RowOut out;
-    hle_call_guest(game(kLotRow), &out, id);
+    hle_call_guest(game_function<void*>(kLotRow), &out, id);
     return out.row;
 }
 
-u64 lvdep_row(i32 id, u8 level) {
+u64 lvdep_row(s32 id, u8 level) {
     RowOut out;
-    hle_call_guest(game(kLvdepRow), &out, id, static_cast<u32>(level));
+    hle_call_guest(game_function<void*>(kLvdepRow), &out, id, static_cast<u32>(level));
     return out.row;
 }
 
@@ -150,32 +141,32 @@ u64 lvdep_row(i32 id, u8 level) {
 struct Direct {
     template <class T>
     bool operator()(u64 a, T* out) const {
-        *out = at<T>(a);
+        *out = ref<T>(a);
         return true;
     }
 };
 
 bool flag_on(u32 id) {
-    const u64 man = at<u64>(decomp_guest(kFlagManSlot));
+    const u64 man = ref<u64>(game_address(kFlagManSlot));
     u64 byte = 0;
     u8 mask = 0;
-    return man && sprj_event_flag::locate(man, id, Direct{}, &byte, &mask) && (at<u8>(byte) & mask);
+    return man && sprj_event_flag::locate(man, id, Direct{}, &byte, &mask) && (ref<u8>(byte) & mask);
 }
 
 void flag_clear(u32 id) {
-    const u64 man = at<u64>(decomp_guest(kFlagManSlot));
+    const u64 man = ref<u64>(game_address(kFlagManSlot));
     u64 byte = 0;
     u8 mask = 0;
-    if (man && sprj_event_flag::locate(man, id, Direct{}, &byte, &mask)) at<u8>(byte) &= static_cast<u8>(~mask);
+    if (man && sprj_event_flag::locate(man, id, Direct{}, &byte, &mask)) ref<u8>(byte) &= static_cast<u8>(~mask);
 }
 
 // One word from the game's MT19937, tempered as the roll tempers it.
 u32 draw() {
-    const u64 mt = at<u64>(decomp_guest(kGameState)) + 0xa78;
-    if (--at<u32>(mt + 4) == 0) hle_call_guest(game(kTwist), mt);
-    const u64 next = at<u64>(mt + 8);
-    at<u64>(mt + 8) = next + 4;
-    u32 y = at<u32>(next);
+    const u64 mt = ref<u64>(game_address(kGameState)) + 0xa78;
+    if (--ref<u32>(mt + 4) == 0) hle_call_guest(game_function<void*>(kTwist), mt);
+    const u64 next = ref<u64>(mt + 8);
+    ref<u64>(mt + 8) = next + 4;
+    u32 y = ref<u32>(next);
     y ^= y >> 11;
     y ^= (y << 7) & 0x9d2c5680u;
     y ^= (y << 15) & 0xefc60000u;
@@ -194,18 +185,18 @@ u32 truncate_low(float v) { return static_cast<u32>(static_cast<u64>(_mm_cvttss_
 void release(u64 block) {
     u64 heap = 0;
     if (t_guest_fs) {
-        const u64 hint = reinterpret_cast<u64>(t_guest_fs) + static_cast<u64>(at<i64>(decomp_guest(kHintTpoff))) + 0x10;
-        heap = at<u64>(hint);
-        at<u64>(hint) = 0;
+        const u64 hint = reinterpret_cast<u64>(t_guest_fs) + static_cast<u64>(ref<i64>(game_address(kHintTpoff))) + 0x10;
+        heap = ref<u64>(hint);
+        ref<u64>(hint) = 0;
     }
-    if (!heap) heap = static_cast<u64>(hle_call_guest(game(kFindHeap), block));
+    if (!heap) heap = static_cast<u64>(hle_call_guest(game_function<void*>(kFindHeap), block));
     if (heap) hle_call_guest(vfunc(heap, 0x70), heap, block);
 }
 
 struct Slot {
-    i32 id, category;
+    s32 id, category;
     u32 weight;
-    i32 flag;
+    s32 flag;
     u8 num, rarity, index;
     bool resets;
 };
@@ -218,41 +209,41 @@ namespace item_lot {
 
 // The roll, as ours.
 GUEST_ABI void roll(u64 ctx_at, u32 mode, u64 trace) {
-    auto& ctx = at<Context>(ctx_at);
+    auto& ctx = ref<Context>(ctx_at);
     ctx.count = 0;
     if (ctx.results) {
         release(ctx.results);
         ctx.results = 0;
     }
-    std::set<i32> count_up, reset;
-    std::map<i32, Result> merged;
-    for (i32 id = ctx.lot;; id = static_cast<i32>(static_cast<u32>(id) + 1)) {
+    std::set<s32> count_up, reset;
+    std::map<s32, Result> merged;
+    for (s32 id = ctx.lot;; id = static_cast<s32>(static_cast<u32>(id) + 1)) {
         const u64 row = lot_row(id);
         if (!row) break;
         g_rows.fetch_add(1, std::memory_order_relaxed);
-        const i32 row_flag = at<i32>(row + 0x80), counter = at<i32>(row + 0x84);
-        const u8 counter_max = at<u8>(row + 0x88);
+        const s32 row_flag = ref<s32>(row + 0x80), counter = ref<s32>(row + 0x84);
+        const u8 counter_max = ref<u8>(row + 0x88);
         float ratio = 0.0f;
         if (counter_max != 0 && counter >= 0) {
             u32 count = 0;
             for (u32 i = 0; i < 8; ++i) {
-                const i32 f = static_cast<i32>(static_cast<u32>(counter) + i);
+                const s32 f = static_cast<s32>(static_cast<u32>(counter) + i);
                 if (f >= 0 && flag_on(static_cast<u32>(f))) count |= 1u << i;
             }
             if (count > counter_max) count = counter_max;
-            ratio = static_cast<float>(static_cast<i64>(count)) / static_cast<float>(static_cast<i32>(counter_max));
+            ratio = static_cast<float>(static_cast<i64>(count)) / static_cast<float>(static_cast<s32>(counter_max));
         }
-        const u16 bits = at<u16>(row + 0x92);
+        const u16 bits = ref<u16>(row + 0x92);
         Slot slots[8];
         int n = 0;
-        i32 total = 0;
+        s32 total = 0;
         for (u32 i = 0; i < 8; ++i) {
-            const float base = static_cast<float>(static_cast<i32>(at<u16>(row + 0x40 + 2 * i) * 100u));
-            const float cumulative = static_cast<float>(static_cast<i32>(at<u16>(row + 0x50 + 2 * i) * 100u));
+            const float base = static_cast<float>(static_cast<s32>(ref<u16>(row + 0x40 + 2 * i) * 100u));
+            const float cumulative = static_cast<float>(static_cast<s32>(ref<u16>(row + 0x50 + 2 * i) * 100u));
             if (!(base > 0.0f) && !(cumulative > 0.0f)) continue;
-            i32 flag = at<i32>(row + 0x60 + 4 * i);
+            s32 flag = ref<s32>(row + 0x60 + 4 * i);
             if (flag == 0) flag = row_flag;
-            flag = static_cast<i32>(static_cast<u32>(flag) + ctx.flag_offset);
+            flag = static_cast<s32>(static_cast<u32>(flag) + ctx.flag_offset);
             if (ctx.honour_flags && flag >= 0 && flag_on(static_cast<u32>(flag))) continue;
             const float d = cumulative - base;
             const float m = ratio * d;
@@ -264,50 +255,50 @@ GUEST_ABI void roll(u64 ctx_at, u32 mode, u64 trace) {
                 if (weight <= 1) weight = 1;
             }
             Slot& s = slots[n++];
-            s.id = at<i32>(row + 4 * i);
-            s.category = at<i32>(row + 0x20 + 4 * i);
+            s.id = ref<s32>(row + 4 * i);
+            s.category = ref<s32>(row + 0x20 + 4 * i);
             s.weight = weight;
             s.flag = flag;
-            s.num = at<u8>(row + 0x8a + i);
-            s.rarity = at<u8>(row + 0x89);
+            s.num = ref<u8>(row + 0x8a + i);
+            s.rarity = ref<u8>(row + 0x89);
             s.index = static_cast<u8>(i);
             s.resets = ((bits >> (8 + i)) & 1) != 0;
             if (s.category == 15) {
                 if (const u64 lv = lvdep_row(s.id, ctx.level)) {
-                    s.id = at<i32>(lv + 4);
-                    s.category = at<i32>(lv);
+                    s.id = ref<s32>(lv + 4);
+                    s.category = ref<s32>(lv);
                 } else {
                     s.id = -1;
                     s.category = -1;
                     s.num = 0;
                 }
             }
-            total = static_cast<i32>(static_cast<u32>(total) + weight);
+            total = static_cast<s32>(static_cast<u32>(total) + weight);
         }
         if (total <= 0) continue;
         count_up.insert(counter);
         g_draws.fetch_add(1, std::memory_order_relaxed);
         const u32 y = draw();
         if (n <= 0) continue;
-        const float scaled = static_cast<float>(static_cast<i32>(y >> 9)) * 1.1920928955078125e-07f;
-        i32 pick = static_cast<i32>(truncate_low(static_cast<float>(total) * scaled));
+        const float scaled = static_cast<float>(static_cast<s32>(y >> 9)) * 1.1920928955078125e-07f;
+        s32 pick = static_cast<s32>(truncate_low(static_cast<float>(total) * scaled));
         int chosen = -1, last = -1;
         for (int j = 0; j < n; ++j) {
-            const i32 w = static_cast<i32>(slots[j].weight);
+            const s32 w = static_cast<s32>(slots[j].weight);
             if (w != 0) last = j;
             if (pick < w) {
                 chosen = j;
                 break;
             }
-            pick = static_cast<i32>(static_cast<u32>(pick) - static_cast<u32>(w));
+            pick = static_cast<s32>(static_cast<u32>(pick) - static_cast<u32>(w));
         }
         if (chosen < 0) chosen = last;
         if (chosen < 0) continue;
         const Slot& s = slots[chosen];
         if (s.resets) reset.insert(counter);
         if (s.num == 0 || (s.category | s.id) < 0) continue;
-        const i32 key = s.flag >= 0 ? static_cast<i32>(static_cast<u32>(s.flag) ^ 0x80000000u)
-                                    : static_cast<i32>(0u - static_cast<u32>(s.flag));
+        const s32 key = s.flag >= 0 ? static_cast<s32>(static_cast<u32>(s.flag) ^ 0x80000000u)
+                                    : static_cast<s32>(0u - static_cast<u32>(s.flag));
         auto it = merged.find(key);
         if (it == merged.end()) {
             Result& r = merged.emplace(key, Result{}).first->second;
@@ -324,17 +315,17 @@ GUEST_ABI void roll(u64 ctx_at, u32 mode, u64 trace) {
         r.items[r.count] = {s.id, s.category, s.num, s.index, 0};
         ++r.count;
     }
-    for (const i32 c : count_up) hle_call_guest(game(kCountUp), c);
-    for (const i32 c : reset) {
+    for (const s32 c : count_up) hle_call_guest(game_function<void*>(kCountUp), c);
+    for (const s32 c : reset) {
         if (c < 0) continue;
         for (u32 i = 0; i < 8; ++i) {
-            const i32 f = static_cast<i32>(static_cast<u32>(c) + i);
+            const s32 f = static_cast<s32>(static_cast<u32>(c) + i);
             if (f >= 0) flag_clear(static_cast<u32>(f));
         }
     }
     const u32 n = static_cast<u32>(merged.size());
     if (n) {
-        const u64 heap = at<u64>(decomp_guest(kHeapSlot));
+        const u64 heap = ref<u64>(game_address(kHeapSlot));
         const u64 out = static_cast<u64>(hle_call_guest(vfunc(heap, 0x58), heap, static_cast<u64>(n) * sizeof(Result), 4));
         ctx.results = out;
         if (out) {
@@ -342,7 +333,7 @@ GUEST_ABI void roll(u64 ctx_at, u32 mode, u64 trace) {
             u64 dst = out;
             for (const auto& [key, r] : merged) {
                 std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)), &r, sizeof r);
-                if (!ctx.honour_flags) at<i32>(dst) = -1;
+                if (!ctx.honour_flags) ref<s32>(dst) = -1;
                 dst += sizeof(Result);
             }
             g_results.fetch_add(n, std::memory_order_relaxed);
@@ -360,7 +351,7 @@ namespace {
 void* g_game_roll = nullptr;
 
 // The debug menu's variant and preview stay the game's.
-bool games_own(u32 mode, u64 trace) { return trace || (at<u8>(decomp_guest(kDebugVariant)) && static_cast<u8>(mode) == 1); }
+bool games_own(u32 mode, u64 trace) { return trace || (ref<u8>(game_address(kDebugVariant)) && static_cast<u8>(mode) == 1); }
 
 GUEST_ABI void roll_entry(u64 ctx, u32 mode, u64 trace) {
     if (games_own(mode, trace)) {
@@ -389,16 +380,16 @@ struct FlagState {
     bool on;
 };
 
-std::vector<FlagState> counter_flags(i32 lot) {
+std::vector<FlagState> counter_flags(s32 lot) {
     std::vector<FlagState> out;
-    std::set<i32> seen;
-    for (i32 id = lot;; id = static_cast<i32>(static_cast<u32>(id) + 1)) {
+    std::set<s32> seen;
+    for (s32 id = lot;; id = static_cast<s32>(static_cast<u32>(id) + 1)) {
         const u64 row = lot_row(id);
         if (!row) break;
-        const i32 c = at<i32>(row + 0x84);
+        const s32 c = ref<s32>(row + 0x84);
         if (c < 0 || !seen.insert(c).second) continue;
         for (u32 i = 0; i < 8; ++i) {
-            const i32 f = static_cast<i32>(static_cast<u32>(c) + i);
+            const s32 f = static_cast<s32>(static_cast<u32>(c) + i);
             if (f >= 0) out.push_back({static_cast<u32>(f), flag_on(static_cast<u32>(f))});
         }
     }
@@ -406,12 +397,12 @@ std::vector<FlagState> counter_flags(i32 lot) {
 }
 
 void put_flags(const std::vector<FlagState>& flags) {
-    const u64 man = at<u64>(decomp_guest(kFlagManSlot));
+    const u64 man = ref<u64>(game_address(kFlagManSlot));
     for (const FlagState& f : flags) {
         u64 byte = 0;
         u8 mask = 0;
         if (!man || !sprj_event_flag::locate(man, f.id, Direct{}, &byte, &mask)) continue;
-        at<u8>(byte) = f.on ? static_cast<u8>(at<u8>(byte) | mask) : static_cast<u8>(at<u8>(byte) & ~mask);
+        ref<u8>(byte) = f.on ? static_cast<u8>(ref<u8>(byte) | mask) : static_cast<u8>(ref<u8>(byte) & ~mask);
     }
 }
 
@@ -425,8 +416,8 @@ GUEST_ABI void compare_roll(u64 ctx_at, u32 mode, u64 trace) {
         hle_call_guest(g_game_roll, ctx_at, mode, trace);
         return;
     }
-    auto& ctx = at<Context>(ctx_at);
-    const u64 mt = at<u64>(decomp_guest(kGameState)) + 0xa78;
+    auto& ctx = ref<Context>(ctx_at);
+    const u64 mt = ref<u64>(game_address(kGameState)) + 0xa78;
     const std::vector<FlagState> flags_before = counter_flags(ctx.lot);
     std::vector<u8> mt_before(kGeneratorBytes);
     std::memcpy(mt_before.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(mt)), kGeneratorBytes);
@@ -459,7 +450,7 @@ GUEST_ABI void compare_roll(u64 ctx_at, u32 mode, u64 trace) {
                      same_flags ? "the same" : "not the same");
     }
     if (mine.results) {
-        const u64 heap = at<u64>(decomp_guest(kHeapSlot));
+        const u64 heap = ref<u64>(game_address(kHeapSlot));
         hle_call_guest(vfunc(heap, 0x70), heap, mine.results);
     }
     std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(mt)), mt_game.data(), kGeneratorBytes);

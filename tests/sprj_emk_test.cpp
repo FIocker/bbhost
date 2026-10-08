@@ -33,8 +33,6 @@
 #include <sys/mman.h>
 
 // What the decomp file links against in the game.
-void decomp_add(const DecompFunction&) {}
-std::uint64_t decomp_guest(std::uint64_t bn) { return bn; }
 extern "C" GUEST_ABI std::int64_t hle_call_guest6(void* fn, std::int64_t a0, std::int64_t a1, std::int64_t a2, std::int64_t a3,
                                                   std::int64_t a4, std::int64_t a5) {
     return reinterpret_cast<GUEST_ABI std::int64_t (*)(std::int64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t,

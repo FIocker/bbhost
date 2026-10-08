@@ -9,7 +9,6 @@
 
 #include <cstdio>
 
-void decomp_add(const DecompFunction&) {}
 
 namespace {
 
