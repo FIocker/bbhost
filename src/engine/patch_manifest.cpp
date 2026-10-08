@@ -239,9 +239,10 @@ bool patch_manifest_option_known(const std::string& option) {
     return known;
 }
 
-bool patch_manifest_off(const std::string& name) {
+bool patch_manifest_off(const std::string& name, bool enabled_by_default) {
     const std::string v = config_value("patches." + name);
     if (!v.empty()) return v == "false" || v == "0";
+    if (!enabled_by_default) return true;
     // The Old Hunters was a PC enhancement in v0.2.9, `old_hunters` under
     // [world]: a bbhost.toml (a package's, a player's) that turned it off there
     // keeps it off until [patches] says otherwise.
@@ -297,9 +298,11 @@ void patch_manifests_apply(ElfImage* image) {
                      image->sha256.c_str());
             continue;
         }
-        if (!m.enabled) continue;
-        if (patch_manifest_off(m.name)) {
-            host_log("patch: %s off ([patches] in bbhost.toml: the setup window's Patches tab)", m.name.c_str());
+        if (patch_manifest_off(m.name, m.enabled)) {
+            host_log(m.enabled || !config_value("patches." + m.name).empty()
+                         ? "patch: %s off ([patches] in bbhost.toml: the setup window's Patches tab)"
+                         : "patch: %s off by default ([patches] %s = true, or the setup window's Patches tab, turns it on)",
+                     m.name.c_str(), m.name.c_str());
             continue;
         }
         if (!m.option.empty()) {

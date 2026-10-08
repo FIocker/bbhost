@@ -86,7 +86,7 @@ name = "skip-intro"
 eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
 description = "the three company logos at startup are skipped"
 option = "startup.skip_intro"      # optional: a setting that switches it
-enabled = true                      # optional, default true
+enabled = true                      # optional: false makes it off until the player turns it on
 
 [site.logo-fromsoft]
 address = "0x04d99138"              # Binary Ninja address (image at 0x400000)
@@ -105,8 +105,10 @@ kind = "code"                       # optional: "code" (default) or "data"
   written, skipped or refused.
 
 The setup window's Patches tab lists every manifest with a switch. A patch
-that follows an `option` is switched by that setting; any other is turned off
-with `<name> = false` under `[patches]` in `bbhost.toml`.
+that follows an `option` is switched by that setting; any other by
+`<name> = true` or `false` under `[patches]` in `bbhost.toml`, and without one
+by its own `enabled` (a workaround only some players need ships with
+`enabled = false`; the tab's All on leaves those as they are).
 
 Shipped patches:
 

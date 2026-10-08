@@ -42,7 +42,9 @@ struct PatchListing {
 // Every manifest patch_manifests_apply would read, by file name, a later
 // directory's replacing an earlier one's. `mods` is the mods directory ("" for none).
 std::vector<PatchListing> patch_manifests_list(const std::string& mods);
-// Whether the player left this manifest out: [patches] <name> = false.
-bool patch_manifest_off(const std::string& name);
+// Whether this manifest is off: [patches] <name> = false or true decides, and
+// without one the file's own default - `enabled = false` makes a patch one the
+// player turns on (the setup window's Patches tab).
+bool patch_manifest_off(const std::string& name, bool enabled_by_default = true);
 // Whether `option` is one a manifest may name (startup.skip_intro, ...).
 bool patch_manifest_option_known(const std::string& option);
