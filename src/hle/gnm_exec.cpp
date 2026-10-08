@@ -145,6 +145,7 @@ thread_local std::uint64_t t_packet_va = 0;
 thread_local std::uint32_t t_packet_op = 0;
 
 std::atomic<std::uint64_t> g_draw_failed{0};
+std::atomic<std::uint64_t> g_indirect_zero_cpu{0};  // GX indirect draws whose count read 0 on the CPU, drawn for the GPU to decide
 std::atomic<std::uint64_t> g_flush_by_op[256];
 std::atomic<std::uint64_t> g_wait_timeouts{0};
 std::atomic<std::uint64_t> g_wait_pending{0};  // waits satisfied by a recorded GPU write
@@ -230,9 +231,27 @@ void native_draw(const GpuDrawInputs* in, const char* kind) {
             return;
         }
         const auto* a = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(o->indirect_va));
-        d.index_count = a[0];
+        // What the CPU reads here is what memory held when the token was
+        // walked, not what the GPU will read: an indirect draw's arguments
+        // are often written on the GPU by a compute pass earlier in the same
+        // command buffer (the game's GPU particles: each emitter's live count),
+        // which has not run yet - so a 0 here is no reason to drop the draw.
+        // Dropping it (as this did) lost the black particles of a lamp's
+        // travel and the blood rain after a boss: their counts are 0 in
+        // memory until the frame's own simulation writes them. The draw stays
+        // indirect and the GPU reads the real count; the CPU's values only
+        // size what the renderer binds, at least one element.
+        // BBHOST_INDIRECT_ZERO=skip drops them again.
+        static const bool skip_zero = [] {
+            const char* e = std::getenv("BBHOST_INDIRECT_ZERO");
+            return e && std::strcmp(e, "skip") == 0;
+        }();
+        if (!a[0]) {
+            if (skip_zero) return;
+            g_indirect_zero_cpu.fetch_add(1, std::memory_order_relaxed);
+        }
+        d.index_count = a[0] ? a[0] : 1;
         d.instance_count = a[1] ? a[1] : 1;
-        if (!a[0]) return;
     }
     if (!host_gpu_draw(d)) g_draw_failed.fetch_add(1);
 }
@@ -2592,6 +2611,8 @@ void hle_gnm_exec_histogram() {
     host_log("gnm dispatches=%llu skipped=%llu draws=%llu draw-failures=%llu", static_cast<unsigned long long>(g_dispatches.load()),
              static_cast<unsigned long long>(g_dispatch_failed.load()), static_cast<unsigned long long>(g_draws.load()),
              static_cast<unsigned long long>(g_draw_failed.load()));
+    host_log("gnm: indirect draws whose count read 0 on the CPU, drawn for the GPU to read its own (BBHOST_INDIRECT_ZERO=skip drops them): %llu",
+             static_cast<unsigned long long>(g_indirect_zero_cpu.load()));
     host_gpu_report();
     for (int op = 0; op < 256; ++op) {
         const std::uint64_t n = g_op_hist[op].load();
