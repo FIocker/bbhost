@@ -30,3 +30,6 @@ void ingame_menu_shutdown();
 // Records the menu over `view` (an image in the colour-attachment layout).
 // Nothing when it is closed.
 void ingame_menu_record(VkCommandBuffer cmd, VkImageView view, VkExtent2D extent);
+// The same draws into a rendering the caller has begun over an image of
+// `extent` (the presenter's one pass); false, and nothing, when it is closed.
+bool ingame_menu_record_in_pass(VkCommandBuffer cmd, VkExtent2D extent);

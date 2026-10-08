@@ -49,16 +49,16 @@ struct VideoPort {
     // `mark`: the draw count when the flip was queued (host_gpu_draw_mark), the
     // frame's last draw for the glitch hunt. `gpu_need`: the submissions that
     // must have finished before it may complete (BBHOST_FLIP_AFTER_GPU).
-    // `shown`: handed to the presenter when it was queued (present on
-    // arrival), so its vblank only completes it. `queued_ns`: when it was
-    // queued, on the steady clock (the pacing line's latencies).
+    // `present`: what the presenter is told of it (when it arrived, the
+    // submissions its frame is in); `shown`: already presented when it
+    // arrived (BBHOST_PRESENT_ON_ARRIVAL), so its vblank only completes it.
     struct FlipReq {
         int buffer;
         std::int64_t arg;
         std::uint64_t mark;
         std::uint64_t gpu_need;
+        PresentFlip present;
         bool shown;
-        std::uint64_t queued_ns;
     };
     std::deque<FlipReq> flip_queue;  // requested flips awaiting a vblank
     std::chrono::steady_clock::time_point last_complete{};
@@ -88,10 +88,7 @@ std::atomic<int> g_fps_cap{30};  // video.fps_cap: upper bound on presented fram
 // earlier than before, so it cannot meet a later frame's writes to that
 // buffer either (the game draws into a buffer only after the flip that
 // showed it is complete). BBHOST_PRESENT_ON_ARRIVAL=0: shown at completion.
-const bool g_present_on_arrival = [] {
-    const char* e = std::getenv("BBHOST_PRESENT_ON_ARRIVAL");
-    return !(e && e[0] == '0');
-}();
+// (g_present_on_arrival is defined with the presenter's flip, below.)
 
 // The pacing line of the 300-flip report (hle_video_pacing_window): how late
 // the vblank clock's ticks woke, and how long a flip took from being queued
@@ -159,9 +156,44 @@ std::atomic<bool> g_flip_uncapped{false};
 std::atomic<bool> g_flip_loading{false};
 std::atomic<std::uint64_t> g_picture{0};  // hle_video_set_picture: w << 32 | h, 0 for the whole buffer
 
-// Hands a frame to the presenter, with the debug hooks that go with showing
-// one. `count` is the flip count the frame completes as.
-void show_frame(int buffer, std::uint64_t display_va, unsigned dw, unsigned dh, std::uint64_t count, std::uint64_t mark) {
+// Hands a frame to the presenter (host/window.cpp): the display buffer, cut to
+// the picture the game draws in it (hle_video_set_picture).
+void show_frame(int buffer, std::uint64_t display_va, unsigned dw, unsigned dh, const PresentFlip& flip) {
+    if (const std::uint64_t pic = g_picture.load(std::memory_order_relaxed)) {
+        dw = std::min(dw, static_cast<unsigned>(pic >> 32));
+        dh = std::min(dh, static_cast<unsigned>(pic & 0xffffffffu));
+    }
+    host_present(buffer, display_va, dw, dh, flip);
+}
+
+// BBHOST_PRESENT_ON_ARRIVAL (on unless 0): a flip the command processor queues
+// is shown at once, and its vblank only completes it. Bloodborne keeps two
+// flips pending, and the vblank both showed and completed one a tick, oldest
+// first, so every frame waited behind the two before it: two flip periods
+// (33 ms at 60, 67 at 30) between the frame being in the GPU's queue and the
+// presenter even seeing it. Kyo measured the same in his fork - input 43-48 ms
+// old when shown - and split showing from completing there (KyoPS4x #249);
+// this is that design on our flip queue. What the game paces on is untouched:
+// flip status, the flip event and the pending count still change on the tick,
+// one flip per tick, oldest first. Showing early cannot race the game reusing
+// the buffer: the game draws into a buffer only once a later flip has
+// completed over it, and the presenter's copy of it is queued on the GPU
+// behind the frame's own work, ahead of anything the game queues afterwards.
+// Only flips the command processor queued after recording their frame
+// (sceGnmSubmitAndFlipCommandBuffers) are shown early; a flip requested from a
+// game thread (sceGnmRequestFlipAndSubmitDone) may be ahead of its frame's
+// commands, and waits for its vblank as before. BBHOST_PRESENT_LEGACY=1 (the
+// presenter's switch back, host/window.cpp) turns it off with the rest.
+const bool g_present_on_arrival = [] {
+    if (const char* e = std::getenv("BBHOST_PRESENT_ON_ARRIVAL")) return e[0] != '0';
+    const char* legacy = std::getenv("BBHOST_PRESENT_LEGACY");
+    return !(legacy && legacy[0] == '1');
+}();
+
+// `shown`: the presenter already has the frame (BBHOST_PRESENT_ON_ARRIVAL);
+// everything else a completed flip does still happens here.
+void present_flip(int buffer, std::uint64_t display_va, unsigned dw, unsigned dh, std::uint64_t count, std::uint64_t mark, bool shown,
+                  const PresentFlip& flip) {
     // BBHOST_DUMP_FRAME=N[,M,...]: write the displayed frame at those flips.
     static std::vector<long> dump_at = [] {
         std::vector<long> out;
@@ -227,16 +259,7 @@ void show_frame(int buffer, std::uint64_t display_va, unsigned dw, unsigned dh, 
         const std::string path = dir + "/f12-" + std::to_string(count) + host_gpu_capture_ext();
         host_gpu_dump_display(display_va, path.c_str(), true);
     }
-    if (const std::uint64_t pic = g_picture.load(std::memory_order_relaxed)) {
-        dw = std::min(dw, static_cast<unsigned>(pic >> 32));
-        dh = std::min(dh, static_cast<unsigned>(pic & 0xffffffffu));
-    }
-    host_present(buffer, display_va, dw, dh);  // hands it to the presenting thread (host/window.cpp)
-}
-
-// A completed flip that was not shown on arrival: shown now.
-void present_flip(int buffer, std::uint64_t display_va, unsigned dw, unsigned dh, std::uint64_t count, std::uint64_t mark) {
-    show_frame(buffer, display_va, dw, dh, count, mark);
+    if (!shown) show_frame(buffer, display_va, dw, dh, flip);  // hands it over; the presenter's thread waits for the display
     engine_on_flip(count);
 }
 
@@ -260,7 +283,8 @@ void vblank_tick(std::uint64_t vcount) {
         std::uint64_t va;
         unsigned w, h, count;
         std::uint64_t mark;
-        bool shown;  // already with the presenter (present on arrival): completed only
+        bool shown;
+        PresentFlip flip;
     };
     std::vector<Done> present;
     {
@@ -298,18 +322,19 @@ void vblank_tick(std::uint64_t vcount) {
             p.pending = static_cast<int>(p.flip_queue.size());
             finish_flip_locked(p, req.buffer, req.arg);
             g_flips_done.store(p.flip_count);
-            pacing_note_completed(req.queued_ns);
-            if (!req.shown) pacing_note_shown(req.queued_ns);
+            pacing_note_completed(req.present.arrived_ns);
+            if (!req.shown) pacing_note_shown(req.present.arrived_ns);
             const std::uint64_t va = (req.buffer >= 0 && req.buffer < 16) ? p.buffers[req.buffer] : 0;
-            present.push_back({req.buffer, va, p.display_w, p.display_h, static_cast<unsigned>(p.flip_count), req.mark, req.shown});
+            // A flip not shown on arrival behind one that was (a game-thread
+            // flip among the command processor's): showing it now would take
+            // the display back a frame, so it only completes.
+            bool shown = req.shown;
+            for (const VideoPort::FlipReq& later : p.flip_queue) shown = shown || later.shown;
+            present.push_back({req.buffer, va, p.display_w, p.display_h, static_cast<unsigned>(p.flip_count), req.mark, shown, req.present});
         }
     }
     for (const Done& d : present) {
-        if (d.shown) {
-            engine_on_flip(d.count);
-        } else {
-            present_flip(d.buffer, d.va, d.w, d.h, d.count, d.mark);
-        }
+        present_flip(d.buffer, d.va, d.w, d.h, d.count, d.mark, d.shown, d.flip);
     }
 }
 
@@ -619,9 +644,9 @@ GUEST_ABI int hle_video_flip(int handle, int buffer, int, std::int64_t arg) {
     if (p->flip_queue.size() >= 4) {
         return static_cast<int>(0x80290012);  // SCE_VIDEO_OUT_ERROR_FLIP_QUEUE_FULL
     }
-    // Shown when it completes: a flip the game submits itself, not through a
-    // command buffer, has no recorded frame behind it to show early.
-    p->flip_queue.push_back({buffer, arg, host_gpu_draw_mark(), g_flip_after_gpu ? host_gpu_work_needs() : 0, false, steady_ns()});
+    PresentFlip flip;
+    flip.arrived_ns = steady_ns();
+    p->flip_queue.push_back({buffer, arg, host_gpu_draw_mark(), g_flip_after_gpu ? host_gpu_work_needs() : 0, flip, false});
     p->pending = static_cast<int>(p->flip_queue.size());
     static int flip_logs;
     if (flip_logs < 8) {
@@ -728,18 +753,26 @@ void hle_video_set_fps_cap(int fps) {
     g_fps_cap.store(fps);
 }
 
-void hle_video_finish_flip(int handle, int buffer, std::int64_t arg) {
+void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool recorded) {
     // Called from the CP thread once it has recorded the frame's GPU work
     // (not once the GPU has run it: BBHOST_FLIP_AFTER_GPU). The flip is
     // queued and completed by the vblank tick at the game's flip rate, so the
     // game's frame loop paces on the flip event. BBHOST_UNCAP=1 completes it
-    // at once (fast headless dumps).
+    // at once (fast headless dumps). `recorded`: from the command processor,
+    // after the frame's commands (else a game thread's request, which may be
+    // ahead of them).
     const std::uint64_t mark = host_gpu_draw_mark();
-    const std::uint64_t gpu_need = g_flip_after_gpu ? host_gpu_work_needs() : 0;
-    const std::uint64_t queued_ns = steady_ns();
+    // The submissions the frame is in: the presenter submits the renderer's
+    // recording only when the frame is still in it (host_gpu_submit_for_flip).
+    const std::uint64_t work = g_flip_after_gpu || recorded ? host_gpu_work_needs() : 0;
+    const std::uint64_t gpu_need = g_flip_after_gpu ? work : 0;
+    PresentFlip flip;
+    flip.submit_need = recorded ? work : ~0ull;
+    flip.arrived_ns = steady_ns();
     if (!g_flip_uncapped.load() && !g_flip_loading.load(std::memory_order_relaxed)) {
-        std::uint64_t display_va = 0, count = 0;
+        std::uint64_t display_va = 0;
         unsigned dw = 0, dh = 0;
+        const bool show = g_present_on_arrival && recorded;
         {
             std::lock_guard<std::mutex> lock(g_vo_mu);
             VideoPort* p = vo_get(handle);
@@ -749,21 +782,21 @@ void hle_video_finish_flip(int handle, int buffer, std::int64_t arg) {
             if (p->flip_queue.size() >= 4) {
                 p->flip_queue.pop_front();  // drop the oldest rather than stall the CP
             }
-            p->flip_queue.push_back({buffer, arg, mark, gpu_need, g_present_on_arrival, queued_ns});
+            flip.on_arrival = show;
+            p->flip_queue.push_back({buffer, arg, mark, gpu_need, flip, show});
             p->pending = static_cast<int>(p->flip_queue.size());
-            if (!g_present_on_arrival) {
-                return;
-            }
+            if (!show) return;
             if (buffer >= 0 && buffer < 16) display_va = p->buffers[buffer];
-            count = p->flip_count + p->flip_queue.size();  // the flip it will complete as
             dw = p->display_w;
             dh = p->display_h;
         }
-        // Shown now, on this (the command processor's) thread, as the
-        // uncapped path below always did: the presenter's submission goes in
-        // behind everything recorded so far, this frame included.
-        show_frame(buffer, display_va, dw, dh, count, mark);
-        pacing_note_shown(queued_ns);
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            host_log("video: frames are shown when their flip is queued and completed on the vblank (BBHOST_PRESENT_ON_ARRIVAL=0: "
+                     "both on the vblank)");
+        }
+        show_frame(buffer, display_va, dw, dh, flip);
+        pacing_note_shown(flip.arrived_ns);
         return;
     }
     std::uint64_t display_va = 0;
@@ -802,7 +835,7 @@ void hle_video_finish_flip(int handle, int buffer, std::int64_t arg) {
         dw = p->display_w;
         dh = p->display_h;
     }
-    present_flip(buffer, display_va, dw, dh, count, mark);
+    present_flip(buffer, display_va, dw, dh, count, mark, false, flip);
 }
 
 void hle_video_detach_equeue(HostEqueue* eq) {

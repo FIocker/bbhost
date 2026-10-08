@@ -14,6 +14,8 @@ void host_gpu_busy_present_end(void*) {}
 void host_gpu_busy_present_done() {}
 std::string host_gpu_busy_report() { return {}; }
 void host_gpu_queue_lock_only() {}
+bool host_gpu_submit_for_flip(std::uint64_t) { return false; }
+bool host_gpu_display_image(std::uint64_t, void**, std::uint32_t*, std::uint32_t*, std::uint32_t*) { return false; }
 bool host_gpu_dispatch(const GpuDispatch&) { return false; }
 bool host_gpu_draw(const GpuDraw&) { return false; }
 void host_gpu_flush() {}

@@ -112,6 +112,7 @@ add_executable(bbhost
   src/host/window.cpp
   src/host/text_entry.cpp
   src/host/overlay.cpp
+  src/host/present_pass.cpp
   src/host/ingame_menu.cpp
   src/host/options.cpp
   src/host/updater.cpp
@@ -305,7 +306,7 @@ if(SDL3_FOUND AND Vulkan_FOUND)
   target_sources(bbhost PRIVATE src/host/launcher.cpp src/host/plugin_ui.cpp)
   target_link_libraries(bbhost PRIVATE imgui)
   set_source_files_properties(src/host/window.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
-  set_source_files_properties(src/host/overlay.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
+  set_source_files_properties(src/host/overlay.cpp src/host/present_pass.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/ingame_menu.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/buffer_shadow.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
