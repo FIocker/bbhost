@@ -334,22 +334,32 @@ GUEST_ABI unsigned int hle_sleep(unsigned int s) {
 // into the guest's - the game's save-load manager read garbage seconds from
 // the high half, decided its last task was minutes old, tore the task's
 // config down under it and mounted "0005" instead of "SPRJ0005" (6.3).
+//
+// Bound raw (hle_raw_clock): no errno, no thread-locals. The time is
+// GetSystemTimePreciseAsFileTime read directly (core/host_clock.h), where
+// it went through std::chrono and winpthreads' clock_gettime behind the
+// thunk. A null tv is not an error: FreeBSD's gettimeofday fills what it is
+// given and returns 0 (the timezone is left alone, as before).
 GUEST_ABI int hle_gettimeofday(void* tv, void*) {
-    if (!tv) return libc_result(-1);
-    const auto now = std::chrono::system_clock::now().time_since_epoch();
-    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-    const std::int64_t out[2] = {static_cast<std::int64_t>(us / 1000000), static_cast<std::int64_t>(us % 1000000)};
+    g_hle_clock_reads.gettimeofday.add();
+    if (!tv) return 0;
+    const std::int64_t us = host_clock_realtime_us();
+    const std::int64_t out[2] = {us / 1000000, us % 1000000};
     std::memcpy(tv, out, sizeof(out));
     return 0;
 }
 GUEST_ABI std::int64_t hle_time(std::int64_t* t) {
+    g_hle_clock_reads.time.add();
     std::time_t now = std::time(nullptr);
     if (t) {
         *t = static_cast<std::int64_t>(now);
     }
     return static_cast<std::int64_t>(now);
 }
-GUEST_ABI std::int64_t hle_clock() { return static_cast<std::int64_t>(std::clock()); }
+GUEST_ABI std::int64_t hle_clock() {
+    g_hle_clock_reads.clock.add();
+    return static_cast<std::int64_t>(std::clock());
+}
 GUEST_ABI double hle_difftime(std::int64_t a, std::int64_t b) {
     return std::difftime(static_cast<std::time_t>(a), static_cast<std::time_t>(b));
 }
@@ -1139,9 +1149,16 @@ void hle_register_libc() {
     REG("usleep", hle_usleep);
     REG("sceKernelUsleep", hle_sce_usleep);
     REG("sleep", hle_sleep);
-    REG("gettimeofday", hle_gettimeofday);
-    REG("time", hle_time);
-    REG("clock", hle_clock);
+#define REG_CLOCK(name, fn) \
+    (hle_raw_clock() ? register_hle_fn_raw(name, reinterpret_cast<void*>(fn)) : register_hle_fn(name, reinterpret_cast<void*>(fn)))
+    // The clock entries' statics set up here, on a host thread, rather than
+    // in a raw entry's first call (the CRT's clock() start time with them).
+    (void)host_clock_realtime_ns();
+    (void)std::clock();
+    REG_CLOCK("gettimeofday", hle_gettimeofday);
+    REG_CLOCK("time", hle_time);
+    REG_CLOCK("clock", hle_clock);
+#undef REG_CLOCK
     REG("difftime", hle_difftime);
     REG("gmtime", hle_gmtime);
     REG("localtime", hle_localtime);

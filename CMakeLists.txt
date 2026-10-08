@@ -45,6 +45,8 @@ add_executable(bbhost
   src/core/imports.cpp
   src/core/thunk.cpp
   src/core/portable.cpp
+  src/core/host_clock.cpp
+  src/core/futex.cpp
   src/core/win_vm.cpp
   src/core/win_watch.cpp
   src/host/win_crash.cpp
@@ -222,7 +224,8 @@ endif()
 if(UNIX)
   target_link_libraries(bbhost PRIVATE pthread dl m)
 elseif(WIN32)
-  target_link_libraries(bbhost PRIVATE ws2_32 winmm)  # hle/net.cpp, net/session.cpp; timeBeginPeriod
+  # hle/net.cpp, net/session.cpp; timeBeginPeriod; WaitOnAddress (core/futex.cpp)
+  target_link_libraries(bbhost PRIVATE ws2_32 winmm synchronization)
   # The SysV convention our guest-facing functions follow lets a leaf keep
   # data in the 128 bytes below rsp, and on Windows an exception - a
   # write-watch fault in a decomp leaf's write, say - builds its frame right
@@ -385,7 +388,7 @@ if(UNIX)
   target_link_libraries(sfx_ribbon_test PRIVATE pthread)
   add_test(NAME sfx_ribbon_test COMMAND sfx_ribbon_test)
   set_tests_properties(sfx_ribbon_test PROPERTIES SKIP_RETURN_CODE 77)
-  add_executable(sync_test tests/sync_test.cpp src/hle/sync.cpp src/host/main_wait.cpp)
+  add_executable(sync_test tests/sync_test.cpp src/hle/sync.cpp src/host/main_wait.cpp src/core/futex.cpp)
   target_include_directories(sync_test PRIVATE src)
   target_link_libraries(sync_test PRIVATE pthread)
   add_test(NAME sync_test COMMAND sync_test)

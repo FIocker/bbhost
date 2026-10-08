@@ -1,4 +1,8 @@
 #include "hle/equeue.h"
+#include "hle/sync.h"
+#include "core/futex.h"
+#include "core/host_clock.h"
+#include "core/tls_rewrite.h"
 #include "host/frame_stats.h"
 #include "engine/gx_resources.h"
 #include "core/write_watch.h"
@@ -1102,14 +1106,22 @@ GUEST_ABI int hle_batch_map(BatchEntry* entries, int num, int* processed) {
     return err;
 }
 
+// The lock and the sleep are core/futex.h's (WaitOnAddress on Windows, not
+// winpthreads' semaphores and critical sections; BBHOST_FUTEX=0 for those).
+// A signal wakes as many waiters as it gives tokens when every waiter wants
+// one (it woke them all, and all but one went back to sleep);
+// when a waiter wants more than one, all wake and each checks its own need,
+// since waking the wrong one would leave a satisfiable waiter asleep.
 struct HostSema {
-    std::mutex mu;
-    std::condition_variable cv;
+    HostLock mu;
+    HostCondVar cv;
     int count = 0;
     int max = 0x7fffffff;
     int waiters = 0;
+    int multi_waiters = 0;  // waiters that want more than one token
     bool dead = false;
 };
+std::atomic<std::uint64_t> g_sema_sleeps{0}, g_sema_wakes{0}, g_eq_sleeps{0};
 
 GUEST_ABI int hle_create_sema(HostSema** out, const char* name, unsigned attr, int init, int max, void*) {
     if (!out || init < 0 || max <= 0 || init > max) {
@@ -1134,7 +1146,7 @@ GUEST_ABI int hle_delete_sema(HostSema* h) {
     }
     bool free_now = false;
     {
-        std::lock_guard<std::mutex> lk(h->mu);
+        std::lock_guard<HostLock> lk(h->mu);
         h->dead = true;
         free_now = h->waiters == 0;
         h->cv.notify_all();
@@ -1152,7 +1164,7 @@ GUEST_ABI int hle_wait_sema(HostSema* h, int need, std::uint32_t* timeout) {
     if (!h || need <= 0) {
         return sce_err(EINVAL);
     }
-    std::unique_lock<std::mutex> lk(h->mu);
+    std::unique_lock<HostLock> lk(h->mu);
     if (h->dead) {
         return sce_err(EINVAL);
     }
@@ -1164,6 +1176,8 @@ GUEST_ABI int hle_wait_sema(HostSema* h, int need, std::uint32_t* timeout) {
         return sce_err(EBUSY);
     }
     ++h->waiters;
+    if (need > 1) ++h->multi_waiters;
+    g_sema_sleeps.fetch_add(1, std::memory_order_relaxed);
     bool ok = true;
     const auto start = std::chrono::steady_clock::now();
     auto ready = [&] { return h->dead || h->count >= need; };
@@ -1173,6 +1187,7 @@ GUEST_ABI int hle_wait_sema(HostSema* h, int need, std::uint32_t* timeout) {
         h->cv.wait(lk, ready);
     }
     --h->waiters;
+    if (need > 1) --h->multi_waiters;
     if (h->dead) {
         const bool last = h->waiters == 0;
         lk.unlock();
@@ -1198,7 +1213,7 @@ GUEST_ABI int hle_signal_sema(HostSema* h, int count) {
     if (!h || count <= 0) {
         return sce_err(EINVAL);
     }
-    std::lock_guard<std::mutex> lk(h->mu);
+    std::lock_guard<HostLock> lk(h->mu);
     if (h->dead) {
         return sce_err(EINVAL);
     }
@@ -1207,7 +1222,19 @@ GUEST_ABI int hle_signal_sema(HostSema* h, int count) {
     }
     h->count += count;
     if (h->waiters) {
-        h->cv.notify_all();
+        // Every logged CreateSema is binary (init 0, max 1) with one waiter
+        // at most, so this is mostly one wake for one token either way.
+        static const bool wake_all = [] {
+            const char* e = std::getenv("BBHOST_SEMA_WAKE_ALL");
+            return e && e[0] == '1';
+        }();
+        if (wake_all || h->multi_waiters || count >= h->waiters) {
+            h->cv.notify_all();
+            g_sema_wakes.fetch_add(static_cast<std::uint64_t>(h->waiters), std::memory_order_relaxed);
+        } else {
+            for (int i = 0; i < count; ++i) h->cv.notify_one();
+            g_sema_wakes.fetch_add(static_cast<std::uint64_t>(count), std::memory_order_relaxed);
+        }
     }
     return 0;
 }
@@ -1221,7 +1248,7 @@ GUEST_ABI int hle_cancel_sema(HostSema* h, int set_count, int* num_waiters) {
     if (!h) {
         return sce_err(EINVAL);
     }
-    std::lock_guard<std::mutex> lk(h->mu);
+    std::lock_guard<HostLock> lk(h->mu);
     if (num_waiters) {
         *num_waiters = h->waiters;
     }
@@ -1236,11 +1263,11 @@ GUEST_ABI int hle_clock_gettime(int clock_id, void* ts) {
     if (!ts) {
         return sce_err(EINVAL);
     }
-    std::int64_t sec = 0;
-    std::int64_t nsec = 0;
-    // clock_gettime on both: winpthreads implements the four POSIX clocks
-    // (monotonic through QueryPerformanceCounter).
-    clockid_t id = CLOCK_REALTIME;
+    g_hle_clock_reads.clock_gettime.add();
+    // FreeBSD's ids: the monotonic and uptime family from the host's
+    // monotonic count, the CPU-time ones from the system (winpthreads asks
+    // GetThreadTimes/GetProcessTimes), everything else wall-clock time.
+    std::int64_t ns = 0;
     switch (clock_id) {
         case 4:
         case 5:
@@ -1248,27 +1275,25 @@ GUEST_ABI int hle_clock_gettime(int clock_id, void* ts) {
         case 8:
         case 11:
         case 12:
-            id = CLOCK_MONOTONIC;
+            ns = static_cast<std::int64_t>(host_clock_monotonic_ns());
             break;
         case 14:
-            id = CLOCK_THREAD_CPUTIME_ID;
-            break;
         case 2:
-        case 15:
-            id = CLOCK_PROCESS_CPUTIME_ID;
+        case 15: {
+            timespec host{};
+            if (clock_gettime(clock_id == 14 ? CLOCK_THREAD_CPUTIME_ID : CLOCK_PROCESS_CPUTIME_ID, &host) != 0) {
+                clock_gettime(CLOCK_REALTIME, &host);
+            }
+            ns = static_cast<std::int64_t>(host.tv_sec) * 1000000000ll + static_cast<std::int64_t>(host.tv_nsec);
             break;
+        }
         default:
+            ns = host_clock_realtime_ns();
             break;
     }
-    timespec host{};
-    if (clock_gettime(id, &host) != 0) {
-        clock_gettime(CLOCK_REALTIME, &host);
-    }
-    sec = static_cast<std::int64_t>(host.tv_sec);
-    nsec = static_cast<std::int64_t>(host.tv_nsec);
     auto* out = static_cast<std::int64_t*>(ts);
-    out[0] = sec;
-    out[1] = nsec;
+    out[0] = ns / 1000000000ll;
+    out[1] = ns % 1000000000ll;
     return 0;
 }
 
@@ -1375,7 +1400,7 @@ GUEST_ABI int hle_delete_equeue(HostEqueue* eq) {
     }
     bool free_now = false;
     {
-        std::lock_guard<std::mutex> lock(eq->mu);
+        std::lock_guard<HostLock> lock(eq->mu);
         eq->dead = true;
         free_now = eq->waiters == 0;
         eq->cv.notify_all();
@@ -1391,10 +1416,11 @@ GUEST_ABI int hle_wait_equeue(HostEqueue* eq, HostEvent* ev, int num, int* out, 
     if (!eq || !equeue_live(eq) || num <= 0) {
         return sce_err(EINVAL);
     }
-    std::unique_lock<std::mutex> lk(eq->mu);
+    std::unique_lock<HostLock> lk(eq->mu);
     auto ready = [&] { return eq->dead || !eq->q.empty(); };
     bool ok = true;
     ++eq->waiters;
+    if (!ready() && !(timeout && *timeout == 0)) g_eq_sleeps.fetch_add(1, std::memory_order_relaxed);
     if (timeout == nullptr) {
         eq->cv.wait(lk, ready);
     } else if (*timeout == 0) {
@@ -1428,16 +1454,63 @@ GUEST_ABI int hle_wait_equeue(HostEqueue* eq, HostEvent* ev, int num, int* out, 
     return n > 0 ? 0 : sce_err(ETIMEDOUT);
 }
 GUEST_ABI std::uint64_t hle_kernel_time() {
-    timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<std::uint64_t>(ts.tv_sec) * 1000000ull +
-           static_cast<std::uint64_t>(ts.tv_nsec) / 1000ull;
+    g_hle_clock_reads.process_time.add();
+    return host_clock_monotonic_ns() / 1000ull;
 }
 
-GUEST_ABI std::uint64_t hle_read_tsc() { return rdtsc_now(); }
+GUEST_ABI std::uint64_t hle_read_tsc() {
+    g_hle_clock_reads.tsc.add();
+    return rdtsc_now();
+}
 GUEST_ABI std::uint64_t hle_tsc_frequency() { return kGuestTscHz; }
 
 }  // namespace
+
+HleClockReads g_hle_clock_reads;
+
+// The clock entries need no thread-local state, so the guest calls them
+// without the FS- and stack-switching thunk, as it calls memcpy (hle/libc.cpp
+// REG_RAW) - only in GS mode (Windows always), where the host's FS (errno,
+// the C library's thread data, which the CPU-time clocks may touch) stays in
+// place while the guest runs. BBHOST_RAW_CLOCK=0 thunks them again.
+bool hle_raw_clock() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_RAW_CLOCK");
+        return tls_gs_mode() && !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+std::string hle_timing_window(double secs, std::string* sync) {
+    // Totals since the start; the lines give rates over this window. Called
+    // from the 300-flip report only (one thread).
+    struct Snap {
+        std::uint64_t v[16];
+    };
+    static Snap last{};
+    const gsync::SyncCounts s = gsync::counts();
+    const HostFutexCounts f = host_futex_counts();
+    const Snap now{{g_hle_clock_reads.gettimeofday.total(), g_hle_clock_reads.clock_gettime.total(),
+                    g_hle_clock_reads.process_time.total(), g_hle_clock_reads.tsc.total(), g_hle_clock_reads.time.total(),
+                    g_hle_clock_reads.clock.total(), s.mutex_contended, s.cond_waits, s.cond_signals, s.rw_sleeps,
+                    g_sema_sleeps.load(), g_sema_wakes.load(), g_eq_sleeps.load(), f.sleeps, f.timeouts, f.wakes}};
+    const double per = secs > 0.0 ? 1.0 / secs : 0.0;
+    const auto rate = [&](int i) { return static_cast<double>(now.v[i] - last.v[i]) * per; };
+    char buf[320];
+    std::snprintf(buf, sizeof(buf), "clock reads/s gettimeofday=%.0f clock_gettime=%.0f process-time=%.0f tsc=%.0f time=%.0f clock=%.0f (%s)",
+                  rate(0), rate(1), rate(2), rate(3), rate(4), rate(5), hle_raw_clock() ? "raw" : "thunked");
+    if (sync) {
+        char sb[400];
+        std::snprintf(sb, sizeof(sb),
+                      "waits/s mutex=%.0f cond=%.0f (signals %.0f) rwlock=%.0f sema=%.0f (woken %.0f) equeue=%.0f; "
+                      "sleeps/s %.0f (timed out %.0f), wakes/s %.0f, on %s",
+                      rate(6), rate(7), rate(8), rate(9), rate(10), rate(11), rate(12), rate(13), rate(14), rate(15),
+                      host_futex_native() ? "the word sleep" : "parked condition variables (BBHOST_FUTEX=0)");
+        *sync = sb;
+    }
+    last = now;
+    return buf;
+}
 
 bool equeue_live(HostEqueue* eq) {
     std::lock_guard<std::mutex> lock(g_eq_mu);
@@ -1448,7 +1521,7 @@ void equeue_post(HostEqueue* eq, const HostEvent& ev) {
     if (!eq) {
         return;
     }
-    std::lock_guard<std::mutex> lock(eq->mu);
+    std::lock_guard<HostLock> lock(eq->mu);
     if (!eq->dead) {
         eq->q.push_back(ev);
         eq->cv.notify_all();
@@ -1476,12 +1549,26 @@ void hle_register_kernel() {
     REG("sceKernelCreateEqueue", hle_create_equeue);
     REG("sceKernelDeleteEqueue", hle_delete_equeue);
     REG("sceKernelWaitEqueue", hle_wait_equeue);
-    REG("sceKernelClockGettime", hle_clock_gettime);
+#define REG_CLOCK(name, fn) \
+    (hle_raw_clock() ? register_hle_fn_raw(name, reinterpret_cast<void*>(fn)) : register_hle_fn(name, reinterpret_cast<void*>(fn)))
+    rdtsc_now();  // the clock statics set up here, not in a raw entry's first call
+    REG_CLOCK("sceKernelClockGettime", hle_clock_gettime);
     REG("sceKernelQueryMemoryProtection", hle_query_prot);
     REG("sceKernelVirtualQuery", hle_virtual_query);
     REG("sceKernelGetDirectMemoryType", hle_direct_mem_type);
-    REG("sceKernelGetProcessTime", hle_kernel_time);
-    REG("sceKernelReadTsc", hle_read_tsc);
-    REG("sceKernelGetTscFrequency", hle_tsc_frequency);
+    REG_CLOCK("sceKernelGetProcessTime", hle_kernel_time);
+    REG_CLOCK("sceKernelReadTsc", hle_read_tsc);
+    REG_CLOCK("sceKernelGetTscFrequency", hle_tsc_frequency);
+#undef REG_CLOCK
 #undef REG
+    host_log("timing: the guest's clocks (gettimeofday, time, clock, sceKernelClockGettime, GetProcessTime, ReadTsc) %s; "
+             "its mutexes, condition variables, read/write locks, semaphores and event queues sleep on %s, %u pauses of spin "
+             "before a contended lock sleeps (BBHOST_FUTEX_SPIN)",
+             hle_raw_clock() ? "bound raw, read from the performance counter (BBHOST_RAW_CLOCK=0: thunked)" : "thunked (BBHOST_RAW_CLOCK=0 or FS mode)",
+#if defined(_WIN32)
+             host_futex_native() ? "WaitOnAddress (BBHOST_FUTEX=0: winpthreads)" : "winpthreads' condition variables (BBHOST_FUTEX=0)",
+#else
+             host_futex_native() ? "futex (BBHOST_FUTEX=0: std::condition_variable)" : "std::condition_variable (BBHOST_FUTEX=0)",
+#endif
+             host_futex_spin());
 }

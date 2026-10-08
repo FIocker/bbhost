@@ -1940,6 +1940,10 @@ void cp_thread(Queue* q, int id) {
         char name[16];
         std::snprintf(name, sizeof(name), "bb-cp%d", id);
         host_thread_set_name(name);
+        // Above the guest's threads on Windows: the game's frame waits on
+        // this one, and a GX worker that took its core delayed every draw
+        // behind it (core/host_clock.h, BBHOST_THREAD_PRIO=0).
+        host_thread_set_class(HostThreadClass::GpuFeed, name);
     }
     CpuProfile profile = id == 0 ? cpu_profile_config() : CpuProfile{};
     for (;;) {

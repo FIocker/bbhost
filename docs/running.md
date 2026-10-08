@@ -163,6 +163,13 @@ by and the values it wrote. The start of the log says which rate runs and how
 many values and code sites were converted (`frame rate:` lines), and names
 any site whose bytes were not the expected ones (that rate is then refused:
 90 or uncapped falls back to 60).
+A frame goes to the screen as soon as the game has finished it; only its flip,
+which the game paces itself on, waits for the next tick of that clock. The game
+keeps two flips queued, and showing each frame at the tick that completed it
+held every frame two refreshes behind (`BBHOST_PRESENT_ON_ARRIVAL=0` brings that
+back, to compare). Every 300 flips the log's `pacing:` line says how late the
+clock's ticks woke and how long flips took from queued to shown and to
+completed.
 
 ## Online
 

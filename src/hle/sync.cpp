@@ -1,6 +1,7 @@
 #include "host/frame_stats.h"
 #include "hle/guest_fs.h"
 #include "hle/sync.h"
+#include "core/futex.h"
 #include "log.h"
 
 #include <atomic>
@@ -112,14 +113,22 @@ constexpr std::uint32_t kMagicDead = 0x44414544u;    // 'DEAD'
 // mutex_unlock_fast); a contender takes m, marks the word 2 and sleeps on cv,
 // and whoever releases a 2 wakes one sleeper under m, so no wakeup is lost.
 // owner and count belong to the holder.
+//
+// m and cv (and every other object's here) are core/futex.h's word lock and
+// sequence-word condition variable, not std::mutex/std::condition_variable:
+// on Windows those are winpthreads', a few system calls and kernel objects
+// a wait, millisecond timeouts against the system tick. A contended guest
+// lock, a condition wait and a read/write sleeper now cost one
+// WaitOnAddress, and their wake one WakeByAddress (BBHOST_FUTEX=0: the old
+// primitives underneath, for an A/B).
 struct Mutex {
     std::uint32_t magic;
     int type;
     std::atomic<std::uint32_t> word;
     int count;
     std::atomic<Thread*> owner;
-    std::mutex m;
-    std::condition_variable cv;
+    HostLock m;
+    HostCondVar cv;
     int waiters;  // under m
     bool dead;    // under m
 };
@@ -128,8 +137,8 @@ struct Mutex {
 // was already satisfied (the seq-compare scheme lost wakeups).
 struct Cond {
     std::uint32_t magic;
-    std::mutex m;
-    std::condition_variable cv;
+    HostLock m;
+    HostCondVar cv;
     int signals;
     int waiters;
     bool dead;
@@ -142,8 +151,8 @@ struct Cond {
 // make ~800 rdlock/unlock calls a frame, and every one took m.
 struct Rwlock {
     std::uint32_t magic;
-    std::mutex m;
-    std::condition_variable cv;
+    HostLock m;
+    HostCondVar cv;
     std::atomic<std::uint32_t> state;
     std::atomic<std::uint32_t> waiters;  // threads asleep (or about to be) on cv
     std::atomic<Thread*> writer;         // the holder while bit 31 is set
@@ -217,7 +226,7 @@ T* get_or_init(void** slot, std::uint32_t magic, Init init) {
 }
 
 template <typename Pred>
-bool wait_until(std::condition_variable& cv, std::unique_lock<std::mutex>& lk, const Deadline* dl, Pred pred) {
+bool wait_until(HostCondVar& cv, std::unique_lock<HostLock>& lk, const Deadline* dl, Pred pred) {
     if (!dl) {
         cv.wait(lk, pred);
         return true;
@@ -227,7 +236,16 @@ bool wait_until(std::condition_variable& cv, std::unique_lock<std::mutex>& lk, c
 
 thread_local Thread* t_current = nullptr;
 
+// For the 300-flip report's timing line (counts(), below): how often the
+// slow paths run, i.e. how much the sleeping primitive matters.
+std::atomic<std::uint64_t> g_mutex_contended{0}, g_cond_waits{0}, g_cond_signals{0}, g_rw_sleeps{0};
+
 }  // namespace
+
+SyncCounts counts() {
+    return {g_mutex_contended.load(std::memory_order_relaxed), g_cond_waits.load(std::memory_order_relaxed),
+            g_cond_signals.load(std::memory_order_relaxed), g_rw_sleeps.load(std::memory_order_relaxed)};
+}
 
 // ---------------------------------------------------------------- thread
 struct Thread {
@@ -288,7 +306,7 @@ int mutex_destroy(void** slot) {
         return kEINVAL;
     }
     {
-        std::unique_lock<std::mutex> lk(m->m);
+        std::unique_lock<HostLock> lk(m->m);
         if (m->word.load(std::memory_order_relaxed) != 0 || m->waiters) {
             return kEBUSY;
         }
@@ -321,7 +339,7 @@ void mutex_release(Mutex* m) {
     m->count = 0;
     m->owner.store(nullptr, std::memory_order_relaxed);
     if (m->word.exchange(0, std::memory_order_release) == 2) {
-        std::lock_guard<std::mutex> lk(m->m);
+        std::lock_guard<HostLock> lk(m->m);
         m->cv.notify_one();
     }
 }
@@ -347,7 +365,17 @@ int mutex_lock_impl(Mutex* m, const Deadline* dl, bool try_only) {
     if (try_only) {
         return kEBUSY;
     }
-    std::unique_lock<std::mutex> lk(m->m);
+    // BBHOST_FUTEX_SPIN=<n>: look for the holder to let go before sleeping
+    // (off by default: Kyo's stress test of the same lock measured a spin
+    // costing 2-5x, and on the APU a spinning core takes the GPU's power).
+    for (unsigned i = 0, n = host_futex_spin(); i < n; ++i) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#endif
+        if (m->word.load(std::memory_order_relaxed) == 0 && mutex_take(m, self)) return 0;
+    }
+    g_mutex_contended.fetch_add(1, std::memory_order_relaxed);
+    std::unique_lock<HostLock> lk(m->m);
     ++m->waiters;
     // Marking the word 2 and finding it was 0 takes the mutex; otherwise the
     // holder will see the 2 and wake a sleeper.
@@ -524,7 +552,7 @@ int cond_destroy(void** slot) {
         return kEINVAL;
     }
     {
-        std::unique_lock<std::mutex> lk(c->m);
+        std::unique_lock<HostLock> lk(c->m);
         if (c->waiters) {
             return kEBUSY;
         }
@@ -544,7 +572,7 @@ int cond_wait(void** cond_slot, void** mutex_slot, const Deadline* dl) {
     }
     Thread* self = current_thread();
     int saved_count = 0;
-    std::unique_lock<std::mutex> ck(c->m);
+    std::unique_lock<HostLock> ck(c->m);
     ++c->waiters;
     {
         // Release the guest mutex completely (even a recursive one).
@@ -555,6 +583,7 @@ int cond_wait(void** cond_slot, void** mutex_slot, const Deadline* dl) {
         saved_count = m->count;
         mutex_release(m);
     }
+    g_cond_waits.fetch_add(1, std::memory_order_relaxed);
     bool ok = wait_until(c->cv, ck, dl, [&] { return c->signals > 0 || c->dead; });
     if (ok && c->signals > 0) {
         --c->signals;
@@ -581,10 +610,11 @@ int cond_signal(void** slot, bool all) {
     if (!c) {
         return kEINVAL;
     }
-    std::unique_lock<std::mutex> lk(c->m);
+    std::unique_lock<HostLock> lk(c->m);
     if (!c->waiters) {
         return 0;
     }
+    g_cond_signals.fetch_add(1, std::memory_order_relaxed);
     if (all) {
         c->signals = c->waiters;
         c->cv.notify_all();
@@ -616,7 +646,7 @@ int rw_destroy(void** slot) {
         return kEINVAL;
     }
     {
-        std::unique_lock<std::mutex> lk(r->m);
+        std::unique_lock<HostLock> lk(r->m);
         if (r->state.load() != 0 || r->waiters.load() != 0) {
             return kEBUSY;
         }
@@ -649,7 +679,7 @@ bool rw_try_take(Rwlock* r, bool write) {
 // `waiters` before it looked at the state, so one of the two sees the other).
 void rw_wake(Rwlock* r) {
     if (r->waiters.load() == 0) return;
-    { std::lock_guard<std::mutex> lk(r->m); }
+    { std::lock_guard<HostLock> lk(r->m); }
     r->cv.notify_all();
 }
 
@@ -662,7 +692,8 @@ int rw_lock_impl(Rwlock* r, bool write, const Deadline* dl, bool try_only) {
         if (try_only) {
             return kEBUSY;
         }
-        std::unique_lock<std::mutex> lk(r->m);
+        g_rw_sleeps.fetch_add(1, std::memory_order_relaxed);
+        std::unique_lock<HostLock> lk(r->m);
         r->waiters.fetch_add(1);
         const bool ok = wait_until(r->cv, lk, dl, [&] { return r->dead || rw_try_take(r, write); });
         r->waiters.fetch_sub(1);

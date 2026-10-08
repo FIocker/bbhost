@@ -21,6 +21,7 @@
 #include "host/gpu_internal.h"
 
 #include <algorithm>
+#include "core/host_clock.h"
 #include "core/portable.h"
 
 #include "log.h"
@@ -242,6 +243,7 @@ const int g_recorder_spin = [] {
 
 void recorder_thread() {
     host_thread_set_name("bb-record");
+    host_thread_set_class(HostThreadClass::GpuFeed, "bb-record");  // with the command processor it serves
     const int spin = g_recorder_spin;
     std::uint64_t done = 0;
     for (;;) {
