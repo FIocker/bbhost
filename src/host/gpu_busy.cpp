@@ -242,10 +242,12 @@ void busy_init_locked() {
              bits, static_cast<double>(g.timestamp_period_ns));
 }
 
-// The callers have just taken g_cmd() (vkBeginCommandBuffer, the barrier
-// before vkEndCommandBuffer), so the recorder holds nothing of this command
-// buffer: g.cmd_ is it, and these two do not show up as recording sites in
-// BBHOST_GPU_PROFILE=2's gaps.
+// With the command stream (recorder.cpp) these are ops the recorder replays
+// right after its vkBeginCommandBuffer and before its vkEndCommandBuffer.
+// Without it the callers have just taken g_cmd() (vkBeginCommandBuffer, the
+// barrier before vkEndCommandBuffer), so the recorder holds nothing of this
+// command buffer: g.cmd_ is it, and these two do not show up as recording
+// sites in BBHOST_GPU_PROFILE=2's gaps.
 void busy_begin_locked(Gpu::Slot& sl) {
     // A slot is retired before it is recorded again, which reads its pair; one
     // that was not would hold the game's spans back for good (`out`), so it
@@ -253,13 +255,23 @@ void busy_begin_locked(Gpu::Slot& sl) {
     if (sl.busy_written) deliver(kGame, 0, 0, false);
     sl.busy_written = false;
     if (!g.busy || !sl.busy_pool) return;
-    vkCmdResetQueryPool(g.cmd_, sl.busy_pool, 0, 2);  // outside any render pass: nothing is recorded yet
+    // Outside any render pass: nothing is recorded yet.
+    if (stream_on()) {
+        rec().reset_query_pool(sl.busy_pool, 0, 2);
+        rec().write_timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.busy_pool, 0);
+        return;
+    }
+    vkCmdResetQueryPool(g.cmd_, sl.busy_pool, 0, 2);
     vkCmdWriteTimestamp(g.cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.busy_pool, 0);
 }
 
 void busy_end_locked(Gpu::Slot& sl) {
     if (!g.busy || !sl.busy_pool) return;
-    vkCmdWriteTimestamp(g.cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.busy_pool, 1);
+    if (stream_on()) {
+        rec().write_timestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.busy_pool, 1);
+    } else {
+        vkCmdWriteTimestamp(g.cmd_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.busy_pool, 1);
+    }
     sl.busy_written = true;
 }
 

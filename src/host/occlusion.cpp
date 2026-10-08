@@ -245,37 +245,37 @@ void resolve_locked(bool mid) {
     if (!so.ready || so.items_done == so.nitems) return;
     transfer_flush_locked();
     render_end_pass_locked();
-    const VkCommandBuffer cmd = g_cmd();
+    // Ops of the command stream (recorder.cpp): the recorder replays them
+    // after the draws whose queries they read; without it, in place.
     // The draws (their queries end with them) and every earlier write of
     // guest memory, before the copy and the shader.
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
-                         &mb, 0, nullptr, 0, nullptr);
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0,
+                           nullptr, 0, nullptr);
     if (so.queries > so.queries_done) {
         // With availability and without waiting: a query AMD never resolves
         // must not hang the GPU; the shader leaves its dump unwritten.
-        vkCmdCopyQueryPoolResults(cmd, so.pool, so.queries_done, so.queries - so.queries_done, so.results.buffer,
-                                  16ull * so.queries_done, 16,
-                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | (g_wait ? VK_QUERY_RESULT_WAIT_BIT : 0));
+        rec().copy_query_results(so.pool, so.queries_done, so.queries - so.queries_done, so.results.buffer, 16ull * so.queries_done, 16,
+                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT | (g_wait ? VK_QUERY_RESULT_WAIT_BIT : 0));
         VkMemoryBarrier cb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         cb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         cb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &cb, 0, nullptr, 0, nullptr);
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &cb, 0, nullptr, 0, nullptr);
     }
     const Push push{so.items.address + 16ull * so.items_done, so.results.address, g_state.address, g_preds.address,
                     so.nitems - so.items_done, g_precise ? 0u : 1u};
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g_pipeline);
-    vkCmdPushConstants(cmd, g_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-    vkCmdDispatch(cmd, 1, 1, 1);
+    rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, g_pipeline);
+    rec().push_constants(g_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    rec().dispatch(1, 1, 1);
     // The counts in guest memory before anything after them - the label
     // fills, the game's own reads, conditional rendering's predicate reads.
     VkMemoryBarrier ab{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     ab.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     ab.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
-                         &ab, 0, nullptr, 0, nullptr);
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &ab, 0,
+                           nullptr, 0, nullptr);
     so.items_done = so.nitems;
     so.queries_done = so.queries;
     ++g_counts.resolves;
@@ -377,7 +377,7 @@ void occlusion_begin_recording_locked() {
     if (!g_on) return;
     SlotOcc& so = g_occ[g.slot];
     // The queries the slot's last recording used; its submission has retired.
-    if (so.to_reset) vkCmdResetQueryPool(g_cmd(), so.pool, 0, so.to_reset);
+    if (so.to_reset) rec().reset_query_pool(so.pool, 0, so.to_reset);
     so.to_reset = 0;
     so.queries = so.nitems = so.queries_done = so.items_done = 0;
     so.ready = true;

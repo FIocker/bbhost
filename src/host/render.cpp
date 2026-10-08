@@ -5843,7 +5843,7 @@ void apply_lean_builds_locked() {
 // The barrier a pass ended between draws still owes, paid now (no pass open).
 void pay_pass_barrier_locked() {
     if (g_hazards.owed) {
-        if (DrawCmds* c = DrawCmds::open(); !c || !c->pass_barrier()) record_pass_barrier(g_cmd());
+        if (DrawCmds* c = DrawCmds::open(); !c || !c->pass_barrier()) rec().pass_barrier();
         g_barriers_paid.fetch_add(1, std::memory_order_relaxed);
     }
     g_hazards.owed = false;
@@ -5859,7 +5859,7 @@ void end_pass_for_draw_locked() {
         return;
     }
     g_pass.active = false;
-    if (DrawCmds* c = DrawCmds::open(); !c || !c->end_rendering(false)) record_end_rendering(g_cmd(), false);
+    if (DrawCmds* c = DrawCmds::open(); !c || !c->end_rendering(false)) rec().end_rendering(false);
     for (int t = 0; t < g_pass.ntargets; ++t) g_hazards.written.insert(g_pass.targets[t]);
     g_hazards.owed = true;
     copy_versions_pass_end_locked();
@@ -6457,7 +6457,7 @@ void render_end_pass_locked() {
     if (g_pass.active) {
         g_pass.active = false;
         // Into the open draw's packet when it can take it (recorder.cpp).
-        if (DrawCmds* c = DrawCmds::open(); !c || !c->end_rendering()) record_end_rendering(g_cmd());
+        if (DrawCmds* c = DrawCmds::open(); !c || !c->end_rendering()) rec().end_rendering(true);
         if (g_pass.profiled) {
             profile_end_locked();
             g_pass.profiled = false;
@@ -13455,6 +13455,8 @@ void host_gpu_hang_report() {
         const char* const step = host_present_step(present_for);
         host_log("hang: %s; the presenting thread is %s (%.1f s); the renderer's lock is held by %s", submit_thread_report().c_str(), step,
                  present_for, GpuMutex::name_of(g.mu.holder()).c_str());
+        // Where the command stream's recorder is (recorder.cpp).
+        if (const std::string s = stream_last_op(); !s.empty()) host_log("hang: %s", s.c_str());
     }
     const std::uint64_t next = g_draw_rec_next;
     const std::uint64_t first = next > 6 ? next - 6 : 0;
