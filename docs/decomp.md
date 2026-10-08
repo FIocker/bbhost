@@ -57,6 +57,10 @@ when there is a reason to change them, not for their own sake.
 | echoes for a kill (`sub_1cfc860`) | `0x1cfc860` | the victim's `haveSoulRate` effects (scaled by the clear count for `bGameClearBonus` effects: 1, 1.1, 1.25, 1.5, 2, 2.5), halved or x1.2 for a cooperator, rounded up past 5e-6 | 200,000 generated cases: 0 differences; no kill in the test sessions |
 | scripts' penalty (`lua_cli_ExcutePenalty`) | `0x1734e40` | the Lua binding that takes a share of the echoes and some insight (not what a death costs) | 200,000 generated cases: 0 differences; not called in the test sessions |
 | level-up price check (`sub_1f2f5e0`) | `0x1f2f5e0` | whether an attribute may rise: the planned level's price (`CalcCorrectGraph` row 200) against the echoes not yet committed | 200,000 generated cases, 41,942 of them at the price itself: 0 differences; not reached in a world session (the level-up screen) |
+| chalice roll (`dungeon_ritual_config_initialize`) | `0x1eaeec0` | a chalice ritual's dungeon: which of its prebuilt layouts (the open unlock ranges weighted by size) and its rites | 20,000 rolls against the game's own code over generated params, flags and draws (`tests/chalice_test.cpp`); in the game, 1,500 rolls through the real rows, flags and heap on a copy of the game's generator: 0 differences |
+| a rite's pick (`sub_2316e70`) | `0x2316e70` | one of a DungeonSubFeatLotParam row's ten rates, by weight | 20,000 picks against the game's own code |
+| chalice map uid (`sub_231fbc0`) | `0x231fbc0` | the setup's map uid: `m29_AA_BB_CC` from the layout, or the row's own for a fixed chalice | 60,000 against the game's own code; 6,000 compared in the game, 0 differences |
+| chalice feature pairs (`sub_1eaf9d0`) | `0x1eaf9d0` | the nine (lot, feature) pairs the dungeon loads with | 40,000 sets against the game's own code; 1,500 compared in the game, 0 differences |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -78,6 +82,12 @@ The player-data functions are where every echo the player gains, the price
 of every level and the drop chance of every kill are decided: a mod that changes those rules changes one function each, not the
 sites that call them. They read their constants where the game does, so a
 patch to one of those still applies.
+Chalice dungeons are not generated: each root dungeon is one of 100 or 200
+layouts built ahead of time, and a ritual rolls which one, and its rites, when
+the altar's menu opens - from the game's random generator, seeded from the
+clock, so no glyph-like seed reproduces a roll in the game itself (glyphs are
+the online server's keywords). With the roll as source, a mod can pick any
+layout and any rites, or open every range.
 
 The four event-flag functions are every read and write the game makes through
 its flag store - event scripts, Lua, talk scripts, the online session. With
