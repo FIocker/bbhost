@@ -74,7 +74,7 @@ const char* stream::op_name(stream::Op op) {
                                         "copy order",     "pass barrier", "end rendering",  "begin rendering", "fill",     "copy",
                                         "copy to image",  "copy to buffer", "clear",        "reset queries", "begin query", "end query",
                                         "copy queries",   "timestamp",    "bind pipeline",  "bind sets",     "push constants", "update sets",
-                                        "dispatch"};
+                                        "dispatch",       "clear depth",  "copy image",     "dispatch indirect"};
     static_assert(sizeof(names) / sizeof(names[0]) == static_cast<std::size_t>(stream::Op::kCount), "a name for every op");
     const auto k = static_cast<std::size_t>(op);
     return k < static_cast<std::size_t>(stream::Op::kCount) ? names[k] : "?";
@@ -530,6 +530,23 @@ void replay_block(const Block& b) {
         case Op::kDispatch: {
             const auto* r = reinterpret_cast<const stream::Dispatch*>(p);
             vkCmdDispatch(cmd, r->x, r->y, r->z);
+            break;
+        }
+        case Op::kClearDepth: {
+            const auto* r = reinterpret_cast<const stream::ClearDepth*>(p);
+            const std::uint8_t* q = p + round8(sizeof(*r));
+            vkCmdClearDepthStencilImage(cmd, r->image, r->layout, &r->value, r->n, tail<VkImageSubresourceRange>(q, r->n));
+            break;
+        }
+        case Op::kCopyImage: {
+            const auto* r = reinterpret_cast<const stream::CopyImage*>(p);
+            const std::uint8_t* q = p + round8(sizeof(*r));
+            vkCmdCopyImage(cmd, r->src, r->src_layout, r->dst, r->dst_layout, r->n, tail<VkImageCopy>(q, r->n));
+            break;
+        }
+        case Op::kDispatchIndirect: {
+            const auto* r = reinterpret_cast<const stream::DispatchIndirect*>(p);
+            vkCmdDispatchIndirect(cmd, r->buffer, r->offset);
             break;
         }
         case Op::kCount: break;
@@ -1200,6 +1217,33 @@ void Rec::dispatch(std::uint32_t x, std::uint32_t y, std::uint32_t z) {
     before_op(REC_SITE);
     std::uint8_t* at = append_record(Op::kDispatch, sizeof(stream::Dispatch));
     *put_struct<stream::Dispatch>(at) = stream::Dispatch{x, y, z, 0};
+    after_op();
+}
+
+void Rec::clear_depth_stencil_image(VkImage image, VkImageLayout layout, const VkClearDepthStencilValue& value, std::uint32_t n,
+                                    const VkImageSubresourceRange* ranges) {
+    if (!stream_on()) return vkCmdClearDepthStencilImage(in_place(REC_SITE), image, layout, &value, n, ranges);
+    before_op(REC_SITE);
+    std::uint8_t* at = append_record(Op::kClearDepth, round8(sizeof(stream::ClearDepth)) + round8(n * sizeof(VkImageSubresourceRange)));
+    *put_struct<stream::ClearDepth>(at) = stream::ClearDepth{image, layout, n, value};
+    put_array(at, ranges, n);
+    after_op();
+}
+
+void Rec::copy_image(VkImage src, VkImageLayout src_layout, VkImage dst, VkImageLayout dst_layout, std::uint32_t n, const VkImageCopy* regions) {
+    if (!stream_on()) return vkCmdCopyImage(in_place(REC_SITE), src, src_layout, dst, dst_layout, n, regions);
+    before_op(REC_SITE);
+    std::uint8_t* at = append_record(Op::kCopyImage, round8(sizeof(stream::CopyImage)) + round8(n * sizeof(VkImageCopy)));
+    *put_struct<stream::CopyImage>(at) = stream::CopyImage{src, dst, src_layout, dst_layout, n, 0};
+    put_array(at, regions, n);
+    after_op();
+}
+
+void Rec::dispatch_indirect(VkBuffer buffer, VkDeviceSize offset) {
+    if (!stream_on()) return vkCmdDispatchIndirect(in_place(REC_SITE), buffer, offset);
+    before_op(REC_SITE);
+    std::uint8_t* at = append_record(Op::kDispatchIndirect, sizeof(stream::DispatchIndirect));
+    *put_struct<stream::DispatchIndirect>(at) = stream::DispatchIndirect{buffer, offset};
     after_op();
 }
 

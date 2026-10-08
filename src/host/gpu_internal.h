@@ -1275,6 +1275,10 @@ public:
     // stream's earlier commands may still bind in this command buffer).
     void update_sets(std::uint32_t n, const VkWriteDescriptorSet* writes);
     void dispatch(std::uint32_t x, std::uint32_t y, std::uint32_t z);
+    void dispatch_indirect(VkBuffer buffer, VkDeviceSize offset);
+    void clear_depth_stencil_image(VkImage image, VkImageLayout layout, const VkClearDepthStencilValue& value, std::uint32_t n,
+                                   const VkImageSubresourceRange* ranges);
+    void copy_image(VkImage src, VkImageLayout src_layout, VkImage dst, VkImageLayout dst_layout, std::uint32_t n, const VkImageCopy* regions);
 };
 Rec& rec();
 
