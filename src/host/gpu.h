@@ -388,6 +388,16 @@ void host_gpu_shadow_cp_write(std::uint64_t va, std::size_t bytes);
 std::string host_gpu_shadow_report();
 // The draw recorder thread's counts (recorder.cpp), for the same report.
 std::string host_gpu_recorder_report();
+// Occlusion (occlusion.cpp). A ZPASS_DONE dump (EVENT_WRITE PIXEL_PIPE_STAT_DUMP,
+// index 1) at va: true when the real sample counters take it - written on the
+// GPU's timeline - false for the caller's fake (BBHOST_OCCLUSION=0, memory
+// not imported).
+bool host_gpu_zpass_dump(std::uint64_t va);
+// SET_PREDICATION: op 0 clears, 1 predicates the draws that follow on the
+// ZPASS block at `block` (draw if visible, or if not), `cont` ORs it with the
+// block before.
+void host_gpu_set_predication(std::uint64_t block, unsigned op, bool draw_if_visible, bool cont);
+std::string host_gpu_occlusion_report();  // the 300-flip line; empty when off
 // The texture image heap's blocks and use (gpu.cpp).
 std::string host_gpu_image_heap_report();
 // Pixel shaders at wave32 (render.cpp): programs by subgroup size, when any
