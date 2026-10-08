@@ -65,6 +65,10 @@ void* tcb();
 // both the game's code and ours then reach the stub - for what a test
 // cannot set up (a param lookup, a heap search).
 void stub(std::uint64_t bn, const void* host);
+// An import the game's code calls, given a function of the test's (by the
+// name bbhost binds it as, core/plt_names.inc) in place of its trap; false
+// when there is none. After load().
+bool bind(const char* name, const void* fn);
 // A Binary Ninja address in the loaded image.
 inline std::uint8_t* at(std::uint64_t bn) { return reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(bn)); }
 template <class F>
