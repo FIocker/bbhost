@@ -1,9 +1,10 @@
 // The game's functions as our source (docs/decomp.md): a decompiled
 // function takes the game's place at its entry. The whole instructions there
-// become a jump to ours, and a trampoline - those instructions, then a jump
-// back - keeps the game's own version callable, for a compare run and for
-// ours to lean on. Every function is registered here: one list, switched off
-// by name, reported at exit.
+// become a jump to ours, and a trampoline - those instructions, re-aimed to
+// run from there (decomp/insn.h), then a jump back - keeps the game's own
+// version callable, for a compare run and for ours to lean on. Every
+// function is registered here: one list, switched off by name, reported at
+// exit.
 //
 // Each engine area keeps its functions in decomp/<area>.cpp and adds them
 // with decomp_add() before decomp_install() runs (hle/runtime.cpp).
@@ -43,8 +44,8 @@ struct DecompFunction {
     const char* name;           // the game's name where the binary gives one, else sub_<address>
     const char* area;           // its engine-map.md category
     std::uint64_t bn;           // the entry, as Binary Ninja addresses it
-    const std::uint8_t* entry;  // the whole instructions expected there: at least 14 bytes, none
-    std::size_t entry_len;      //   rip-relative, none a branch target
+    const std::uint8_t* entry;  // the whole instructions expected there: at least 5 bytes, none a
+    std::size_t entry_len;      //   branch target (rip-relative ones and relative branches are re-aimed)
     void* ours;                 // GUEST_ABI, the game's signature
     DecompKind kind;
     void** original = nullptr;  // receives the trampoline into the game's version
