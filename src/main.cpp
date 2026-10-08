@@ -111,6 +111,13 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
         const char* e = std::getenv("BBHOST_EXIT_FLIP");
         return e ? std::strtoull(e, nullptr, 10) : 0ull;
     }();
+    // BBHOST_EXIT_SECONDS=N: as BBHOST_EXIT_FLIP, after N seconds of the run
+    // (an uncapped benchmark's flips come at any rate).
+    static const double exit_seconds = [] {
+        const char* e = std::getenv("BBHOST_EXIT_SECONDS");
+        return e ? std::strtod(e, nullptr) : 0.0;
+    }();
+    static const auto run_start = std::chrono::steady_clock::now();
     static const std::uint64_t fault_flip = [] {
         const char* e = std::getenv("BBHOST_FAULT_AT_FLIP");
         return e ? std::strtoull(e, nullptr, 10) : 0ull;
@@ -153,7 +160,8 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
                 if (kind && !std::strcmp(kind, "invalid")) std::fclose(static_cast<FILE*>(nullptr));
                 *static_cast<volatile int*>(nullptr) = 1;
             }
-            if (exit_flip && hle_video_flip_count() >= exit_flip) {
+            if ((exit_flip && hle_video_flip_count() >= exit_flip) ||
+                (exit_seconds > 0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count() >= exit_seconds)) {
                 // The guest keeps running while this prints; the window is
                 // not stopped (that waits for the GPU lock the command
                 // processor may hold), the process just ends.
