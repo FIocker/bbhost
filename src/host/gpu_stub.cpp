@@ -53,6 +53,7 @@ void host_gpu_shadow_cp_write(std::uint64_t, std::size_t) {}
 std::string host_gpu_shadow_report() { return {}; }
 std::string host_gpu_recorder_report() { return {}; }
 std::string host_gpu_image_heap_report() { return {}; }
+std::string host_gpu_ps_wave_report() { return {}; }
 std::string host_gpu_memory_budget_report() { return {}; }
 void host_gpu_set_loading(bool) {}
 void host_gpu_world_reached() {}

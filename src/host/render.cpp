@@ -15,6 +15,7 @@
 #include "host/draw_capture.h"
 #include "gcn/container.h"
 #include "gcn/lift.h"
+#include "gcn/wave.h"
 #include "gcn/isa.h"
 #include "hle/modules.h"
 #include "log.h"
@@ -3689,6 +3690,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                                  pl.ps.meta().spirv.size());
                     }
                     pl.ps.fresh().spirv = std::move(lifted.spirv);
+                    pl.ps.fresh().wave64_needs = 0;  // no cross-lane operation left: any subgroup size (gcn/wave.h)
                     pl.ps.lifted = true;
                 } else if (first) {
                     host_log("render: PS %s not lifted, translated shader kept: %s", ps_name.c_str(), lifted.rejections[0].c_str());
@@ -4176,6 +4178,99 @@ VkPipeline pre_raster_library(const ShaderStage& vs, const ShaderStage& gs, VkPo
     });
 }
 
+// ---- Pixel shaders at wave32 (g.ps_wave, decided in gpu.cpp) ----
+// The fragment stage's subgroup size: 32 for a program that computes the same
+// in a 32-lane subgroup (gcn/wave.h: TranslateResult::wave64_needs 0), the
+// device's own size for the others - asked for in so many words, so a stage
+// that needs its 64 lanes keeps them - or, with BBHOST_PS_WAVE32=driver, the
+// driver's choice. The census counts programs by their SPIR-V, for the report
+// line (ps_wave_census) and the log of a program kept at 64.
+struct PsWaveCensus {
+    std::mutex mu;
+    std::unordered_set<std::uint64_t> programs;  // under mu
+    std::uint64_t at32 = 0, driver = 0, kept = 0;  // under mu: programs
+    std::uint64_t reasons[gcn::kWave64NeedBits] = {};  // under mu: kept programs, by gcn::Wave64Need bit
+    std::uint64_t reported = 0;                        // under mu: programs at the last 300-flip line
+    std::atomic<std::uint64_t> stages{0};              // fragment stages created with a size asked for
+    std::atomic<std::uint64_t> refused{0};             // ... that the driver refused, created again at its default
+} g_ps_wave;
+
+// Gives `si` (a fragment stage, pNext unused) its subgroup size through `req`
+// (or ALLOW_VARYING_SUBGROUP_SIZE). Returns false where the stage is left as
+// it was: BBHOST_PS_WAVE32=0, a device that cannot be asked, a program kept
+// at a default the device cannot be asked for by name.
+bool fragment_stage_wave(const gcn::TranslateResult& meta, VkPipelineShaderStageCreateInfo& si,
+                         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo& req) {
+    if (!g.ps_wave) return false;
+    const bool wave32 = meta.wave64_needs == 0;
+    {
+        const std::uint64_t h = fnv1a(meta.spirv.data(), meta.spirv.size() * 4);
+        std::lock_guard<std::mutex> lk(g_ps_wave.mu);
+        if (g_ps_wave.programs.insert(h).second) {
+            if (wave32) {
+                ++(g.ps_wave == 1 ? g_ps_wave.driver : g_ps_wave.at32);
+            } else {
+                ++g_ps_wave.kept;
+                for (int b = 0; b < gcn::kWave64NeedBits; ++b) g_ps_wave.reasons[b] += (meta.wave64_needs >> b) & 1;
+                if (g_ps_wave.kept <= 20) {
+                    host_log("render: pixel shader %016llx (%s) keeps the device's %u-lane subgroups: %s", static_cast<unsigned long long>(h),
+                             t_library_owner ? t_library_owner : "a draw's", g.subgroup_size, gcn::wave64_needs_str(meta.wave64_needs).c_str());
+                }
+            }
+        }
+    }
+    if (wave32 && g.ps_wave == 1) {
+        si.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT;
+    } else {
+        const std::uint32_t size = wave32 ? 32 : g.subgroup_size;
+        if (!(g.subgroup_required_stages & VK_SHADER_STAGE_FRAGMENT_BIT) || size < g.subgroup_min || size > g.subgroup_max) return false;
+        req = {};
+        req.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO;
+        req.requiredSubgroupSize = size;
+        si.pNext = &req;
+    }
+    g_ps_wave.stages.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+// A fragment stage the driver would not create with the size asked for (a
+// size it lists for the stage, so that would be its bug): `si` goes back to
+// the stage as it was before, at the device's default, for the caller to
+// create again.
+void fragment_stage_unsized(VkPipelineShaderStageCreateInfo& si) {
+    si.pNext = nullptr;
+    si.flags &= ~static_cast<VkPipelineShaderStageCreateFlags>(VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT);
+}
+// The second creation's outcome: counted, and the first few logged, when it
+// worked - then the size was why the first failed. When it failed as well the
+// size was not the reason, and the caller reports the failure as before.
+void fragment_stage_wave_refused(bool created_unsized) {
+    if (!created_unsized) return;
+    if (g_ps_wave.refused.fetch_add(1, std::memory_order_relaxed) < 4) {
+        host_log("render: the driver refused a fragment stage (%s) at the subgroup size asked for; created at its default",
+                 t_library_owner ? t_library_owner : "a draw's");
+    }
+}
+// "ps-wave: ..." for the 300-flip report when programs were added since the
+// last one (`changed_only`), and for the exit report.
+std::string ps_wave_census(bool changed_only) {
+    if (!g.ps_wave) return {};
+    std::lock_guard<std::mutex> lk(g_ps_wave.mu);
+    const std::uint64_t n = g_ps_wave.programs.size();
+    if (changed_only && n == g_ps_wave.reported) return {};
+    g_ps_wave.reported = n;
+    std::string reasons;
+    for (int b = 0; b < gcn::kWave64NeedBits; ++b) {
+        if (g_ps_wave.reasons[b]) reasons += std::string(reasons.empty() ? " (" : ", ") + gcn::wave64_need_name(b) + " x" + std::to_string(g_ps_wave.reasons[b]);
+    }
+    if (!reasons.empty()) reasons += ")";
+    char buf[320];
+    std::snprintf(buf, sizeof(buf), "ps-wave: pixel shaders %llu: wave32 %llu, the driver's choice %llu, kept at %u %llu%s; fragment stages sized %llu, refused %llu",
+                  static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_ps_wave.at32),
+                  static_cast<unsigned long long>(g_ps_wave.driver), g.subgroup_size, static_cast<unsigned long long>(g_ps_wave.kept), reasons.c_str(),
+                  static_cast<unsigned long long>(g_ps_wave.stages.load()), static_cast<unsigned long long>(g_ps_wave.refused.load()));
+    return buf;
+}
+
 // A pixel shader's fragment-shader library. It takes no target formats (the
 // fragment output library has them), so it is keyed by the shader and its set
 // layout alone, and can be compiled before any draw uses it (step 4). `layout`
@@ -4193,6 +4288,8 @@ VkPipeline fragment_library(const gcn::TranslateResult& meta, VkShaderModule mod
         si.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         si.module = module;
         si.pName = "main";
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo wave{};
+        const bool sized = module && fragment_stage_wave(meta, si, wave);
         static const auto w3_entries = [] {
             std::array<VkSpecializationMapEntry, 32> e{};
             for (std::uint32_t k = 0; k < 16; ++k) e[k] = {gcn::kCbW3SpecId + k, k * 4, 4};
@@ -4219,7 +4316,13 @@ VkPipeline fragment_library(const gcn::TranslateResult& meta, VkShaderModule mod
         gpci.pDynamicState = &dsi;
         gpci.layout = layout;
         VkPipelineRenderingCreateInfo no_formats{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-        return create_library(gpci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, &no_formats);
+        VkPipeline p = create_library(gpci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, &no_formats);
+        if (!p && sized) {
+            fragment_stage_unsized(si);
+            p = create_library(gpci, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, &no_formats);
+            fragment_stage_wave_refused(p != VK_NULL_HANDLE);
+        }
+        return p;
     });
 }
 
@@ -4723,7 +4826,10 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         note_ps_early_tests(code.words, stage.meta().spirv);
         if (lift) {
             gcn::LiftResult lifted = lift_cached(false, prog, options, stage.meta());
-            if (lifted.ok()) stage.fresh().spirv = std::move(lifted.spirv);
+            if (lifted.ok()) {
+                stage.fresh().spirv = std::move(lifted.spirv);
+                stage.fresh().wave64_needs = 0;  // as build_gfx_pipeline's lift
+            }
         }
         if (!make_module(stage.meta().spirv, stage.module)) return give_up("shader module");
         if (cacheable) cache_stage(key, stage.meta(), stage.module);
@@ -4841,7 +4947,10 @@ void precompile_manifest(const ManifestStage& m) {
             stage.fresh() = translate_cached(prog, options);
             if (stage.meta().ok() && m.lift) {
                 gcn::LiftResult lifted = lift_cached(false, prog, options, stage.meta());
-                if (lifted.ok()) stage.fresh().spirv = std::move(lifted.spirv);
+                if (lifted.ok()) {
+                    stage.fresh().spirv = std::move(lifted.spirv);
+                    stage.fresh().wave64_needs = 0;  // as build_gfx_pipeline's lift
+                }
             }
         } else {
             const gcn::TranslateOptions options = vs_translate_options(m.vs_inputs(), m.fetch_words.empty() ? nullptr : &fetch_prog);
@@ -5179,6 +5288,7 @@ void precompile_report() {
     compute_optimize_report();
     compute_precompile_report();
     translation_cache_report();
+    if (const std::string r = ps_wave_census(false); !r.empty()) host_log("render: %s", r.c_str());
     if (!precompile_enabled()) return;
     Precompiler& w = precompiler();
     std::lock_guard<std::mutex> lk(w.mu);
@@ -5365,6 +5475,13 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     }
     if (pl.gs.module) stage(VK_SHADER_STAGE_GEOMETRY_BIT, pl.gs.module);
     if (pl.ps.module) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
+    // Pixel shaders at wave32: built whole, the fragment stage is given its
+    // subgroup size here (linked, in its library: fragment_library).
+    const bool linked = use_pipeline_library() && pl.layout;
+    const char* const owner = t_library_owner;
+    t_library_owner = pl.name.c_str();
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo ps_wave{};
+    const bool ps_sized = !linked && pl.ps.module && fragment_stage_wave(pl.ps.meta(), stages.back(), ps_wave);
 
     VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     if (vertex_input) {  // Vulkan vertex input
@@ -5436,8 +5553,14 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     // whole, each took ~1.6 ms from a warm cache (50-165 ms cold), 14 of them in
     // the frame after a fight, and left the draw after it to set every dynamic
     // value again.
-    const bool created = use_pipeline_library() && pl.layout ? link_gfx_pipeline(pl, f, vertex_input)
-                                                             : vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+    bool created = linked ? link_gfx_pipeline(pl, f, vertex_input)
+                          : vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+    if (!created && ps_sized) {
+        fragment_stage_unsized(stages.back());
+        created = vkCreateGraphicsPipelines(g.device, PipelineCacheUse().cache, 1, &gpci, nullptr, &pl.pipeline) == VK_SUCCESS;
+        fragment_stage_wave_refused(created);
+    }
+    t_library_owner = owner;
     if (!created) {
         host_log("render: pipeline %s: vkCreateGraphicsPipelines failed", pl.name.c_str());
         pl.failed = true;
@@ -14488,6 +14611,8 @@ void stage_manifest_save_async(const std::string& path) {
 }
 
 }  // namespace gpu
+
+std::string host_gpu_ps_wave_report() { return gpu::ps_wave_census(true); }
 
 bool host_gpu_draw_window(std::uint64_t dst, const void* data, std::uint32_t bytes) {
     static const bool gpu_writes = [] {

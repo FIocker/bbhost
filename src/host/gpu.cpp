@@ -1803,6 +1803,68 @@ bool init_locked() {
         feds3.pNext = f13.pNext;
         f13.pNext = &feds3;
     }
+    // Pixel shaders at wave32 (gcn/wave.h).
+    // The translated stages use subgroup operations in SPIR-V 1.5 without
+    // asking for a size, and Vulkan then holds every stage to the device's
+    // default: on AMD's drivers (subgroupSize 64, sizes 32-64) every pixel
+    // shader is compiled wave64, where RDNA's own choice for them is wave32 -
+    // KyoPS4x measured the forced wave64 at ~10% of a 4K frame on a Radeon
+    // 8060S. Subgroup size control (core in 1.3) lets the fragment stage of a
+    // program that computes the same in a 32-lane subgroup (gcn/wave.h) ask
+    // for 32. BBHOST_PS_WAVE32=0 keeps the device's size for all; =driver lets
+    // the driver choose between 32 and its default, as SPIR-V 1.6 would.
+    {
+        VkPhysicalDeviceVulkan13Features q13{};
+        q13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        VkPhysicalDeviceFeatures2 qf{};
+        qf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        qf.pNext = &q13;
+        vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+        VkPhysicalDeviceSubgroupSizeControlProperties sc{};
+        sc.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES;
+        VkPhysicalDeviceProperties2 pp{};
+        pp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        pp.pNext = &sc;
+        vkGetPhysicalDeviceProperties2(g.phys, &pp);
+        g.subgroup_size = subp.subgroupSize;
+        g.subgroup_min = sc.minSubgroupSize;
+        g.subgroup_max = sc.maxSubgroupSize;
+        g.subgroup_required_stages = sc.requiredSubgroupSizeStages;
+        // The driver's choice by default: on a Radeon 8060S (AMD's Windows
+        // driver, RDNA 3.5) a required 32 made the world's pixel shaders
+        // slower - 105 against 118 fps uncapped at a save's spawn, 9.3
+        // against 8.3 ms of GPU a flip, two alternating runs each - and the
+        // driver's choice measured as 64 does (117.7/115.7 against 117.6):
+        // RDNA 3's wave64 issues both halves at once. A device whose own
+        // sizes are below 32 (driver choice not offered) gets 32 required, as
+        // BBHOST_PS_WAVE32=32 asks anywhere; =0 the device's size for all.
+        const char* e = std::getenv("BBHOST_PS_WAVE32");
+        const bool driver = !(e && (std::strcmp(e, "32") == 0 || std::strcmp(e, "1") == 0));
+        const bool fragment = (sc.requiredSubgroupSizeStages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0;
+        const char* why = nullptr;
+        if (e && e[0] == '0') why = "BBHOST_PS_WAVE32=0";
+        else if (subp.subgroupSize <= 32) why = "the device's subgroups are 32 wide or narrower already";
+        else if (!q13.subgroupSizeControl) why = "no subgroup size control";
+        else if (sc.minSubgroupSize > 32 || sc.maxSubgroupSize < 32) why = "32 is not one of the device's subgroup sizes";
+        // The driver's choice only where every size it may take is 32 or
+        // more: the programs are judged for 32 lanes, not 8 or 16.
+        else if (driver && sc.minSubgroupSize == 32) g.ps_wave = 1;
+        else if (!fragment) why = "the fragment stage cannot be given a subgroup size";
+        else g.ps_wave = 32;
+        if (g.ps_wave) f13.subgroupSizeControl = VK_TRUE;
+        if (g.ps_wave == 32) {
+            host_log("gpu: pixel shaders at wave32: a required subgroup size of 32 for each program that computes the same in 32 lanes, "
+                     "the device's %u for the rest (sizes %u-%u, required-size stages 0x%x%s; BBHOST_PS_WAVE32=0 keeps %u for all)",
+                     subp.subgroupSize, sc.minSubgroupSize, sc.maxSubgroupSize, sc.requiredSubgroupSizeStages,
+                     driver ? "; the driver's choice wanted, but the device has sizes below 32" : "", subp.subgroupSize);
+        } else if (g.ps_wave == 1) {
+            host_log("gpu: pixel shaders at the driver's choice of subgroup size (sizes %u-%u; BBHOST_PS_WAVE32=32 requires 32, =0 the device's) for each program "
+                     "that computes the same in 32 lanes, the device's %u for the rest",
+                     sc.minSubgroupSize, sc.maxSubgroupSize, subp.subgroupSize);
+        } else {
+            host_log("gpu: pixel shaders at the device's subgroup size %u: %s", subp.subgroupSize, why);
+        }
+    }
     f13.dynamicRendering = VK_TRUE;
     f13.synchronization2 = VK_TRUE;
     {
