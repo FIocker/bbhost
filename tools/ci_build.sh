@@ -24,6 +24,14 @@ VK_TAG=${VK_TAG:-v1.4.350}
 SDL_TAG=${SDL_TAG:-release-3.4.16}
 FFMPEG_VER=${FFMPEG_VER:-7.1.1}
 JOBS=$(nproc)
+# A prefix restored from a cache made in another directory (the repository's
+# name is in the runner's path, and it can change) names
+# that directory in its pkg-config files and CMake packages, and CMake refuses
+# the paths that do not exist here. Such a prefix is built again.
+if [ -f "$P/lib/pkgconfig/libavcodec.pc" ] && ! grep -q "^prefix=$P\$" "$P/lib/pkgconfig/libavcodec.pc"; then
+    echo "the cached prefix was made in another directory ($(sed -n 's/^prefix=//p' "$P/lib/pkgconfig/libavcodec.pc")); building it again"
+    rm -rf "$P"
+fi
 mkdir -p "$W/src" "$P"
 
 if [ "${CI_APT:-1}" = 1 ]; then
