@@ -62,7 +62,7 @@ void report() {
 }  // namespace
 
 void decomp_game_memcpy_add() {
-    DecompFunction fn{"sub_2a1a1b0", "Core (memory)", 0x2a1a1b0, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&game_memcpy),
+    DecompFunction fn{"sub_2a1a1b0", "memory", 0x2a1a1b0, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&game_memcpy),
                       DecompKind::Leaf};
     fn.report = &report;
     decomp_add(fn);

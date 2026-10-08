@@ -604,7 +604,7 @@ void report_end() {
 }  // namespace
 
 void decomp_event_interpreter_add() {
-    const char* area = "Events";
+    const char* area = "events";
     DecompFunction dispatch{"emevd_dispatch_instruction", area, 0x1bb93a0, kDispatchEntry, sizeof(kDispatchEntry),
                             reinterpret_cast<void*>(&emevd_dispatch_instruction), DecompKind::Leaf, &g_game_dispatch};
     dispatch.report = &report;

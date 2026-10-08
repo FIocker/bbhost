@@ -1,4 +1,4 @@
-// Player data (docs/engine-map.md, "Player data and progression"): the
+// Player data (docs/decomp.md, "Player data"): the
 // funnels the player's echoes and levels pass through, and the drop chance a
 // kill rolls with, as ours.
 //
@@ -470,7 +470,7 @@ constexpr u8 kPriceEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x
 }  // namespace
 
 void decomp_player_data_add() {
-    const char* area = "player data";
+    const char* area = "player";
     DecompFunction discovery{"sub_1981830", area, 0x1981830, kDiscoveryEntry, sizeof(kDiscoveryEntry),
                              reinterpret_cast<void*>(&item_discovery), DecompKind::Leaf, &g_game_discovery,
                              reinterpret_cast<void*>(&compare_discovery), &g_cmp_discovery};

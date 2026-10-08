@@ -402,15 +402,15 @@ void decomp_chalice_ritual_add() {
     // trampoline re-aims the je.
     static const std::uint8_t kMapUidEntry[] = {0xc7, 0x07, 0xff, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x4e, 0x08,
                                                 0x48, 0x85, 0xc9, 0x0f, 0x84, 0x5c, 0x01, 0x00, 0x00};
-    decomp_add({"dungeon_ritual_config_initialize", "Chalice dungeons", kRoll, kRollEntry, sizeof kRollEntry,
+    decomp_add({"dungeon_ritual_config_initialize", "chalice", kRoll, kRollEntry, sizeof kRollEntry,
                 reinterpret_cast<void*>(&chalice_roll), DecompKind::Leaf, &g_roll_game,
                 reinterpret_cast<void*>(&roll_compare), &g_roll_counts, &report});
-    decomp_add({"sub_2316e70", "Chalice dungeons", kPick, kPickEntry, sizeof kPickEntry,
+    decomp_add({"sub_2316e70", "chalice", kPick, kPickEntry, sizeof kPickEntry,
                 reinterpret_cast<void*>(&chalice_rite_pick), DecompKind::Leaf});
-    decomp_add({"sub_231fbc0", "Chalice dungeons", kMapUid, kMapUidEntry, sizeof kMapUidEntry,
+    decomp_add({"sub_231fbc0", "chalice", kMapUid, kMapUidEntry, sizeof kMapUidEntry,
                 reinterpret_cast<void*>(&chalice_map_uid), DecompKind::Leaf, &g_uid_game,
                 reinterpret_cast<void*>(&uid_compare), &g_uid_counts});
-    decomp_add({"sub_1eaf9d0", "Chalice dungeons", kPairs, kPairsEntry, sizeof kPairsEntry,
+    decomp_add({"sub_1eaf9d0", "chalice", kPairs, kPairsEntry, sizeof kPairsEntry,
                 reinterpret_cast<void*>(&chalice_feature_pairs), DecompKind::Leaf, &g_pairs_game,
                 reinterpret_cast<void*>(&pairs_compare), &g_pairs_counts});
 }
