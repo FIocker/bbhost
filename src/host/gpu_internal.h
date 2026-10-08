@@ -288,6 +288,11 @@ struct Gpu {
         bool span = false;  // the command-buffer span pair was written
         VkQueryPool stat_pool = VK_NULL_HANDLE;  // Gpu::profile_stats: one query per pair
         bool stat_open = false;                  // the last pair's statistics query is still active
+        // The GPU busy meter (gpu_busy.cpp, on unless BBHOST_GPU_BUSY=0): a
+        // timestamp at the command buffer's start and one at its end, read
+        // once the slot retired. `busy_written`: this recording wrote both.
+        VkQueryPool busy_pool = VK_NULL_HANDLE;
+        bool busy_written = false;
         // Descriptor sets allocated ahead from this slot's pool, by layout
         // (alloc_set_locked); dropped with the pool's reset.
         std::vector<std::pair<VkDescriptorSetLayout, std::vector<VkDescriptorSet>>> spare_sets;
@@ -421,6 +426,9 @@ struct Gpu {
     // Whole command buffers, first command to last: includes the transfers,
     // barriers and render-pass changes the draw/dispatch pairs miss.
     std::uint64_t cmdbuf_ns = 0, cmdbuf_count = 0;
+    // The GPU busy meter (gpu_busy.cpp) is on: the slots and the presenter
+    // have their timestamp pairs.
+    bool busy = false;
     std::atomic<std::uint64_t> phase_ns[8] = {};
 };
 extern Gpu g;
@@ -789,6 +797,14 @@ VkPipelineCreateFlags compute_create_flags();
 // The watchdog's line on compute pipelines still compiling (gpu.cpp), their
 // SPIR-V written to the data directory's tmp.
 void compute_compiling_report();
+// The GPU busy meter (gpu_busy.cpp): the union of the time our command
+// buffers spent on the GPU, a timestamp at each one's start and end.
+void busy_init_locked();                           // after the slots exist: the query pools, or off
+void busy_begin_locked(Gpu::Slot& sl);             // a recording's first command
+void busy_end_locked(Gpu::Slot& sl);               // its last, before vkEndCommandBuffer
+void busy_submitted_locked(Gpu::Slot& sl);         // it is on its way to the queue
+void busy_retired_locked(Gpu::Slot& sl, bool ok);  // its fence signalled (ok), or it never will
+std::string busy_exit_report();                    // the whole run's line, for host_gpu_report
 struct DrawCall;
 bool glitch_on();
 VkQueryControlFlags glitch_query_flags();                     // precise when the device has it

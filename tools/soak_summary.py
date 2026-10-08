@@ -62,6 +62,7 @@ if not a.keep_loads:
         dropped.update(i for i in frames if i > begins[-1])
 rows = []
 threads = {}
+gpu_busy = []  # ms a second bbhost's command buffers kept the GPU busy (host/gpu_busy.cpp)
 for i in (i for i in frames if i >= start and i not in dropped):
     l = lines[i]
     fps = float(re.search(r'\(([0-9.]+)/s\)', l).group(1))
@@ -69,6 +70,9 @@ for i in (i for i in frames if i >= start and i not in dropped):
     waited = re.search(r'main loop waited (\d+) ms', l)
     cpu = re.search(r'cpu (\d+)%:(.*?);', l)
     rows.append((fps, work, int(waited.group(1)) if waited else 0, int(cpu.group(1)) if cpu else 0))
+    gb = re.search(r'gpu busy ([0-9.]+) ms/s', l)
+    if gb:
+        gpu_busy.append(float(gb.group(1)))
     if cpu:
         for m in re.finditer(r' (.+?):\d+ (\d+)%', cpu.group(2)):
             threads.setdefault(m.group(1), []).append(int(m.group(2)))
@@ -101,6 +105,11 @@ if any(r[3] for r in rows):
     top = sorted(threads.items(), key=lambda kv: -sum(kv[1]) / n)[:10]
     print('  process cpu %.0f%%; threads (avg over the window): %s' %
           (sum(r[3] for r in rows) / n, ', '.join('%s %.0f%%' % (k, sum(v) / n) for k, v in top)))
+if gpu_busy:
+    gb = sorted(gpu_busy)
+    print('  gpu busy avg %.0f ms/s (%.1f%%), p95 %.0f, max %.0f; %.2f ms a flip' %
+          (sum(gb) / len(gb), sum(gb) / len(gb) / 10.0, gb[min(len(gb) - 1, int(0.95 * len(gb)))], gb[-1],
+           sum(gb) / max(1.0, flips)))
 loads = [l.split('loading: ', 1)[1].strip() for l in lines if l.startswith('[bbhost] loading: ') and 'begins' not in l and 'quick re-entry' not in l]
 if loads:
     print('  loads: ' + '; '.join(loads[:8]))

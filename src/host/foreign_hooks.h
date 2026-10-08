@@ -13,3 +13,10 @@ std::string host_foreign_hooks();
 // True when OBS's game capture is among them: the device-loss message names
 // its own switch (DISABLE_VULKAN_OBS_CAPTURE=1).
 bool host_foreign_hooks_obs();
+
+// Windows' graphics modules in this process ("dxgi.dll d3d12.dll ...", ""
+// when none or not Windows). Said before and after the swapchain is made: a
+// Vulkan driver that presents through DXGI loads them inside
+// vkCreateSwapchainKHR, and that path decides what Windows' per-process GPU
+// counters see of the presents (host/gpu_busy.cpp).
+std::string host_graphics_modules();

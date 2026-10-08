@@ -1,6 +1,7 @@
 #include "host/frame_stats.h"
 
 #include "hle/modules.h"
+#include "host/gpu.h"
 #include "log.h"
 
 #include <algorithm>
@@ -81,6 +82,7 @@ struct State {
     std::uint64_t displayed_at_start = 0;  // completed flips when the window opened
     std::vector<double> intervals_ms;
     std::unordered_map<int, ThreadTime> threads;
+    GpuBusy gpu{};  // host_gpu_busy() when the window opened
 };
 
 }  // namespace
@@ -101,6 +103,7 @@ void frame_stats_on_flip() {
     if (s.last_flip.time_since_epoch().count() == 0) {
         s.window_start = s.last_flip = now;
         s.threads = thread_times();
+        s.gpu = host_gpu_busy();
         return;
     }
     s.intervals_ms.push_back(std::chrono::duration<double, std::milli>(now - s.last_flip).count());
@@ -163,11 +166,24 @@ void frame_stats_on_flip() {
     const std::uint64_t displayed_now = hle_video_flip_count();
     const double displayed = static_cast<double>(displayed_now - s.displayed_at_start) / secs;
     s.displayed_at_start = displayed_now;
+    // How much of the second our work kept the GPU busy (host/gpu_busy.cpp:
+    // the union of our command buffers' spans on the GPU's clock), last on
+    // the line so the summaries' patterns for what is before it still hold.
+    // The spans are counted a frame or two after they ran.
+    std::string gpu;
+    const GpuBusy gpu_now = host_gpu_busy();
+    if (gpu_now.on && s.gpu.on) {
+        const double ms = static_cast<double>(gpu_now.busy_ns - s.gpu.busy_ns) / 1e6 / secs;
+        char gb[96];
+        std::snprintf(gb, sizeof(gb), "; gpu busy %.0f ms/s (%.0f%%)", ms, ms / 10.0);
+        gpu = gb;
+    }
+    s.gpu = gpu_now;
     host_log("frames: %.2f s: %zu flips (%.1f/s), displayed %.1f/s, interval avg %.1f p95 %.1f max %.1f ms, %d over 16.7, %d over 33.3; "
-             "cpu %.0f%%:%s; main loop waited %.0f ms, slept %.0f ms, file I/O %.0f ms%s",
+             "cpu %.0f%%:%s; main loop waited %.0f ms, slept %.0f ms, file I/O %.0f ms%s%s",
              secs, n, static_cast<double>(n) / secs, displayed, sum / static_cast<double>(n), p95, worst, over16, over33, total,
              top.c_str(), static_cast<double>(sync_ns) / 1e6, static_cast<double>(sleep_ns) / 1e6,
-             static_cast<double>(file_ns) / 1e6, work.c_str());
+             static_cast<double>(file_ns) / 1e6, work.c_str(), gpu.c_str());
     s.intervals_ms.clear();
     s.window_start = now;
     s.threads = std::move(cur);

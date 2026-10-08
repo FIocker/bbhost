@@ -508,6 +508,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         last_hash_us = hash_us;
         const std::string prof = host_gpu_profile_report();
         if (!prof.empty()) host_log("  gpu profile:%s", prof.c_str());
+        if (const std::string busy = host_gpu_busy_report(); !busy.empty()) host_log("  %s", busy.c_str());
         host_log("  fill: %s", host_gpu_fill_stats().c_str());
         host_log("  %s", host_gpu_shadow_report().c_str());
         if (const std::string r = host_gpu_recorder_report(); !r.empty()) host_log("  %s", r.c_str());
