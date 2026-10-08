@@ -987,6 +987,7 @@ void glitch_draw_locked(DrawCall& call) {
     }
     call.query_pool = sl.cov_pool;
     call.query = static_cast<std::uint32_t>(sl.cov_recs.size());
+    call.query_flags = glitch_query_flags();
     sl.cov_recs.push_back(g_draw_rec_next);
 }
 
