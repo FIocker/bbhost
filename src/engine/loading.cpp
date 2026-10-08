@@ -51,7 +51,7 @@ void loading_tick(std::uint64_t flip) {
     if (!g_slide) return;
     static bool seen_world = false;
     static std::chrono::steady_clock::time_point began;
-    static std::uint64_t began_flip = 0;
+    static std::uint64_t began_flip = 0, began_unshown = 0;
     const bool requested = at<std::uint8_t>(guest(kNowLoadingRequested)) != 0;
     const std::uint64_t helper = at<std::uint64_t>(guest(kNowLoadingHelper));
     const bool in_game = helper && (at<std::uint8_t>(helper + 0x50) || at<std::uint8_t>(helper + 0x51));
@@ -70,10 +70,12 @@ void loading_tick(std::uint64_t flip) {
     if (loading && !was) {
         began = now;
         began_flip = flip;
+        began_unshown = hle_video_loading_unshown();
         if (seen_world) host_log("loading: begins, flip %llu", static_cast<unsigned long long>(flip));  // a death or a warp
     } else if (!loading && was) {
-        host_log("loading: %.2f s (flips %llu-%llu)", std::chrono::duration<double>(now - began).count(),
-                 static_cast<unsigned long long>(began_flip), static_cast<unsigned long long>(flip));
+        host_log("loading: %.2f s (flips %llu-%llu, %llu of them not shown)", std::chrono::duration<double>(now - began).count(),
+                 static_cast<unsigned long long>(began_flip), static_cast<unsigned long long>(flip),
+                 static_cast<unsigned long long>(hle_video_loading_unshown() - began_unshown));
     }
     if (in_game && !seen_world) {
         seen_world = true;
