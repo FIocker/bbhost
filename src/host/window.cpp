@@ -1,4 +1,5 @@
 #include "host/window.h"
+#include "core/host_clock.h"
 #include "core/portable.h"
 
 #include "core/config.h"
@@ -1829,6 +1830,7 @@ std::thread g_present_thread;
 
 void present_thread_main() {
     host_thread_set_name("bb-present");
+    host_thread_set_class(HostThreadClass::GpuFeed, "bb-present");  // core/host_clock.h
     for (;;) {
         PendingPresent p;
         {

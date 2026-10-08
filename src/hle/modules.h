@@ -140,6 +140,9 @@ void hle_gnm_dump_recent_writes(std::uint64_t near, unsigned count);
 void hle_gnm_find_writes(std::uint64_t va, std::uint64_t bytes, std::uint64_t value);
 void hle_video_finish_flip(int handle, int buffer, std::int64_t arg);
 std::uint64_t hle_video_flip_count();
+// Since the last call, for the 300-flip report: how late the vblank clock's
+// ticks woke, and how long flips took from queued to shown and to completed.
+std::string hle_video_pacing_window();
 int hle_save_writable_mounts();  // saves mounted for writing now (system.cpp)
 // The picture inside the display buffers: the top-left w x h of each is what
 // the window shows (a live resolution change renders into buffers allocated

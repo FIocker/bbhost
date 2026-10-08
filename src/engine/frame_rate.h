@@ -1,5 +1,7 @@
 #pragma once
 
+#include <string>
+
 // The game's own frame pace: 30, 60, 90 or uncapped.
 //
 // FD4's frame-time manager (0x2434770, called once a frame from the main
@@ -41,3 +43,9 @@ int frame_rate_game_fps();
 // a fixed amount a frame, so this is the frame pacing's interval. (Uncapped,
 // the step follows the frame time, so only the fixed steps slow down.)
 void frame_rate_set_time_scale(float scale);
+
+// The limiter since the last call, for the 300-flip report's timing line:
+// its margin (learnt from its own sleeps' lateness, or
+// BBHOST_LIMITER_MARGIN_US), how late its sleeps woke, and how long it spun
+// a frame.
+std::string frame_rate_limiter_window();
