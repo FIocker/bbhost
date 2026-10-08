@@ -23,6 +23,10 @@
 # than publish unsigned). The same key signs the official plugins each
 # package carries (tools/package_plugins.sh: plugins/<name>.so|.dll + .sig).
 #
+# The jobs' checks - package-linux, package-windows and package-all (the Steam
+# Deck kit, the updater's executables and the bundle check), with build.yml's
+# tests - are the ones master's ruleset requires before a pull request merges.
+#
 # The debug menu's font (engine/debug_menu.h) is the Debug Menu plugin's own,
 # made from public-domain fonts (plugins/debug_menu): nothing is fetched.
 name: release
@@ -39,6 +43,7 @@ permissions:
   pull-requests: write
 jobs:
   linux:
+    name: package-linux
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -67,6 +72,7 @@ jobs:
         run: tail -n 80 build-ci/*.log || true
 
   windows:
+    name: package-windows
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     container: archlinux:latest
@@ -98,6 +104,7 @@ jobs:
         run: tail -n 80 build/win-deps/*.log build-win.*.log || true
 
   publish:
+    name: package-all
     needs: [linux, windows]
     runs-on: ubuntu-24.04
     steps:
