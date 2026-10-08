@@ -83,6 +83,17 @@ on, a quick flick of the mouse switches targets. Mouse sensitivity and
 inverting either axis are on the game's PC Controls page; the game's own
 Camera settings are the stick's.
 
+With the mouse, the camera also stays where you put it: it does not turn by
+itself as the character moves - following the character round, or turning
+away from walls. Lock On with no target (Q) still swings it round behind the
+character. That follows the device you used last: pick up a controller and
+the game's own camera is back; touch the keyboard or mouse and it holds
+again. Mouse Auto-Rotation on the PC Camera page (F10: Mouse auto-rotation)
+turns it back on for the mouse too. It is the community's "Disable Camera
+Auto Rotation via Movement" patch made part of the camera - less its hold on
+the lock-on button's recentre; that patch, applied as before, still works as
+it always did, with any device.
+
 The character's name, a chalice glyph and the network password are typed in
 a box over the game, which stands in for the console's on-screen keyboard:
 Enter accepts, Escape cancels, Backspace deletes and Ctrl+V pastes. A

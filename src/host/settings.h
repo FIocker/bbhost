@@ -34,6 +34,9 @@ struct HostSettings {
     bool mouse_camera = true;   // the mouse turns the camera outside menus
     int mouse_sens = 5;         // 0..10, DS3's: 0.2 * (s * 0.15 + 0.5) degrees a count (engine/mouse_camera.h)
     bool mouse_invert_x = false, mouse_invert_y = false;
+    // While the mouse turns the camera (the keyboard and mouse used last): off
+    // holds the camera's own turns as the character moves (engine/mouse_camera.h).
+    bool mouse_auto_rotation = false;
     bool draw_cursor = true;    // the host draws its own pointer
     // What the game's own button prompts show: 0 follows whether a pad is
     // plugged in, 1 always the bound key, 2 always the pad's glyph

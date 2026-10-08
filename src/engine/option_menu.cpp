@@ -230,7 +230,7 @@ constexpr std::uint32_t kDeckFrameRate = 123000, kDeckModelDetail = 123001;
 // Settings.
 constexpr std::uint32_t kCtlCamera = 118000, kCtlSensitivity = 118001, kCtlInvertX = 118002, kCtlInvertY = 118003;
 constexpr std::uint32_t kCtlFov = 118004;  // shown in PC Camera
-constexpr std::uint32_t kCamDistance = 121000, kCamHeight = 121001;
+constexpr std::uint32_t kCamDistance = 121000, kCamHeight = 121001, kCamMouseAutoRotation = 121002;
 constexpr std::uint32_t kCtlMouseMenu = 116002, kCtlDrawCursor = 116003;
 // Key Bindings, 119000: the page row, seven placeholder rows whose captions
 // the port replaces with its own text, and the page names.
@@ -584,11 +584,13 @@ constexpr int kControlsRows = 4 + static_cast<int>(sizeof(g_ctl_pointer) / sizeo
 
 // PC Camera: the follow camera's field of view (0 the game's own, 5% wider a
 // step), its distance and the height it looks at (5 the game's own, 10% a
-// step) - LockCamParam's fields, engine/camera.h.
+// step) - LockCamParam's fields, engine/camera.h - and whether it turns by
+// itself as the character moves while the mouse turns it (engine/mouse_camera.h).
 Slider g_cam_fov{"fov", kCtlFov, 0, 0xff};
 Slider g_cam_distance{"camera_distance", kCamDistance, 5, 0xff};
 Slider g_cam_height{"camera_height", kCamHeight, 5, 0xff};
-constexpr int kCameraRows = 3;
+Toggle g_cam_mouse_auto_rotation{"mouse_auto_rotation", kCamMouseAutoRotation, 0, 0xff};
+constexpr int kCameraRows = 4;
 
 // Steam Deck (on one only, host_steam_deck): the frame rate as a left/right
 // choice of the two configurations - 0 is 30 fps at the screen's 1280x800, 1
@@ -822,6 +824,9 @@ GUEST_ABI void pc_camera_handler(void* dialog, void* params) {
         seed(*c);
         add_slider_row(dialog, &c->value, c->id, default_of(*c));
     }
+    seed(g_cam_mouse_auto_rotation);
+    add_toggle_row(dialog, &g_cam_mouse_auto_rotation.value, g_cam_mouse_auto_rotation.id,
+                   default_of(g_cam_mouse_auto_rotation));
     log_rows("PCCamera", dialog, kCameraRows, kCameraRows);
 }
 
@@ -1750,6 +1755,7 @@ void option_menu_poll() {
         seed(g_cam_fov);
         seed(g_cam_distance);
         seed(g_cam_height);
+        seed(g_cam_mouse_auto_rotation);
         seed_controls();
         seed_deck();
         g_resolution = host_opt_resolution_index();
@@ -1778,6 +1784,7 @@ void option_menu_poll() {
     push(g_cam_fov);
     push(g_cam_distance);
     push(g_cam_height);
+    push(g_cam_mouse_auto_rotation);
     for (auto& t : g_toggles) push(t);
     for (auto& t : g_enhance) push(t);
     // Steam Deck: the frame rate sets the frame cap, the resolution and the
