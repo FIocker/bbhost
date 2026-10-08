@@ -5074,9 +5074,9 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     infos.reserve(pl.meta.images.size() + pl.meta.samplers.size() + 1);
     bind_stage_images(set, pl.meta, stage_images, writes, infos, pl.name.c_str());
     vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    vkCmdBindPipeline(g_cmd(), VK_PIPELINE_BIND_POINT_COMPUTE, pl.pipeline);
+    rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pl.pipeline);
     const std::uint32_t params_offset = static_cast<std::uint32_t>(ubi.offset);
-    vkCmdBindDescriptorSets(g_cmd(), VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_layout, 0, 1, &set, set_cache_on() ? 1 : 0, &params_offset);
+    rec().bind_sets(VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_layout, 0, 1, &set, set_cache_on() ? 1 : 0, &params_offset);
     profile_begin_locked(&pl.name);
     note_dispatch_name(g.dispatches.load(), pl.name.c_str());
     gpu_checkpoint(2, g.dispatches.load());
@@ -5088,9 +5088,9 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
             g.failures.fetch_add(1);
             return false;
         }
-        if (!g_render_min) vkCmdDispatchIndirect(g_cmd(), loc.buffer, loc.offset);
+        if (!g_render_min) rec().dispatch_indirect(loc.buffer, loc.offset);
     } else {
-        if (!g_render_min) vkCmdDispatch(g_cmd(), d.dim[0], d.dim[1], d.dim[2]);
+        if (!g_render_min) rec().dispatch(d.dim[0], d.dim[1], d.dim[2]);
     }
     profile_end_locked();
     // Buffers the shader writes: the buffer shadow's copies of them are stale
@@ -5137,7 +5137,7 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                          nullptr, 0, nullptr);
     g.dispatches.fetch_add(1);
     return true;

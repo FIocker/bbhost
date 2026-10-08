@@ -43,6 +43,9 @@ enum class Op : std::uint16_t {
     kPushConstants,      // vkCmdPushConstants
     kUpdateSets,         // vkUpdateDescriptorSets at its place in the stream
     kDispatch,           // vkCmdDispatch
+    kClearDepth,         // vkCmdClearDepthStencilImage
+    kCopyImage,          // vkCmdCopyImage
+    kDispatchIndirect,   // vkCmdDispatchIndirect
     kCount
 };
 
@@ -172,13 +175,31 @@ struct UpdateSets {
 struct Dispatch {
     std::uint32_t x, y, z, pad;
 };
+struct ClearDepth {
+    VkImage image;
+    VkImageLayout layout;
+    std::uint32_t n;
+    VkClearDepthStencilValue value;
+    // + VkImageSubresourceRange[n]
+};
+struct CopyImage {
+    VkImage src, dst;
+    VkImageLayout src_layout, dst_layout;
+    std::uint32_t n, pad;
+    // + VkImageCopy[n]
+};
+struct DispatchIndirect {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+};
 
 template <class T> constexpr bool kRecordable = std::is_trivially_copyable_v<T> && alignof(T) <= 8;
 static_assert(kRecordable<Begin> && kRecordable<EndSubmit> && kRecordable<ForeignSubmit> && kRecordable<DrawState> && kRecordable<Barrier> &&
                   kRecordable<Flag> && kRecordable<BeginRendering> && kRecordable<Fill> && kRecordable<CopyBuffer> &&
                   kRecordable<CopyBufferToImage> && kRecordable<CopyImageToBuffer> && kRecordable<ClearColor> && kRecordable<Queries> &&
                   kRecordable<CopyQueryResults> && kRecordable<Timestamp> && kRecordable<BindPipeline> && kRecordable<BindSets> &&
-                  kRecordable<PushConstants> && kRecordable<UpdateSets> && kRecordable<Dispatch>,
+                  kRecordable<PushConstants> && kRecordable<UpdateSets> && kRecordable<Dispatch> && kRecordable<ClearDepth> &&
+                  kRecordable<CopyImage> && kRecordable<DispatchIndirect>,
               "op records are plain values");
 static_assert(kRecordable<VkMemoryBarrier> && kRecordable<VkBufferMemoryBarrier> && kRecordable<VkImageMemoryBarrier> &&
                   kRecordable<VkBufferCopy> && kRecordable<VkBufferImageCopy> && kRecordable<VkImageSubresourceRange> &&
