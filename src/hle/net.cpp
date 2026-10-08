@@ -1,4 +1,5 @@
 #include "hle/common.h"
+#include "core/futex.h"
 #include "hle/platform.h"
 #include "hle/hle.h"
 #include "hle/net_p2p.h"
@@ -136,12 +137,21 @@ inline void sock_setopt_int(sockfd_t fd, int level, int name, int v) { ::setsock
 #endif
 inline bool sock_ok(sockfd_t fd) { return fd != kBadSock; }
 
-// The game's epoll over our own condition variable instead of the kernel's
-// epoll and eventfds: Windows has neither, and on Linux BBHOST_NET_POLL=1
-// runs this path so it is proven on the same co-op runs. A P2P socket is
-// readable when its inbox has a datagram; a UDP socket is polled with a
-// zero timeout; a wait sleeps on one condition variable every reader and
-// abort notifies, ten milliseconds at a time for the UDP sockets.
+// The game's epoll over our own wake word instead of the kernel's epoll and
+// eventfds: Windows has neither, and on Linux BBHOST_NET_POLL=1 runs this
+// path so it is proven on the same co-op runs. A P2P socket is readable when
+// its inbox has a datagram; a UDP socket is polled with a zero timeout; a
+// wait sleeps on one word every reader, control change and abort bumps
+// (net_wake), ten milliseconds at a time for the UDP sockets.
+//
+// The word, not a condition variable: a waiter reads it before it looks at
+// the sockets and sleeps only while it is unchanged, so a datagram that lands
+// between the look and the sleep wakes it (the condition variable's notifier
+// did not hold its mutex, and such a datagram waited out the slice). The
+// sleep is core/futex.h's - WaitOnAddress, with the timeout honoured below a
+// millisecond (KyoPS4x #215 found the empty epoll spinning a core on a
+// timeout it ignored; winpthreads' condition variable returned at once on a
+// sub-millisecond one, and the loop spun out the rest).
 const bool g_net_poll = [] {
 #if defined(_WIN32)
     return true;
@@ -150,8 +160,11 @@ const bool g_net_poll = [] {
     return e && e[0] == '1';
 #endif
 }();
-std::mutex g_net_wait_mu;
-std::condition_variable g_net_wait_cv;
+std::atomic<std::uint32_t> g_net_wake_word{0};
+void net_wake() {
+    g_net_wake_word.fetch_add(1, std::memory_order_seq_cst);
+    host_futex_wake_all(&g_net_wake_word);
+}
 
 int net_err(int e) {
     return kNetErrBase | (to_freebsd(e) & 0xff);
@@ -504,7 +517,7 @@ void p2p_reader(std::shared_ptr<P2pPort> port) {
 #endif
         }
         q->cv.notify_all();
-        if (g_net_poll) g_net_wait_cv.notify_all();
+        if (g_net_poll) net_wake();
     }
 }
 
@@ -998,7 +1011,7 @@ GUEST_ABI int hle_net_epoll_destroy(int id) {
     if (it->second->efd >= 0) ::close(it->second->efd);
 #endif
     g_net_epolls.erase(it);
-    g_net_wait_cv.notify_all();
+    net_wake();
     return 0;
 }
 // The game's SceNetEpollEvent: {u32 events, u32 pad, u64 ident, u64 data}.
@@ -1042,7 +1055,7 @@ GUEST_ABI int hle_net_epoll_control(int id, int op, int sock, void* event) {
         }
     }
 #endif
-    g_net_wait_cv.notify_all();
+    net_wake();
     if (g_net_trace) host_log("sceNetEpollControl %d op %d sock %d events 0x%x", id, op, sock, sev.events);
     return 0;
 }
@@ -1061,6 +1074,9 @@ GUEST_ABI int hle_net_epoll_wait(int id, void* events, int maxevents, int timeou
         const auto deadline = timeout < 0 ? std::chrono::steady_clock::time_point::max()
                                           : std::chrono::steady_clock::now() + std::chrono::microseconds(timeout);
         for (;;) {
+            // Before the look: a wake after it changes the word, and the
+            // sleep below then returns at once.
+            const std::uint32_t gen = g_net_wake_word.load(std::memory_order_seq_cst);
             int out = 0;
             {
                 std::lock_guard<std::mutex> lock(g_net_mu);
@@ -1106,8 +1122,8 @@ GUEST_ABI int hle_net_epoll_wait(int id, void* events, int maxevents, int timeou
             const auto now = std::chrono::steady_clock::now();
             if (now >= deadline) return 0;
             const auto slice = std::chrono::milliseconds(10);
-            std::unique_lock<std::mutex> wl(g_net_wait_mu);
-            g_net_wait_cv.wait_for(wl, deadline - now < slice ? deadline - now : slice);
+            const HostDeadline until = deadline - now < slice ? deadline : now + slice;
+            host_futex_wait(&g_net_wake_word, gen, &until);
         }
     }
 #if !defined(_WIN32)
@@ -1168,7 +1184,7 @@ GUEST_ABI int hle_net_epoll_abort(int id, int) {
     std::lock_guard<std::mutex> lk(it->second->mu);
     it->second->aborting = true;
     it->second->cv.notify_all();
-    g_net_wait_cv.notify_all();
+    net_wake();
 #if !defined(_WIN32)
     if (it->second->wake >= 0) {
         const std::uint64_t one = 1;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/host_clock.h"
 #include "core/imports.h"
 #include "guest_abi.h"
 #include "log.h"
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <string>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -115,9 +117,7 @@ inline std::uint64_t guest_clock_quantum_us() {
 }
 
 inline std::uint64_t monotonic_ns() {
-    timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    const std::uint64_t ns = static_cast<std::uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(ts.tv_nsec);
+    const std::uint64_t ns = host_clock_monotonic_ns();  // QPC / CLOCK_MONOTONIC, core/host_clock.h
     if (const std::uint64_t q = guest_clock_quantum_us()) return ns / (q * 1000ull) * (q * 1000ull);
     return ns;
 }
@@ -128,12 +128,29 @@ inline std::uint64_t now_us() { return monotonic_ns() / 1000ull; }
 // converts sceKernelReadTsc deltas with that constant (it never asks for
 // the frequency). A synthesized 1.6 GHz counter from the monotonic clock
 // keeps its timers honest whatever the host TSC runs at (a 2.1 GHz host
-// made menus repeat keys and pace animations 1.3x too fast).
+// made menus repeat keys and pace animations 1.3x too fast). Scaled from the
+// performance counter directly (x160 from Windows' 10 MHz).
 constexpr std::uint64_t kGuestTscHz = 1600000000ull;
 inline std::uint64_t rdtsc_now() {
-    const std::uint64_t ns = monotonic_ns();
-    return ns / 1000000000ull * kGuestTscHz + ns % 1000000000ull * 16ull / 10ull;
+    if (guest_clock_quantum_us()) {
+        const std::uint64_t ns = monotonic_ns();
+        return ns / 1000000000ull * kGuestTscHz + ns % 1000000000ull * 16ull / 10ull;
+    }
+    return host_clock_ticks_at(kGuestTscHz);
 }
+
+// The guest's clock reads by entry, since the start. They run raw (no
+// thunk), so BBHOST_HLE_COUNT does not see them; the 300-flip report's
+// timing line gives these as rates (hle_timing_window, kernel.cpp).
+struct HleClockReads {
+    HostShardedCount gettimeofday, clock_gettime, process_time, tsc, time, clock;
+};
+extern HleClockReads g_hle_clock_reads;
+// Whether the clock entries are bound raw (GS mode and BBHOST_RAW_CLOCK not 0).
+bool hle_raw_clock();
+// Clock reads per second over `secs`, since the last call, and (into `sync`)
+// the sync layer's slow paths: waits that slept, wakes (kernel.cpp).
+std::string hle_timing_window(double secs, std::string* sync);
 
 GUEST_ABI int hle_ok();
 

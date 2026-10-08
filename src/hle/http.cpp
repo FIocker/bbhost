@@ -5,6 +5,7 @@
 // URLs to the official hosts are rewritten to the private server from the
 // config (online.host / online.scheme).
 #include "hle/common.h"
+#include "core/futex.h"
 #include "hle/hle.h"
 #include "hle/modules.h"
 #include "core/config.h"
@@ -71,9 +72,12 @@ struct NbEvent {
     int id;
     void* user;
 };
+// The lock and the sleep are core/futex.h's: sceHttpWaitRequest's timeout is
+// in microseconds, and winpthreads' condition variable returned at once on
+// one under a millisecond, the game's wait loop then spinning out the rest.
 struct HttpEpoll {
-    std::mutex mu;
-    std::condition_variable cv;
+    HostLock mu;
+    HostCondVar cv;
     std::deque<NbEvent> events;
     bool aborting = false;
 };
@@ -378,7 +382,7 @@ void post_event(HttpEpoll* ep, int id, void* user, std::uint32_t events, std::ui
     if (!ep) {
         return;
     }
-    std::lock_guard<std::mutex> lk(ep->mu);
+    std::lock_guard<HostLock> lk(ep->mu);
     ep->events.push_back(NbEvent{events, detail, id, user});
     ep->cv.notify_all();
 }
@@ -445,7 +449,7 @@ GUEST_ABI int hle_http_destroy_epoll(int, HttpEpoll* ep) {
     }
     // Waiters hold g_http_mu only briefly; mark and leak rather than free under them.
     {
-        std::lock_guard<std::mutex> lk(ep->mu);
+        std::lock_guard<HostLock> lk(ep->mu);
         ep->aborting = true;
         ep->cv.notify_all();
     }
@@ -483,7 +487,7 @@ GUEST_ABI int hle_http_wait_request(HttpEpoll* ep, NbEvent* out, int max_events,
             return kHttpInvalidValue;
         }
     }
-    std::unique_lock<std::mutex> lk(ep->mu);
+    std::unique_lock<HostLock> lk(ep->mu);
     auto ready = [&] { return !ep->events.empty() || ep->aborting; };
     if (timeout < 0) {
         ep->cv.wait(lk, ready);
@@ -505,7 +509,7 @@ GUEST_ABI int hle_http_abort_wait(HttpEpoll* ep) {
     if (!ep) {
         return kHttpInvalidValue;
     }
-    std::lock_guard<std::mutex> lk(ep->mu);
+    std::lock_guard<HostLock> lk(ep->mu);
     ep->aborting = true;
     ep->cv.notify_all();
     return 0;

@@ -13,6 +13,7 @@
 
 #include "core/elf.h"
 #include "core/memory.h"
+#include "core/host_clock.h"
 #include "core/portable.h"
 #include "engine/addr.h"
 #include "engine/graphics_patch.h"
@@ -531,27 +532,109 @@ struct FlipClock {
     // How close to the deadline the wait sleeps before it spins: the eboot's
     // 5 ms, or less for a host sleep that keeps time better (RealClock).
     virtual float spin_margin_s() { return 0.00499999989f; }
+    // The least time left that is worth a sleep: the eboot's 1 ms.
+    virtual float min_sleep_s() { return 0.00100000005f; }
     // Between two reads of the clock while spinning.
     virtual void spin_pause() {}
+    // The wait is over (accounting only).
+    virtual void wait_done() {}
     virtual ~FlipClock() = default;
 };
 
-struct RealClock final : FlipClock {
-    std::int64_t now() override {
-        return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+// The limiter's margin, learnt from its own sleeps (CPU-04). The eboot
+// sleeps to 5 ms before the deadline and spins the rest on gettimeofday: a
+// fifth of the main thread's CPU at 60 fps went there (the 2026-10-04
+// profile), taken from its SMT sibling - and on an APU (the Radeon 8060S),
+// from the GPU's share of the package's power. This is the cost Kyo found in
+// KyoPS4x's traces as "the game calls gettimeofday constantly" (Game:Main
+// ~30% in posix_gettimeofday at a cap). A fixed 2 ms kept most of it back on
+// Linux, where 1 ms cost flip-interval p95 a millisecond on a busy machine;
+// how late a sleep wakes is the host's, though: Windows' high-resolution
+// waitable timer is usually a few hundred microseconds late, a loaded Linux
+// box more. So every sleep's lateness is kept (the last 128), and the margin
+// is the second-latest of them plus 200 us, within 0.3-2 ms; it starts at
+// 2 ms and moves after 32 sleeps. BBHOST_LIMITER_MARGIN_US=<n> fixes it
+// (2000 is the old behaviour).
+struct LimiterTuning {
+    std::int64_t fixed_us = -1;  // BBHOST_LIMITER_MARGIN_US, -1 for learnt
+    std::int64_t late_us[128] = {};
+    std::uint32_t samples = 0;
+    std::int64_t margin_us = 2000;
+    std::int64_t late_p99_us = 0;  // the second-latest of the window
+    // Since the last report (frame_rate_limiter_window): the main thread
+    // only writes these, the report thread only reads and resets.
+    std::atomic<std::uint64_t> waits{0}, sleeps{0}, spin_us{0}, sleep_late_us{0};
+    std::atomic<std::int64_t> shown_margin_us{2000}, shown_late_p99_us{0};
+};
+LimiterTuning g_limiter;
+const bool g_limiter_env = [] {
+    if (const char* e = std::getenv("BBHOST_LIMITER_MARGIN_US"); e && *e && std::strcmp(e, "auto") != 0) {
+        g_limiter.fixed_us = std::clamp<std::int64_t>(std::strtoll(e, nullptr, 10), 0, 5000);
+        g_limiter.margin_us = g_limiter.fixed_us;
+        g_limiter.shown_margin_us.store(g_limiter.fixed_us);
     }
-    void sleep_us(std::int64_t us) override { host_sleep_us(static_cast<std::uint64_t>(us)); }
-    // The eboot sleeps to 5 ms before the deadline and spins the rest on the
-    // clock: a fifth of the main thread's CPU at 60 fps went there (the
-    // 2026-10-04 profile), taken from its SMT sibling. Sleeping to 2 ms keeps
-    // most of that back; 1 ms cost flip-interval p95 a millisecond on a busy
-    // machine, the sleep overshooting. The spin pauses between reads.
-    float spin_margin_s() override { return 0.002f; }
+    return true;
+}();
+
+void limiter_note_sleep(std::int64_t asked_us, std::int64_t took_us) {
+    LimiterTuning& t = g_limiter;
+    const std::int64_t late = std::max<std::int64_t>(0, took_us - asked_us);
+    t.sleeps.fetch_add(1, std::memory_order_relaxed);
+    t.sleep_late_us.fetch_add(static_cast<std::uint64_t>(late), std::memory_order_relaxed);
+    t.late_us[t.samples % 128] = late;
+    ++t.samples;
+    if (t.fixed_us >= 0 || t.samples < 32 || (t.samples % 16) != 0) return;
+    const std::uint32_t n = std::min<std::uint32_t>(t.samples, 128);
+    std::int64_t first = 0, second = 0;
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const std::int64_t v = t.late_us[i];
+        if (v > first) {
+            second = first;
+            first = v;
+        } else if (v > second) {
+            second = v;
+        }
+    }
+    t.late_p99_us = second;
+    t.margin_us = std::clamp<std::int64_t>(second + 200, 300, 2000);
+    t.shown_margin_us.store(t.margin_us, std::memory_order_relaxed);
+    t.shown_late_p99_us.store(second, std::memory_order_relaxed);
+}
+
+struct RealClock final : FlipClock {
+    // The guest's gettimeofday clock (hle/libc.cpp), read the same way.
+    std::int64_t now() override { return host_clock_realtime_us(); }
+    void sleep_us(std::int64_t us) override {
+        const std::int64_t t0 = now();
+        host_sleep_us(static_cast<std::uint64_t>(us));
+        const std::int64_t t1 = now();
+        limiter_note_sleep(us, t1 - t0);
+        slept_until_ = t1;
+        spun_from_ = 0;
+    }
+    float spin_margin_s() override { return static_cast<float>(g_limiter.margin_us) * 1e-6f; }
+    // A sleep is worth taking down to the margin itself, not only above the
+    // eboot's 1 ms: with a margin under 1 ms the remainder would be spun.
+    float min_sleep_s() override { return spin_margin_s(); }
+    // The spin pauses between reads.
     void spin_pause() override {
+        if (!spun_from_) spun_from_ = slept_until_ ? slept_until_ : now();
 #if defined(__x86_64__) || defined(_M_X64)
         __builtin_ia32_pause();
 #endif
     }
+    void wait_done() override {
+        g_limiter.waits.fetch_add(1, std::memory_order_relaxed);
+        if (spun_from_) g_limiter.spin_us.fetch_add(static_cast<std::uint64_t>(std::max<std::int64_t>(0, now() - spun_from_)), std::memory_order_relaxed);
+        slept_until_ = 0;
+        spun_from_ = 0;
+    }
+
+private:
+    // This frame's wait (one RealClock lives for one update): when its last
+    // sleep ended, and when its spin began.
+    std::int64_t slept_until_ = 0;
+    std::int64_t spun_from_ = 0;
 };
 
 struct ReplayClock final : FlipClock {
@@ -692,10 +775,11 @@ void sprj_flipper_update(SprjFlipper* f, FlipClock& clock, float target) {
         const std::int64_t prev = static_cast<std::int64_t>(f->previous_frame_microseconds);
         float remaining = target_s - us_to_float(now - prev) / 1000000.0f;
         const float margin = clock.spin_margin_s();
+        const float min_sleep = clock.min_sleep_s();
         while (!(0.0f > remaining)) {
             const float left = std::min(target_s, remaining);
             if (left <= 0.0f) break;
-            if (!(left <= 0.00100000005f) && !(left <= margin)) {
+            if (!(left <= min_sleep) && !(left <= margin)) {
                 const auto us = static_cast<std::int32_t>((left - margin) * 1000.0f * 1000.0f);
                 if (us > 0) clock.sleep_us(us);
             } else {
@@ -705,6 +789,7 @@ void sprj_flipper_update(SprjFlipper* f, FlipClock& clock, float target) {
             f->current_frame_microseconds = static_cast<std::uint64_t>(now);
             remaining = target_s + us_to_float(now - prev) / -1000000.0f;
         }
+        clock.wait_done();
     }
     if (f->force_no_sleep) f->frame_behind = 1;
     const std::uint32_t idx = (f->frame_history_index + 1) & 0x1f;
@@ -817,7 +902,7 @@ void note_main_frame_work(std::uint64_t m) {
     if (!frame_stats_enabled()) return;
     // The same clock the guest's gettimeofday reads (hle/libc.cpp), on both
     // platforms.
-    const std::int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::int64_t now = host_clock_realtime_us();
     const std::int64_t last = get<std::int64_t>(m + 0x28);
     if (last > 0 && now >= last && now - last < 10000000) frame_stats_main_frame(static_cast<std::uint64_t>(now - last), hle_video_flip_count());
 }
@@ -1243,4 +1328,22 @@ void frame_rate_set_time_scale(float scale) {
         logged = scale;
         host_log("frame rate: time scale %.2f", static_cast<double>(scale));
     }
+}
+
+std::string frame_rate_limiter_window() {
+    LimiterTuning& t = g_limiter;
+    const std::uint64_t waits = t.waits.exchange(0, std::memory_order_relaxed);
+    const std::uint64_t sleeps = t.sleeps.exchange(0, std::memory_order_relaxed);
+    const std::uint64_t spin = t.spin_us.exchange(0, std::memory_order_relaxed);
+    const std::uint64_t late = t.sleep_late_us.exchange(0, std::memory_order_relaxed);
+    if (!waits && !sleeps) return "limiter idle";
+    char buf[220];
+    std::snprintf(buf, sizeof(buf), "limiter margin %lld us (%s), sleeps %llu late avg %.0f us p99 %lld us, spin %.2f ms a frame over %llu",
+                  static_cast<long long>(t.shown_margin_us.load(std::memory_order_relaxed)),
+                  t.fixed_us >= 0 ? "BBHOST_LIMITER_MARGIN_US" : "learnt", static_cast<unsigned long long>(sleeps),
+                  sleeps ? static_cast<double>(late) / static_cast<double>(sleeps) : 0.0,
+                  static_cast<long long>(t.shown_late_p99_us.load(std::memory_order_relaxed)),
+                  waits ? static_cast<double>(spin) / 1000.0 / static_cast<double>(waits) : 0.0,
+                  static_cast<unsigned long long>(waits));
+    return buf;
 }

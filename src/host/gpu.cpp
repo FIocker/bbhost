@@ -1,4 +1,5 @@
 #include "core/config.h"
+#include "core/host_clock.h"
 #include "core/portable.h"
 #include "host/foreign_hooks.h"
 #include "host/gpu_internal.h"
@@ -127,6 +128,7 @@ const bool g_submit_thread_on = [] {
 
 void submit_thread() {
     host_thread_set_name("bb-submit");
+    host_thread_set_class(HostThreadClass::GpuFeed, "bb-submit");  // core/host_clock.h
     for (;;) {
         SubmitJob job;
         {

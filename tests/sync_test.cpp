@@ -1,9 +1,11 @@
 // Phase 0.5: Orbis sync semantics over hle/sync.cpp.
 #include "hle/sync.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
@@ -90,9 +92,73 @@ int main() {
     CHECK(mutex_lock(&cm, nullptr) == 0);
     dl = after_us(10000);
     CHECK(cond_wait(&cv, &cm, &dl) == kETIMEDOUT);
+    // Under a millisecond: never before the deadline, and not
+    // rounded up to a timer tick either - the median of twenty 400 us waits
+    // well under the 15.6 ms (or 1 ms) tick a whole-millisecond wait takes.
+    {
+        std::vector<long long> took;
+        for (int i = 0; i < 20; ++i) {
+            const auto s0 = Clock::now();
+            Deadline sub = after_us(400);
+            CHECK(cond_wait(&cv, &cm, &sub) == kETIMEDOUT);
+            CHECK(Clock::now() >= sub);
+            took.push_back(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - s0).count());
+        }
+        std::sort(took.begin(), took.end());
+        CHECK(took[10] >= 400 && took[10] < 5000);
+        if (std::getenv("SYNC_TEST_VERBOSE")) {
+            std::printf("400 us timed cond waits: min %lld, median %lld, max %lld us\n", took.front(), took[10], took.back());
+        }
+    }
     CHECK(mutex_unlock(&cm) == 0);
     CHECK(cond_destroy(&cv) == 0);
     CHECK(mutex_destroy(&cm) == 0);
+
+    // Producer and consumers over cond_signal: every item is taken and no
+    // wakeup is lost (a lost one leaves a consumer asleep with items queued
+    // until its deadline, which the check counts instead of hanging).
+    {
+        void* qm = nullptr;
+        void* qc = nullptr;
+        CHECK(mutex_init(&qm, kMutexNormal) == 0);
+        CHECK(cond_init(&qc) == 0);
+        int queued = 0, taken = 0;
+        bool closing = false;
+        std::atomic<int> stalls{0};
+        constexpr int kItems = 20000;
+        std::vector<std::thread> consumers;
+        for (int c = 0; c < 4; ++c) {
+            consumers.emplace_back([&] {
+                CHECK(mutex_lock(&qm, nullptr) == 0);
+                for (;;) {
+                    while (queued == 0 && !closing) {
+                        Deadline d = after_us(2000000);
+                        if (cond_wait(&qc, &qm, &d) == kETIMEDOUT) stalls.fetch_add(1);
+                    }
+                    if (queued == 0) break;
+                    --queued;
+                    ++taken;
+                }
+                CHECK(mutex_unlock(&qm) == 0);
+            });
+        }
+        for (int i = 0; i < kItems; ++i) {
+            CHECK(mutex_lock(&qm, nullptr) == 0);
+            ++queued;
+            CHECK(cond_signal(&qc, false) == 0);
+            CHECK(mutex_unlock(&qm) == 0);
+            if ((i & 63) == 0) std::this_thread::yield();
+        }
+        CHECK(mutex_lock(&qm, nullptr) == 0);
+        closing = true;
+        CHECK(cond_signal(&qc, true) == 0);
+        CHECK(mutex_unlock(&qm) == 0);
+        for (auto& c : consumers) c.join();
+        CHECK(taken == kItems);
+        CHECK(stalls == 0);
+        CHECK(cond_destroy(&qc) == 0);
+        CHECK(mutex_destroy(&qm) == 0);
+    }
 
     // Rwlock: two readers coexist, writer excludes.
     void* rw = nullptr;

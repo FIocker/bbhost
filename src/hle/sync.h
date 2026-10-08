@@ -91,6 +91,14 @@ bool rw_rdlock_fast(void** slot);
 int rw_unlock_fast(void** slot);
 void rw_wake_slot(void** slot);
 
+// How often the slow paths ran since the start: mutex locks that had to
+// wait, condition waits and signals that found a waiter, read/write locks
+// that had to wait (the 300-flip report's timing line).
+struct SyncCounts {
+    std::uint64_t mutex_contended, cond_waits, cond_signals, rw_sleeps;
+};
+SyncCounts counts();
+
 // Deadline helpers.
 inline Deadline after_us(std::uint64_t us) {
     return Clock::now() + std::chrono::microseconds(us);
