@@ -365,7 +365,9 @@ bool ensure_buffer_locked(DevBuffer& b, std::uint64_t bytes) {
 bool serial_done_locked(std::uint64_t serial) {
     if (g.completed_submits > serial) return true;
     for (const Gpu::Slot& sl : g.slots) {
-        if (sl.in_flight && sl.serial == serial) return vkGetFenceStatus(g.device, sl.fence) == VK_SUCCESS;
+        if (sl.in_flight && sl.serial == serial) {
+            return serial < stream_submitted_serial() && vkGetFenceStatus(g.device, sl.fence) == VK_SUCCESS;  // submitted (bb-submit) first
+        }
     }
     return false;  // not submitted yet
 }
@@ -954,7 +956,7 @@ void glitch_begin_recording_locked() {
     if (!glitch_on()) return;
     Gpu::Slot& sl = g.slots[g.slot];
     if (!sl.cov_pool) return;
-    vkCmdResetQueryPool(g_cmd(), sl.cov_pool, 0, kCovQueries);
+    rec().reset_query_pool(sl.cov_pool, 0, kCovQueries);
     sl.cov_recs.clear();
     sl.cov_reset = true;
 }
@@ -1123,7 +1125,8 @@ void host_gpu_glitch_watch(std::uint64_t display_va, std::uint64_t mark) {
         }
     }
     for (Gpu::Slot& sl : g.slots) {
-        if (sl.in_flight && (!sl.cov_recs.empty() || !g_watch_pending.empty()) && vkGetFenceStatus(g.device, sl.fence) == VK_SUCCESS) {
+        if (sl.in_flight && (!sl.cov_recs.empty() || !g_watch_pending.empty()) && sl.serial < stream_submitted_serial() &&
+            vkGetFenceStatus(g.device, sl.fence) == VK_SUCCESS) {
             collect_locked(sl);
         }
     }

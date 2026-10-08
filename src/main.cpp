@@ -906,6 +906,23 @@ int main(int argc, char** argv) {
         sigaction(SIGTRAP, &st, nullptr);
     }
 #endif
+    {
+        // --stream-selftest[=N] / BBHOST_STREAM_SELFTEST=N: the command
+        // stream's self-test (host/stream_selftest.cpp), headless, before
+        // any configuration or anything of the game; the exit code says.
+        int rounds = 0;
+        if (const char* e = std::getenv("BBHOST_STREAM_SELFTEST"); e && *e && *e != '0') rounds = std::max(1, std::atoi(e));
+        for (int i = 1; i < argc; ++i) {
+            if (std::strncmp(argv[i], "--stream-selftest", 17) == 0 && (argv[i][17] == 0 || argv[i][17] == '=')) {
+                rounds = argv[i][17] == '=' ? std::max(1, std::atoi(argv[i] + 18)) : 16;
+            }
+        }
+        if (rounds) {
+            const int rc = host_gpu_stream_selftest(rounds);
+            std::fflush(nullptr);
+            std::_Exit(rc);  // the recorder and submission threads run on: no static destructors under them
+        }
+    }
     HostConfig cfg;
     std::string err;
     if (!config_load(argc, argv, &cfg, &err)) {
