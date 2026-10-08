@@ -123,6 +123,11 @@ bool place(ElfImage* image, const DecompFunction& fn, bool compare) {
                  fn.name, static_cast<ull>(fn.bn));
         return false;
     }
+    if (fn.body_ok && !fn.body_ok(p)) {
+        host_log("decomp: %s refused, its body after 0x%llx is not the one ours mirrors; the game's stays", fn.name,
+                 static_cast<ull>(fn.bn));
+        return false;
+    }
     // The trampoline: the displaced instructions, re-aimed, at most 64 bytes
     // (a short branch grows to its rel32 form); the jump back; the far leg.
     constexpr std::size_t kMoved = 64, kNeed = kMoved + 5 + 14;

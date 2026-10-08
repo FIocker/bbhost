@@ -16,10 +16,10 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 10 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 11 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 117 |
-| **Taken over in all** | **131** |
+| **Taken over in all** | **132** |
 | With any code byte changed (including byte patches and redirected calls) | 154; 236 at 60 fps |
 | The game's own code | everything else |
 
@@ -43,6 +43,7 @@ when there is a reason to change them, not for their own sake.
 | parallel resource copy (`sub_23bde30`) | `0x23bde30` | the copy of streamed resource data across the engine's worker pool | copies on the calling thread; removes a ~1 s wait per area tour |
 | effect ribbon tail, facing the eye (`sub_2cce7b0`) | `0x2cce7b0` | the last one to three points of an effect ribbon as vertices, the strip turned to the camera | 400,000 random strips against the game's own code (`tests/sfx_ribbon_test.cpp`), 21 calls compared in a world session: 0 differences |
 | effect ribbon tail, along normals (`sub_2cceec0`) | `0x2cceec0` | the same for a ribbon laid along its points' normals | 400,000 random strips, 426 calls compared in a world session: 0 differences |
+| the follow camera's step (`NS_SPRJ::ChrExFollowCam::Update`) | `0x183ac60` | the player camera, once a frame: LockCamParam easing, a moving floor, the character's frame, reset, lock-on and turn-behind angles, the stick and the fast turn, the wanted position, the wall casts and the wall escape, the chase and the view basis, the camera's collision, the NaN guard, the keep-out spheres, the near clamp | 400,000 generated cameras, 24 million frames, against the game's own code (`tests/follow_camera_test.cpp`: casts and the debug draw as stubs both versions call, the fov-uncap and 60 fps variants), every line of its phases run but the panics for a missing singleton and two of the param file's three layouts; 12,586 frames compared in a world session: 0 differences |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -54,6 +55,23 @@ its own pointers back as zero and crashed at `0x2cce9b5` (the crash the
 community's "Intel 12th Gen+ SFX workaround" patch avoids by not drawing
 those effects). The rewrites keep nothing below the stack pointer. Linux
 skips the red zone when it delivers a signal, so only Windows crashed.
+
+The follow camera's step is 20,077 bytes of hand-scheduled SIMD - 550
+multiplies, 248 shuffles, reciprocal square roots refined by Newton steps,
+sine and cosine series summed with horizontal adds - where only the same
+operations in the same order give the same bits. Ours is its 23 phases as
+functions named for what they do, over a struct of the camera's fields with
+every offset checked at compile time. The game's idioms are small helpers
+that perform its operations in its order - the length from `rsqrtps` and two
+Newton steps, its two ways of summing a row times a matrix, the angle wraps
+through integer conversions, the sine, cosine and arcsine series - and the
+rest is plain C++. Its denormals come along too: under the game's MXCSR
+`minss` turns a denormal into zero where a branch keeps it, and ours chooses
+each value the way the game's instruction does. Three places in the game's
+code are rewritten at load - the fov-uncap patch and two 60 fps sites - and
+ours reads them where the game would; any other change to the function's
+body, or to a constant it reads, keeps the game's version in place. The
+stick's phase marks where a mouse turn goes.
 
 The four event-flag functions are every read and write the game makes through
 its flag store - event scripts, Lua, talk scripts, the online session. With
@@ -155,8 +173,6 @@ argument bits the original tests.
 
 - **Player data**: adding and removing items, levelling up, paying echoes -
   item and progression mods, NG+ rules.
-- **The lock-on camera** (`0x183ac60`): camera behaviour beyond what its params
-  reach.
 - **Damage and stamina**: the functions that apply attack params and attribute
   scaling, for balance changes params cannot express.
 - **The event system's condition checks**: event-script logic as source, and
