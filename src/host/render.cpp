@@ -6448,7 +6448,7 @@ void note_shader_created(int stage, const std::uint8_t* container, std::size_t s
 DrawCmds* g_draw_cmds = nullptr;
 
 DrawCmds* draw_packet_early_locked() {
-    if (!g_draw_cmds || g.profile || g.has_checkpoints) return nullptr;
+    if (!g_draw_cmds || g.profile || (g.has_checkpoints && !g.cmd_buffer_marker)) return nullptr;
     g_draw_cmds->start(true);
     return g_draw_cmds->deferred() ? g_draw_cmds : nullptr;
 }
@@ -12600,8 +12600,12 @@ static bool draw_impl(const GpuDraw& d) {
     }
     // From here the draw's descriptor writes and commands go to the recorder
     // thread (recorder.cpp), except while something that must see them in
-    // place is on: checkpoints, GPU profiling, a draw capture.
-    cmds.start(!capture && !g.profile && !g.has_checkpoints);
+    // place is on: NVIDIA's checkpoints, GPU profiling, a draw capture. AMD's
+    // markers ride in the packet (DrawCmds::marker): a start after a lost
+    // device recorded every draw in place, draining the stream at each one -
+    // 2.2 million drains a 300-flip window against ~360, on the Radeon 8060S
+    // at 60 fps (2026-10-08).
+    cmds.start(!capture && !g.profile && !(g.has_checkpoints && !g.cmd_buffer_marker));
     if (set_cache_on()) {
         cmds.take_sets(writes, infos, buffer_infos, &g_params_desc, 1);
     } else {
@@ -13056,7 +13060,11 @@ static bool draw_impl(const GpuDraw& d) {
         cmds.vertex_buffers(static_cast<std::uint32_t>(vertex_input.bindings.size()), vertex_input.buffer, vertex_input.offset);
     }
     draw_stamp.to(kRenderCostGeometry);
-    gpu_checkpoint(1, g_draw_rec_next);
+    if (g.cmd_buffer_marker) {
+        cmds.marker(gpu_marker_value(1, g_draw_rec_next));
+    } else {
+        gpu_checkpoint(1, g_draw_rec_next);
+    }
     if (bind_pl->profile_name.empty()) {
         const bool walks = !bind_pl->vs.meta().walks.empty() || !bind_pl->ps.meta().walks.empty();
         bind_pl->profile_name = pl.name + (bind_pl->lean ? "" : "~fallback") + (walks ? "~walks" : "");
