@@ -3,6 +3,7 @@
 #include "host/foreign_hooks.h"
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
+#include "host/translation_cache.h"
 
 #include "gcn/container.h"
 #include "gcn/half.h"
@@ -936,6 +937,13 @@ std::string stage_manifest_path() {
     return path.substr(0, path.rfind('/') + 1) + "stage-manifest.bin";
 }
 
+// <data root>/bbhost/translation-cache.bin (host/translation_cache.h), the same.
+std::string translation_cache_path() {
+    std::string path = pipeline_cache_path();
+    if (path.empty()) return path;
+    return path.substr(0, path.rfind('/') + 1) + "translation-cache.bin";
+}
+
 // Rebuild the guest page tables when the mapping list changed.
 bool rebuild_page_tables() {
     static std::uint64_t seen_gen = 0;
@@ -1797,6 +1805,19 @@ bool init_locked() {
     }
     f13.dynamicRendering = VK_TRUE;
     f13.synchronization2 = VK_TRUE;
+    {
+        // Required by Vulkan 1.3, asked anyway: compute pipelines are taken
+        // from the pipeline cache without compiling when it has them
+        // (first_compute_pipeline).
+        VkPhysicalDeviceVulkan13Features q13{};
+        q13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        VkPhysicalDeviceFeatures2 qf{};
+        qf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        qf.pNext = &q13;
+        vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+        g.cache_control = q13.pipelineCreationCacheControl == VK_TRUE;
+        f13.pipelineCreationCacheControl = q13.pipelineCreationCacheControl;
+    }
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.pNext = &f13;
     f12.bufferDeviceAddress = VK_TRUE;
@@ -2069,6 +2090,7 @@ bool init_locked() {
     }
     VkPipelineCacheCreateInfo side{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     if (vkCreatePipelineCache(g.device, &side, nullptr, &g.side_cache) != VK_SUCCESS) g.side_cache = VK_NULL_HANDLE;
+    if (vkCreatePipelineCache(g.device, &side, nullptr, &g.opt_cache) != VK_SUCCESS) g.opt_cache = VK_NULL_HANDLE;
 
     // Descriptor layout: params UBO, then sampled images, samplers, storage images.
     std::vector<VkDescriptorSetLayoutBinding> binds;
@@ -2209,6 +2231,10 @@ bool init_locked() {
              (g.subgroup_stages & VK_SHADER_STAGE_COMPUTE_BIT) ? "compute" : "", g.host_pointer_align,
              g.has_maint8 ? ", maintenance8" : "", g.present_capable ? ", presentable" : "",
              g.has_tessellation ? ", tessellation" : "");
+    // Before g.ok: the precompile workers wait for it, and their first
+    // translations look in the cache. After the device's features went to the
+    // translator above (they are part of every key).
+    translation_cache_load(translation_cache_path());
     g.ok = true;
     start_submit_thread();
     start_hang_watchdog();
@@ -2525,6 +2551,7 @@ struct PrecompiledCompute {
         gcn::TranslateResult meta;
         VkShaderModule module = VK_NULL_HANDLE;
         VkPipeline pipeline = VK_NULL_HANDLE;
+        bool standin = false;  // unoptimized, the optimized one queued (first_compute_pipeline)
         std::uint64_t us = 0;  // translation and compile
     };
     enum State { kQueued, kCompiling, kDone, kFailed };
@@ -2559,28 +2586,6 @@ PrecompiledCompute g_cs_pre;
 
 }  // namespace
 
-// BBHOST_CS_OPTIMIZE: 0 builds every compute pipeline without the driver's
-// optimizer, 1 with it; unset, without it on AMD. AMD's Windows driver
-// (amdvlk64, Radeon 8060S) was still compiling four of the game's compute
-// shaders minutes after they were created - every one of them compiles in
-// well under a millisecond on NVIDIA - with its memory climbing, and the
-// command processor waiting on one of them: the loading screen after a new
-// character never ended.
-VkPipelineCreateFlags compute_create_flags() {
-    static const int opt = [] {
-        const char* e = std::getenv("BBHOST_CS_OPTIMIZE");
-        return e && e[0] ? std::atoi(e) : -1;
-    }();
-    const bool off = opt == 0 || (opt < 0 && g.vendor_id == 0x1002);
-    static bool said = false;
-    if (!said) {
-        said = true;
-        if (off) host_log("gpu: compute pipelines built without the driver's optimizer (%s; BBHOST_CS_OPTIMIZE=1 builds them optimized)",
-                          opt == 0 ? "BBHOST_CS_OPTIMIZE=0" : "AMD, whose compiler took minutes over some of them");
-    }
-    return off ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT : 0;
-}
-
 namespace {
 
 // One pipeline into the driver's compiler, recorded for the watchdog while it
@@ -2596,6 +2601,351 @@ struct CompilingScope {
         g_cs_pre.compiling.erase(name);
     }
 };
+
+// ---- compute pipelines and the driver's optimizer (BBHOST_CS_OPTIMIZE) ----
+// 2026-09-28: AMD's Windows driver (amdvlk64, Radeon 8060S) was
+// still compiling four of the game's compute shaders minutes after GX created
+// them, its memory climbing, and the command processor waiting on one of them:
+// the loading screen after a new character never ended. Every AMD device then
+// built every compute pipeline without the optimizer - and the cause, the
+// program-counter dispatcher those four had, was removed the same day (loop
+// blocks: 24 s -> 6.5 s cold for 42f2a521 on NVIDIA). What stayed was -O0 code
+// for the two 4-5k-instruction loop shaders that run every third frame and the
+// small ones that run every frame (gpu-time item 6).
+//
+// By default now (kBackground, every vendor) nothing waits for the optimizer:
+//   - a pipeline the pipeline cache has optimized is taken at once
+//     (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT answers without
+//     compiling) - every start after the first;
+//   - otherwise the unoptimized pipeline (VK_PIPELINE_CREATE_DISABLE_
+//     OPTIMIZATION_BIT, the build every AMD start made until now) stands in for
+//     its first dispatches, and a bb-cs-optimize thread builds the optimized
+//     one, which the shader's next dispatch swaps in (adopt_optimized_compute) -
+//     the graphics pipelines' optimized relink (render.cpp,
+//     BBHOST_LIBRARY_RELINK), for compute. Each optimized build goes to a
+//     pipeline cache of its own, merged when it is done into g.opt_cache and
+//     that into the main one when it is saved (merge_side_caches): the next
+//     start takes them at once, and a build that takes minutes holds no cache
+//     a save or the exit waits for.
+// Such a build costs one of those threads, not the game; one still running at
+// exit after a minute is written to <data>/bbhost/compute-unoptimized.txt, and
+// later starts keep that shader unoptimized (delete the file to try again).
+// BBHOST_CS_OPTIMIZE=0: never optimized; =1: optimized and waited for (every
+// other vendor's default until now). BBHOST_CS_OPTIMIZE_THREADS=<n>: the
+// threads (default 2); BBHOST_CS_OPTIMIZE_DELAY_MS=<ms> (checks) holds each
+// optimized build that long, to watch the stand-ins on a fast driver.
+enum class CsOptimize { kNever, kAlways, kBackground };
+enum class CsBuild { kOptimized, kUnoptimized, kOptimizedCached };
+
+struct CsOptimizer {
+    struct Job {
+        std::uint64_t key = 0;
+        std::string name;
+        std::vector<std::uint32_t> spirv;
+        std::uint64_t flip = 0;        // when its stand-in was built
+        std::uint64_t standin_us = 0;  // and how long that took
+    };
+    struct Running {
+        std::string name;  // empty: the thread is idle
+        std::chrono::steady_clock::time_point since{};
+    };
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<Job> jobs;                                  // under mu
+    std::unordered_set<std::uint64_t> queued;              // under mu: one optimized build a key
+    std::unordered_map<std::uint64_t, VkPipeline> ready;   // under mu: the optimized pipelines built
+    std::atomic<std::uint64_t> gen{0};                     // bumped with each one put in `ready`
+    std::vector<Running> running;                          // under mu: by thread, the build in the compiler now
+    std::unordered_set<std::string> keep_unoptimized;      // compute-unoptimized.txt, read once
+    std::uint64_t slowest_us = 0;                          // under mu
+    std::string slowest;                                   // under mu
+    int threads = 2;
+    std::atomic<std::uint64_t> from_cache{0}, standins{0}, standins_cp{0}, built{0}, failed{0}, build_us{0}, adopted{0}, kept{0};
+    std::atomic<std::uint64_t> window_built{0}, window_us{0}, window_adopted{0};
+};
+CsOptimizer g_cs_opt;
+// g.opt_cache is a merge's destination (each build's cache into it) and a
+// source (it into the main cache): Vulkan has a merge's destination externally
+// synchronized, so both go under this.
+std::mutex g_opt_cache_mu;
+// The precompile workers' builds at creation, told apart from the command
+// processor's for the report (set in precompile_compute).
+thread_local bool t_compute_worker = false;
+// A build still in the compiler at exit after this long is taken for one that
+// may never end (the dispatcher shapes of 2026-09-28 did not); a cold world
+// load's slowest compute compiles were 13 s each.
+constexpr std::uint64_t kCsGiveUpS = 60;
+
+// <data root>/bbhost/compute-unoptimized.txt, beside the pipeline cache.
+std::string compute_unoptimized_path() {
+    std::string path = pipeline_cache_path();
+    if (path.empty()) return path;
+    return path.substr(0, path.rfind('/') + 1) + "compute-unoptimized.txt";
+}
+
+CsOptimize cs_optimize_mode() {
+    static const CsOptimize mode = [] {
+        const char* e = std::getenv("BBHOST_CS_OPTIMIZE");
+        const int v = e && e[0] ? std::atoi(e) : -1;
+        const CsOptimize m = v == 0 ? CsOptimize::kNever : v == 1 ? CsOptimize::kAlways : CsOptimize::kBackground;
+        if (m == CsOptimize::kBackground) {
+            if (const std::string path = compute_unoptimized_path(); !path.empty()) {
+                std::ifstream in(path);
+                for (std::string line; std::getline(in, line);) {
+                    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+                    if (!line.empty()) g_cs_opt.keep_unoptimized.insert(line);
+                }
+            }
+            if (const char* t = std::getenv("BBHOST_CS_OPTIMIZE_THREADS")) g_cs_opt.threads = std::clamp(std::atoi(t), 1, 8);
+            host_log("gpu: compute pipelines: the driver's optimizer in the background - one the pipeline cache does not have optimized "
+                     "is built unoptimized for its first dispatches and swapped for the optimized one, built on %d bb-cs-optimize "
+                     "thread%s (BBHOST_CS_OPTIMIZE=0 never optimizes, =1 waits for the optimizer)%s; %zu kept unoptimized "
+                     "(compute-unoptimized.txt)",
+                     g_cs_opt.threads, g_cs_opt.threads == 1 ? "" : "s",
+                     g.cache_control ? "" : "; no pipeline creation cache control: each start builds the optimized ones again",
+                     g_cs_opt.keep_unoptimized.size());
+        } else {
+            host_log("gpu: compute pipelines built %s (BBHOST_CS_OPTIMIZE=%d; unset builds them in the background)",
+                     m == CsOptimize::kNever ? "without the driver's optimizer" : "with the driver's optimizer, waited for", v);
+        }
+        return m;
+    }();
+    return mode;
+}
+
+// One compute pipeline from `module`. kOptimizedCached: only if the pipeline
+// cache has it optimized, VK_NULL_HANDLE at once otherwise. `own_cache`: a
+// bb-cs-optimize build's, instead of the main cache.
+VkPipeline create_compute(VkShaderModule module, CsBuild how, const std::string& watch, const std::vector<std::uint32_t>* spirv,
+                          VkPipelineCache own_cache = VK_NULL_HANDLE) {
+    if (how == CsBuild::kOptimizedCached && !g.cache_control) return VK_NULL_HANDLE;
+    VkComputePipelineCreateInfo cpci{};
+    cpci.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpci.stage.module = module;
+    cpci.stage.pName = "main";
+    cpci.layout = g.pipe_layout;
+    cpci.flags = how == CsBuild::kUnoptimized        ? VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT
+                 : how == CsBuild::kOptimizedCached ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT
+                                                     : 0;
+    VkPipeline p = VK_NULL_HANDLE;
+    VkResult r;
+    if (how == CsBuild::kOptimizedCached) {
+        r = vkCreateComputePipelines(g.device, PipelineCacheUse().cache, 1, &cpci, nullptr, &p);  // VK_PIPELINE_COMPILE_REQUIRED: not there
+    } else if (own_cache != VK_NULL_HANDLE) {
+        CompilingScope compiling(watch, spirv);
+        r = vkCreateComputePipelines(g.device, own_cache, 1, &cpci, nullptr, &p);
+    } else {
+        CompilingScope compiling(watch, spirv);
+        r = vkCreateComputePipelines(g.device, PipelineCacheUse().cache, 1, &cpci, nullptr, &p);
+    }
+    return r == VK_SUCCESS ? p : VK_NULL_HANDLE;
+}
+
+std::uint64_t cs_us_since(std::chrono::steady_clock::time_point t0) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+}
+
+// bb-cs-optimize: the optimized builds, behind everything else.
+void cs_optimize_thread(int index) {
+    host_thread_set_name("bb-cs-optimize");
+    static const int delay_ms = [] {
+        const char* d = std::getenv("BBHOST_CS_OPTIMIZE_DELAY_MS");
+        return d ? std::atoi(d) : 0;
+    }();
+    for (;;) {
+        CsOptimizer::Job job;
+        {
+            std::unique_lock<std::mutex> lk(g_cs_opt.mu);
+            g_cs_opt.running[index].name.clear();
+            g_cs_opt.cv.wait(lk, [] { return !g_cs_opt.jobs.empty(); });
+            job = std::move(g_cs_opt.jobs.front());
+            g_cs_opt.jobs.pop_front();
+            g_cs_opt.running[index] = {job.name, std::chrono::steady_clock::now()};
+        }
+        if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        const auto t0 = std::chrono::steady_clock::now();
+        VkShaderModule module = VK_NULL_HANDLE;
+        VkShaderModuleCreateInfo smci{};
+        smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        smci.codeSize = job.spirv.size() * 4;
+        smci.pCode = job.spirv.data();
+        VkPipeline p = VK_NULL_HANDLE;
+        if (vkCreateShaderModule(g.device, &smci, nullptr, &module) == VK_SUCCESS) {
+            char watch[32];
+            std::snprintf(watch, sizeof(watch), " (optimized, %04llx)", static_cast<unsigned long long>(job.key & 0xffff));
+            // Its own cache while it compiles, merged into g.opt_cache after.
+            VkPipelineCache own = VK_NULL_HANDLE;
+            VkPipelineCacheCreateInfo pcci{};
+            pcci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+            if (g.opt_cache == VK_NULL_HANDLE || vkCreatePipelineCache(g.device, &pcci, nullptr, &own) != VK_SUCCESS) own = VK_NULL_HANDLE;
+            p = create_compute(module, CsBuild::kOptimized, job.name + watch, &job.spirv, own);
+            if (own != VK_NULL_HANDLE) {
+                if (p) {
+                    std::lock_guard<std::mutex> lk(g_opt_cache_mu);
+                    vkMergePipelineCaches(g.device, g.opt_cache, 1, &own);
+                }
+                vkDestroyPipelineCache(g.device, own, nullptr);
+            }
+            vkDestroyShaderModule(g.device, module, nullptr);  // the pipeline keeps what it needs
+        }
+        const std::uint64_t us = cs_us_since(t0);
+        {
+            std::lock_guard<std::mutex> lk(g_cs_opt.mu);
+            if (p) {
+                g_cs_opt.ready[job.key] = p;
+                if (us > g_cs_opt.slowest_us) {
+                    g_cs_opt.slowest_us = us;
+                    g_cs_opt.slowest = job.name;
+                }
+            }
+        }
+        if (p) {
+            g_cs_opt.built.fetch_add(1, std::memory_order_relaxed);
+            g_cs_opt.build_us.fetch_add(us, std::memory_order_relaxed);
+            g_cs_opt.window_built.fetch_add(1, std::memory_order_relaxed);
+            g_cs_opt.window_us.fetch_add(us, std::memory_order_relaxed);
+            g_cs_opt.gen.fetch_add(1, std::memory_order_release);
+        } else {
+            g_cs_opt.failed.fetch_add(1, std::memory_order_relaxed);
+        }
+        host_log("gpu: compute shader %s %s in %llu ms on bb-cs-optimize (unoptimized it took %llu ms, and stood in from flip %llu; "
+                 "now flip %llu)%s",
+                 job.name.c_str(), p ? "optimized" : "not optimized: the build failed", static_cast<unsigned long long>(us / 1000),
+                 static_cast<unsigned long long>(job.standin_us / 1000), static_cast<unsigned long long>(job.flip),
+                 static_cast<unsigned long long>(hle_video_flip_count()), p ? "" : "; the unoptimized one stays");
+    }
+}
+
+void queue_compute_optimize(std::uint64_t key, const std::string& name, const std::vector<std::uint32_t>& spirv, std::uint64_t standin_us) {
+    static std::once_flag started;
+    std::call_once(started, [] {
+        {
+            std::lock_guard<std::mutex> lk(g_cs_opt.mu);
+            g_cs_opt.running.resize(static_cast<std::size_t>(g_cs_opt.threads));
+        }
+        for (int i = 0; i < g_cs_opt.threads; ++i) std::thread(cs_optimize_thread, i).detach();
+    });
+    {
+        std::lock_guard<std::mutex> lk(g_cs_opt.mu);
+        if (!g_cs_opt.queued.insert(key).second) return;  // queued, building or built
+        CsOptimizer::Job job;
+        job.key = key;
+        job.name = name;
+        job.spirv = spirv;
+        job.flip = hle_video_flip_count();
+        job.standin_us = standin_us;
+        g_cs_opt.jobs.push_back(std::move(job));
+    }
+    g_cs_opt.cv.notify_one();
+}
+
+}  // namespace
+
+VkPipeline first_compute_pipeline(VkShaderModule module, std::uint64_t opt_key, const std::string& name,
+                                  const std::vector<std::uint32_t>& spirv, bool& standin, const std::string& watch) {
+    standin = false;
+    switch (cs_optimize_mode()) {
+    case CsOptimize::kNever:
+        return create_compute(module, CsBuild::kUnoptimized, watch, &spirv);
+    case CsOptimize::kAlways:
+        return create_compute(module, CsBuild::kOptimized, watch, &spirv);
+    case CsOptimize::kBackground:
+        break;
+    }
+    if (g_cs_opt.keep_unoptimized.count(name)) {
+        g_cs_opt.kept.fetch_add(1, std::memory_order_relaxed);
+        return create_compute(module, CsBuild::kUnoptimized, watch, &spirv);
+    }
+    {
+        // Built this run already, for an earlier pipeline of the same key.
+        std::lock_guard<std::mutex> lk(g_cs_opt.mu);
+        if (const auto it = g_cs_opt.ready.find(opt_key); it != g_cs_opt.ready.end()) return it->second;
+    }
+    if (const VkPipeline p = create_compute(module, CsBuild::kOptimizedCached, watch, &spirv)) {
+        g_cs_opt.from_cache.fetch_add(1, std::memory_order_relaxed);
+        return p;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const VkPipeline p = create_compute(module, CsBuild::kUnoptimized, watch, &spirv);
+    if (!p) return p;
+    standin = true;
+    g_cs_opt.standins.fetch_add(1, std::memory_order_relaxed);
+    if (!t_compute_worker) g_cs_opt.standins_cp.fetch_add(1, std::memory_order_relaxed);
+    queue_compute_optimize(opt_key, name, spirv, cs_us_since(t0));
+    return p;
+}
+
+bool adopt_optimized_compute(std::uint64_t opt_key, VkPipeline& pipeline, bool& standin, std::uint64_t& seen) {
+    const std::uint64_t gen = g_cs_opt.gen.load(std::memory_order_acquire);
+    if (gen == seen) return false;
+    seen = gen;
+    std::lock_guard<std::mutex> lk(g_cs_opt.mu);
+    const auto it = g_cs_opt.ready.find(opt_key);
+    if (it == g_cs_opt.ready.end()) return false;
+    pipeline = it->second;  // dispatches already recorded keep the stand-in: pipelines are never destroyed
+    standin = false;
+    g_cs_opt.adopted.fetch_add(1, std::memory_order_relaxed);
+    g_cs_opt.window_adopted.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+std::uint64_t compute_optimized_built() { return g_cs_opt.built.load(std::memory_order_relaxed); }
+
+void compute_optimize_report() {
+    if (cs_optimize_mode() != CsOptimize::kBackground) return;
+    std::string slowest;
+    std::size_t waiting = 0;
+    std::uint64_t slowest_us = 0;
+    std::vector<std::pair<std::string, std::uint64_t>> running;  // name, seconds in the compiler
+    {
+        std::lock_guard<std::mutex> lk(g_cs_opt.mu);
+        waiting = g_cs_opt.jobs.size();
+        for (const CsOptimizer::Running& r : g_cs_opt.running) {
+            if (!r.name.empty()) running.emplace_back(r.name, cs_us_since(r.since) / 1000000);
+        }
+        slowest = g_cs_opt.slowest;
+        slowest_us = g_cs_opt.slowest_us;
+    }
+    std::string building = running.empty() ? "none building" : "building";
+    for (const auto& [name, s] : running) building += " " + name + " (" + std::to_string(s) + " s)";
+    host_log("gpu: compute pipelines, the optimizer in the background: %llu taken optimized from the pipeline cache, %llu built "
+             "unoptimized to stand in (%llu of them on the command processor), %llu optimized on bb-cs-optimize (%.1f s; the slowest %s, "
+             "%llu ms), %llu failed, %llu swapped in; at exit %zu waiting, %s; %llu kept unoptimized (compute-unoptimized.txt)",
+             static_cast<unsigned long long>(g_cs_opt.from_cache.load()), static_cast<unsigned long long>(g_cs_opt.standins.load()),
+             static_cast<unsigned long long>(g_cs_opt.standins_cp.load()), static_cast<unsigned long long>(g_cs_opt.built.load()),
+             g_cs_opt.build_us.load() / 1e6, slowest.empty() ? "none" : slowest.c_str(), static_cast<unsigned long long>(slowest_us / 1000),
+             static_cast<unsigned long long>(g_cs_opt.failed.load()), static_cast<unsigned long long>(g_cs_opt.adopted.load()), waiting,
+             building.c_str(), static_cast<unsigned long long>(g_cs_opt.kept.load()));
+    // A build that has had its thread this long may never end: later starts
+    // keep that shader unoptimized.
+    for (const auto& [name, s] : running) {
+        if (s < kCsGiveUpS) continue;
+        const std::string path = compute_unoptimized_path();
+        if (path.empty()) break;
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+        if (std::ofstream out(path, std::ios::app); out) {
+            out << name << "\n";
+            host_log("gpu: compute shader %s: its optimized build was still running after %llu s; later starts keep it unoptimized (%s)",
+                     name.c_str(), static_cast<unsigned long long>(s), path.c_str());
+        }
+    }
+}
+
+// Since the last call, for the 300-flip report; empty when nothing happened.
+std::string compute_optimize_window() {
+    const std::uint64_t built = g_cs_opt.window_built.exchange(0), us = g_cs_opt.window_us.exchange(0);
+    const std::uint64_t adopted = g_cs_opt.window_adopted.exchange(0);
+    if (!built && !adopted) return {};
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "compute pipelines optimized %llu (%llu ms), swapped in %llu", static_cast<unsigned long long>(built),
+                  static_cast<unsigned long long>(us / 1000), static_cast<unsigned long long>(adopted));
+    return buf;
+}
+
+namespace {
 
 // A dispatch's first build of a pipeline (under g.mu): take what a worker
 // compiled for the same key, waiting while it builds - but not for ever: a
@@ -2677,6 +3027,7 @@ Precompiled take_precompiled_compute(std::uint64_t key, const GpuDispatch& d, co
     pl.meta = std::move(e.meta);
     pl.module = e.module;
     pl.pipeline = e.pipeline;
+    pl.standin = e.standin;
     e.failed = true;  // taken
     g_cs_pre.taken += 1;
     if (e.us >= 100000 || waited) {
@@ -2701,7 +3052,11 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
                               const std::vector<bool>& sampler_modes) {
     auto it = g.pipelines.find(key);
     if (it != g.pipelines.end()) {
-        if (!it->second.pending) return it->second;
+        if (!it->second.pending) {
+            ComputePipeline& have = it->second;
+            if (have.standin) adopt_optimized_compute(key, have.pipeline, have.standin, have.opt_seen);
+            return have;
+        }
         // A worker's build not waited for: skipped until it is done, then
         // made again from the start, which takes it.
         if (!precompiled_compute_done(key)) {
@@ -2739,7 +3094,7 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     case Precompiled::kBuildHere:
         break;
     }
-    pl.meta = gcn::translate(prog, o);
+    pl.meta = translate_cached(prog, o);
     if (!pl.meta.ok()) {
         host_log("gpu: shader %s: %s", name.c_str(), pl.meta.errors[0].c_str());
         pl.failed = true;
@@ -2762,20 +3117,9 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
         pl.failed = true;
         return pl;
     }
-    VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-    cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    cpci.stage.module = pl.module;
-    cpci.stage.pName = "main";
-    cpci.layout = g.pipe_layout;
-    cpci.flags = compute_create_flags();
     const auto t0 = std::chrono::steady_clock::now();
-    VkResult created;
-    {
-        CompilingScope compiling(name + " (at its dispatch)", &pl.meta.spirv);
-        created = vkCreateComputePipelines(g.device, PipelineCacheUse().cache, 1, &cpci, nullptr, &pl.pipeline);
-    }
-    if (created != VK_SUCCESS) {
+    pl.pipeline = first_compute_pipeline(pl.module, key, name, pl.meta.spirv, pl.standin, name + " (at its dispatch)");
+    if (!pl.pipeline) {
         host_log("gpu: shader %s: pipeline creation failed", name.c_str());
         pl.failed = true;
         return pl;
@@ -2806,9 +3150,9 @@ ComputePipeline& pipeline_for(const GpuDispatch& d, std::uint64_t key, const std
     }
     static std::atomic<int> logs{0};
     if (logs.fetch_add(1) < 40) {
-        host_log("gpu: compute shader %s: %zu instructions, %zu images, %zu samplers, threads %ux%ux%u, pipeline in %lld ms",
+        host_log("gpu: compute shader %s: %zu instructions, %zu images, %zu samplers, threads %ux%ux%u, pipeline in %lld ms%s",
                  name.c_str(), prog.insts.size(), pl.meta.images.size(), pl.meta.samplers.size(), d.threads[0],
-                 d.threads[1], d.threads[2], static_cast<long long>(ms));
+                 d.threads[1], d.threads[2], static_cast<long long>(ms), pl.standin ? " (unoptimized, standing in)" : "");
     }
     return pl;
 }
@@ -2855,7 +3199,7 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
     paths_options.stage = gcn::Stage::Compute;
     paths_options.rsrc1 = rsrc1;
     paths_options.rsrc2 = rsrc2;
-    const gcn::TranslateResult paths = gcn::translate(prog, paths_options);
+    const gcn::TranslateResult paths = translate_cached(prog, paths_options, TranslationUse::kPaths);
     offer_paths(code.words, paths);  // the first dispatch's paths_for takes them instead of translating on the command processor
     std::vector<std::pair<std::uint32_t, bool>> dims;
     for (const gcn::PredictedImage& p : gcn::predict_image_dims(prog, paths)) dims.emplace_back(p.dim, p.arrayed);
@@ -2880,7 +3224,7 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
     // From here every way out marks the entry done: a dispatch may be waiting on it.
     PrecompiledCompute::Entry e;
     std::string why;
-    e.meta = gcn::translate(prog, compute_options(rsrc1, rsrc2, threads, dims, modes));
+    e.meta = translate_cached(prog, compute_options(rsrc1, rsrc2, threads, dims, modes));
     if (!e.meta.ok()) why = "translation: " + e.meta.errors[0];
     if (why.empty()) {
         if (const char* env = std::getenv("BBHOST_DUMP_SPIRV"); env && env[0] == '1') {
@@ -2906,14 +3250,6 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
         if (vkCreateShaderModule(g.device, &smci, nullptr, &e.module) != VK_SUCCESS) why = "shader module";
     }
     if (why.empty()) {
-        VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        cpci.stage.module = e.module;
-        cpci.stage.pName = "main";
-        cpci.layout = g.pipe_layout;
-        cpci.flags = compute_create_flags();
-        CompilingScope compiling(name, &e.meta.spirv);
         // BBHOST_CS_COMPILE_DELAY_MS=<ms> (checks): a compiler that takes that
         // long over every compute pipeline built at creation - the dispatch's
         // bounded wait and the watchdog's line, tried on a fast driver.
@@ -2922,12 +3258,15 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
             return d ? std::atoi(d) : 0;
         }();
         if (delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
-        if (vkCreateComputePipelines(g.device, PipelineCacheUse().cache, 1, &cpci, nullptr, &e.pipeline) != VK_SUCCESS) why = "pipeline";
+        t_compute_worker = true;
+        e.pipeline = first_compute_pipeline(e.module, key, name, e.meta.spirv, e.standin, name);
+        if (!e.pipeline) why = "pipeline";
     }
     e.us = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
     e.done = true;
     e.failed = !why.empty();
     const std::uint64_t us = e.us;
+    const bool standin = e.standin;
     {
         std::lock_guard<std::mutex> lk(g_cs_pre.mu);
         g_cs_pre.by_key[key] = std::move(e);
@@ -2939,8 +3278,9 @@ void precompile_compute(const std::string& name, const std::vector<std::uint8_t>
     }
     g_cs_pre.cv.notify_all();
     if (us >= 1000000) {
-        host_log("gpu: compute shader %s compiled at creation (flip %llu) in %llu ms%s%s", name.c_str(), static_cast<unsigned long long>(created_flip),
-                 static_cast<unsigned long long>(us / 1000), why.empty() ? "" : ", failed: ", why.c_str());
+        host_log("gpu: compute shader %s compiled at creation (flip %llu) in %llu ms%s%s%s", name.c_str(), static_cast<unsigned long long>(created_flip),
+                 static_cast<unsigned long long>(us / 1000), standin ? " (unoptimized, standing in)" : "", why.empty() ? "" : ", failed: ",
+                 why.c_str());
     }
 }
 
@@ -4768,12 +5108,29 @@ void save_pipeline_cache_now(const std::string& path, bool periodic) {
 // runs on a thread of its own, at most every three minutes (serializing may
 // hold the cache against the command processor's pipeline creation meanwhile),
 // and host_gpu_save_pipeline_cache_at_exit() keeps what came after.
+namespace {
+// With g_cache_divert set and no creation left against the main cache (whose
+// merge needs it to itself - Vulkan's dstCache is externally synchronized, the
+// sources are not): the side cache's pipelines and the compute optimizer's
+// (g.opt_cache) join it.
+void merge_side_caches() {
+    VkPipelineCache sources[2];
+    std::uint32_t n = 0;
+    if (g.side_cache != VK_NULL_HANDLE) sources[n++] = g.side_cache;
+    if (g.opt_cache != VK_NULL_HANDLE) sources[n++] = g.opt_cache;
+    std::lock_guard<std::mutex> lk(g_opt_cache_mu);  // not a destination meanwhile
+    if (n) vkMergePipelineCaches(g.device, g.cache, n, sources);
+}
+}  // namespace
+
 void host_gpu_save_pipeline_cache() {
     static std::uint64_t saved_pipelines = 0;
     static std::chrono::steady_clock::time_point last{};
     if (!g.ok || g.cache == VK_NULL_HANDLE) return;
     stage_manifest_save_async(stage_manifest_path());
-    const std::uint64_t pipelines = host_gpu_stats().pipelines;
+    translation_cache_save_async(translation_cache_path());
+    // Compute pipelines the optimizer built count: they join the cache at a save (merge_side_caches).
+    const std::uint64_t pipelines = host_gpu_stats().pipelines + compute_optimized_built();
     if (pipelines == saved_pipelines) return;
     const auto now = std::chrono::steady_clock::now();
     // BBHOST_PIPELINE_CACHE_SAVE_S: the interval, and every save that finds the
@@ -4795,7 +5152,7 @@ void host_gpu_save_pipeline_cache() {
         // What was created meanwhile joins the main cache, which the merge
         // needs to itself: the creations that took it before the divert end first.
         while (g_cache_users.load() != 0) host_sleep_us(200);
-        if (g.side_cache != VK_NULL_HANDLE) vkMergePipelineCaches(g.device, g.cache, 1, &g.side_cache);
+        merge_side_caches();
         g_cache_divert.store(false);
         if (const std::uint64_t n = g_cache_diverted.load() - diverted) {
             host_log("gpu: %llu pipelines created against the side cache while the cache saved", static_cast<unsigned long long>(n));
@@ -4809,8 +5166,29 @@ void host_gpu_save_pipeline_cache_at_exit() {
     const std::string path = pipeline_cache_path();
     if (path.empty()) return;
     while (g_cache_saving.exchange(true)) std::this_thread::sleep_for(std::chrono::milliseconds(10));  // a periodic save first
+    // What the side cache and the compute optimizer's own cache took since the
+    // last periodic save joins first - the optimized compute pipelines built
+    // late in a run would otherwise be built again at the next start. The merge
+    // needs the main cache to itself: when a pipeline still compiling against
+    // it does not end within a second, they are left for the next run to build.
+    {
+        g_cache_divert.store(true);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (g_cache_users.load() != 0 && std::chrono::steady_clock::now() < until) host_sleep_us(200);
+        if (g_cache_users.load() == 0) merge_side_caches();
+        else host_log("gpu: pipeline cache: a pipeline still compiling at exit; what the side caches hold is left out of the save");
+        g_cache_divert.store(false);
+    }
     save_pipeline_cache_now(path, false);  // the flag stays set: no save after this one
     stage_manifest_save(stage_manifest_path());
+    translation_cache_save(translation_cache_path(), true);
+}
+
+std::string host_gpu_compile_report() {
+    std::string out = compute_optimize_window();
+    const std::string tc = translation_cache_window();
+    if (!tc.empty()) out += (out.empty() ? "" : "; ") + tc;
+    return out;
 }
 
 void host_gpu_submit() {
@@ -5042,7 +5420,10 @@ VkDeviceAddress guest_device_address(std::uint64_t va, std::size_t bytes) {
 
 void host_gpu_set_loading(bool loading) {
     if (gpu::g_loading_screen.exchange(loading) != loading) gpu::g_keeper_cv.notify_one();
+    gpu::precompile_set_loading(loading);
 }
+
+void host_gpu_world_reached() { gpu::precompile_set_world_reached(); }
 
 std::string host_gpu_image_heap_report() {
     std::lock_guard<GpuMutex> lock(gpu::g.mu);

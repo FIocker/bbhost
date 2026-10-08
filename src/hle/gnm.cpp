@@ -496,6 +496,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         const std::string sources = hle_gx_source_window();
         if (!sources.empty()) host_log("  gnm sources: %s", sources.c_str());
         host_gpu_save_pipeline_cache();
+        if (const std::string c = host_gpu_compile_report(); !c.empty()) host_log("  compile: %s", c.c_str());
         static std::uint64_t last_hashes = 0, last_hash_us = 0;
         const std::uint64_t hashes = host_gpu_texture_hashes(), hash_us = host_gpu_texture_hash_us();
         host_log("  media:%s%s texture-uploads=%llu texture-hashes=%llu in %llu ms",

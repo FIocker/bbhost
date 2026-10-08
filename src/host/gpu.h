@@ -256,6 +256,10 @@ std::string host_gpu_fill_stats();      // fill-pending / fill-applied counters
 // a background thread. BBHOST_PIPELINE_CACHE=0 turns loading and saving off.
 void host_gpu_save_pipeline_cache();  // periodic, in the background (gpu.cpp)
 void host_gpu_save_pipeline_cache_at_exit();  // synchronous: the window closing, the game exiting
+// Shader compiles since the last call, for the 300-flip report: compute
+// pipelines optimized in the background and swapped in, translations taken
+// from the translation cache or made (gpu.cpp); empty when there were none.
+std::string host_gpu_compile_report();
 // Guest-memory writes ordered after the queued shader work, executed by the
 // GPU: label writes and CP DMA. Return false when the memory is not
 // imported; the caller then flushes and writes on the host.
@@ -390,6 +394,9 @@ std::string host_gpu_image_heap_report();
 // coming area's image-heap blocks and upload staging ready, and holds less
 // once play resumes (gpu.cpp, start_memory_reserve).
 void host_gpu_set_loading(bool loading);
+// The first in-game frame (engine/loading.cpp): the shader compiles at the
+// start go from half the hardware threads to a quarter (render.cpp, precompiler).
+void host_gpu_world_reached();
 std::string host_gpu_memory_budget_report();
 // Serialises queue use between the presenter and the executor.
 void host_gpu_lock();

@@ -77,6 +77,7 @@ void loading_tick(std::uint64_t flip) {
     }
     if (in_game && !seen_world) {
         seen_world = true;
+        host_gpu_world_reached();  // the start's shader compiles go back to a quarter of the threads
         host_log("world: the first in-game frame, flip %llu, %.1f s after start", static_cast<unsigned long long>(flip),
                  std::chrono::duration<double>(now - g_start).count());
     }
