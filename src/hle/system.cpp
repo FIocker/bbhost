@@ -11,6 +11,7 @@
 #include "core/write_watch.h"
 #include "engine/debug_menu.h"
 #include "engine/menu_pointer.h"
+#include "engine/mouse_camera.h"
 #include "host/bindings.h"
 #include "host/ingame_menu.h"
 #include "host/options.h"
@@ -1482,6 +1483,46 @@ struct PadTap {
 std::mutex g_taps_mu;
 std::vector<PadTap> g_taps;  // under g_taps_mu
 
+// The wheel's notches as presses of mouse inputs 6 (up) and 7 (down): bits
+// 0x20 and 0x40 of the buttons the bindings read. The notches are counted
+// whole (SDL's high-resolution wheels report fractions) and a few at most are
+// kept, so a long spin does not go on pressing after the wheel stops.
+std::uint32_t wheel_presses(float notches) {
+    using Clock = std::chrono::steady_clock;
+    constexpr auto kPress = std::chrono::milliseconds(70), kGap = std::chrono::milliseconds(40);
+    static std::mutex mu;
+    static float part = 0.0f;
+    static int up = 0, down = 0;
+    static std::uint32_t bit = 0;
+    static Clock::time_point until, gap_until;
+    std::lock_guard<std::mutex> lock(mu);
+    part += notches;
+    while (part >= 1.0f) {
+        part -= 1.0f;
+        up = std::min(up + 1, 4);
+    }
+    while (part <= -1.0f) {
+        part += 1.0f;
+        down = std::min(down + 1, 4);
+    }
+    const Clock::time_point now = Clock::now();
+    if (bit && now >= until) {
+        bit = 0;
+        gap_until = now + kGap;
+    }
+    if (!bit && now >= gap_until && (up || down)) {
+        bit = up ? 0x20u : 0x40u;
+        --(up ? up : down);
+        until = now + kPress;
+        static int logs = 0;
+        if (logs < 6) {
+            ++logs;
+            host_log("mouse: the wheel %s, a press of what is bound to it", bit == 0x20u ? "up" : "down");
+        }
+    }
+    return bit;
+}
+
 GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
     if (!st || handle != 1) {
         return static_cast<int>(0x80920002u);  // SCE_PAD_ERROR_INVALID_HANDLE
@@ -1532,26 +1573,30 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         }
         if (want) {
             const MouseState m = host_mouse_state();
-            const float gain = hs.mouse_gain;
             const auto axis = [](float v) {
                 const float c = 128.0f + v;
                 return static_cast<std::uint8_t>(c < 0.0f ? 0.0f : c > 255.0f ? 255.0f : c);
             };
-            // **Added** to whatever the pad reports, not substituted for it.
-            // The first cut only wrote the stick when it read exactly 128,128,
-            // on the theory that a pad and a mouse fighting over one axis is
-            // worse than either - but a resting stick reads 127,124, not
-            // 128,128, so that guard never passed and the camera never moved.
-            // Composing is also the better answer: a stick that is being
-            // pushed and a mouse that is being moved simply sum.
-            // Reversed per axis on the PC Controls screen, on top of the
-            // game's own Camera X-Axis / Y-Axis, which act on the stick this
-            // feeds and so on the mouse as well.
-            const float sx = hs.mouse_invert_x ? -1.0f : 1.0f;
-            const float sy = hs.mouse_invert_y ? -1.0f : 1.0f;
-            if (m.dx != 0.0f || m.dy != 0.0f) {
-                p.rx = axis(static_cast<float>(p.rx) - 128.0f + sx * m.dx * gain);
-                p.ry = axis(static_cast<float>(p.ry) - 128.0f + sy * m.dy * gain);
+            // The mouse turns the camera itself, as DS3's does: an angle a
+            // count added in the follow camera's update, not a stick
+            // deflection here (engine/mouse_camera.h). The stick only carries
+            // the one thing DS3's mouse does with a target locked: a flick
+            // that switches it. Where that hook could not be placed (not the
+            // 1.09 eboot), the stick is the mouse's way in, as before.
+            float fx = 0.0f, fy = 0.0f;
+            if (mouse_camera_flick(fx, fy)) {
+                p.rx = axis(fx * 127.0f);
+                p.ry = axis(fy * 127.0f);
+                static int flogs = 0;
+                if (flogs < 8) {
+                    ++flogs;
+                    host_log("mouse: the lock-on flick on the right stick: %u,%u", p.rx, p.ry);
+                }
+            } else if (!mouse_camera_installed() && (m.dx != 0.0f || m.dy != 0.0f)) {
+                const float sx = hs.mouse_invert_x ? -1.0f : 1.0f;
+                const float sy = hs.mouse_invert_y ? -1.0f : 1.0f;
+                p.rx = axis(static_cast<float>(p.rx) - 128.0f + sx * m.dx * 1.1f);
+                p.ry = axis(static_cast<float>(p.ry) - 128.0f + sy * m.dy * 1.1f);
             }
             // And the buttons, because a mouse that turns the camera and does
             // nothing when clicked is half a mouse. Each is bound to an action
@@ -1567,8 +1612,12 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             // rather than four more bindings.
             bool held[kBindCount];
             // `pressed` as well: a click that starts and ends between two reads
-            // is still a press, for one read, rather than nothing.
-            host_bindings_mouse_held(m.buttons | m.pressed, held);
+            // is still a press, for one read, rather than nothing. And the
+            // wheel, which has no held state of its own: each notch is a
+            // press of whatever is bound to it (host/bindings.h), long enough
+            // for the game to see at 30 fps and with a gap before the next, so
+            // two notches are two presses.
+            host_bindings_mouse_held(m.buttons | m.pressed | wheel_presses(m.wheel), held);
             host_bindings_apply(held, host_key_strong(), p);
             // On a change only: a held button is seen on every pad read, and
             // logging each one spent the whole budget on the first press.
@@ -1578,12 +1627,6 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
                 last_buttons = m.buttons;
                 ++blogs;
                 host_log("mouse: camera buttons %x -> pad %04x", m.buttons, p.buttons);
-            }
-            static int logs = 0;
-            if (logs < 4 && (m.dx != 0.0f || m.dy != 0.0f)) {
-                ++logs;
-                host_log("mouse: camera d=%.1f,%.1f gain %.2f stick now %u,%u", m.dx, m.dy, gain,
-                         p.rx, p.ry);
             }
         }
     }
