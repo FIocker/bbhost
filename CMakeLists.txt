@@ -89,6 +89,7 @@ add_executable(bbhost
   src/decomp/player_data.cpp
   src/decomp/chalice.cpp
   src/decomp/talk_script.cpp
+  src/decomp/follow_camera.cpp
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
@@ -322,6 +323,10 @@ set_source_files_properties(src/decomp/item_lot.cpp PROPERTIES COMPILE_OPTIONS "
 set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/player_data.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
 set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/chalice.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
 set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/talk_script.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
+# The follow camera's step reproduces the game's floating point bit for bit:
+# no multiply-add fused, and the game's own AVX instructions (every CPU that
+# runs the eboot has AVX).
+set_source_files_properties(src/decomp/follow_camera.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off;-mavx")
 
 if(MSVC)
   target_compile_options(bbhost PRIVATE /W4)
@@ -441,6 +446,11 @@ if(UNIX)
   target_link_libraries(chalice_test PRIVATE eboot_kit)
   add_test(NAME chalice_test COMMAND chalice_test)
   set_tests_properties(chalice_test PROPERTIES SKIP_RETURN_CODE 77)
+  # The follow camera's step against the game's code (skips without the eboot).
+  add_executable(follow_camera_test tests/follow_camera_test.cpp src/decomp/follow_camera.cpp)
+  target_link_libraries(follow_camera_test PRIVATE eboot_kit)
+  add_test(NAME follow_camera_test COMMAND follow_camera_test 2000)
+  set_tests_properties(follow_camera_test PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(sync_test tests/sync_test.cpp src/hle/sync.cpp src/host/main_wait.cpp)
   target_include_directories(sync_test PRIVATE src)
   target_link_libraries(sync_test PRIVATE pthread)
