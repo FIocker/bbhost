@@ -1,12 +1,12 @@
 // The player-data decomps (decomp/player/player_data.cpp) against the game's own
-// code (tests/eboot_kit.h): item discovery, the echo gain, the kill reward,
+// code (tests/decomp/eboot_kit.h): item discovery, the echo gain, the kill reward,
 // the death penalty and the level-up price check run in the loaded eboot and
 // as ours on the same generated state - effect lists, a player and its
 // vtable, the record, GameDataMan, the HUD's counters - and every byte either
 // could write is compared, with what each returns and every call it makes
 // (the player's virtuals, the kill's hand-on and the param lookup are stubs
 // here, the same for both). Skips without the 1.09 eboot.
-#include "../src/decomp/player/player_data.cpp"
+#include "decomp/player/player_data.cpp"
 
 #include "eboot_kit.h"
 
@@ -320,7 +320,7 @@ int price_cases(int n) {
 }  // namespace
 
 int main() {
-    eboot_kit::load("player_data_test");
+    eboot_kit::load("decomp_player_data");
     struct Entry {
         u64 bn;
         const u8* bytes;
@@ -330,7 +330,7 @@ int main() {
                          {0x1f2f5e0, kPriceEntry, sizeof kPriceEntry}};
     for (const Entry& e : entries) {
         if (std::memcmp(eboot_kit::at(e.bn), e.bytes, e.n) != 0) {
-            std::printf("player_data_test: 0x%llx is not the entry the decomp was written against\n", static_cast<ull>(e.bn));
+            std::printf("decomp_player_data: 0x%llx is not the entry the decomp was written against\n", static_cast<ull>(e.bn));
             return 1;
         }
     }
@@ -346,7 +346,7 @@ int main() {
         bad += penalty_cases(kCases);
         bad += price_cases(kCases);
     }
-    std::printf("player_data_test: %d cases each of 5 functions (ordinary values, then special ones; %d price checks at the "
+    std::printf("decomp_player_data: %d cases each of 5 functions (ordinary values, then special ones; %d price checks at the "
                 "price), %d differ\n",
                 2 * kCases, g_price_edges, bad);
     return bad ? 1 : 0;

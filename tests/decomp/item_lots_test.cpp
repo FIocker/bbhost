@@ -1,12 +1,12 @@
 // The item-lot roll (decomp/items/item_lots.cpp) against the game's own
-// (tests/eboot_kit.h): sub_1bceaf0 and ours on the same random lots - rows of
+// (tests/decomp/eboot_kit.h): sub_1bceaf0 and ours on the same random lots - rows of
 // every slot shape, counters at every count, discovery, category-15 levels,
 // flags on and off, results to free - from the same flag store, generator and
 // heap. The results are compared byte for byte, and so are the generator and
 // every flag block afterwards, the heap hint, and what is left allocated.
 // Skips without the 1.09 eboot (BBHOST_EBOOT, or eboot-109-decrypted.bin in
 // the checkout).
-#include "../src/decomp/items/item_lots.cpp"
+#include "decomp/items/item_lots.cpp"
 
 #include "eboot_kit.h"
 
@@ -19,7 +19,7 @@
 
 namespace {
 
-const char* const kTest = "item_lot_test";
+const char* const kTest = "decomp_item_lots";
 eboot_kit::Rng g_rng(0x1bceaf0);
 
 // ---- The heap and the allocator the game's trees use --------------------

@@ -14,7 +14,7 @@
 #include <string>
 
 int main() {
-    const char* test = "decomp_insn_eboot_test";
+    const char* test = "decomp_insn_eboot";
     const auto& fns = eboot_kit::functions(test);
     std::size_t bad = 0, insns = 0, movable = 0, movable_before = 0, with_tables = 0, small = 0;
     std::size_t refused_loop = 0, refused_into = 0;
@@ -94,10 +94,10 @@ int main() {
         }
         ++(loop ? refused_loop : refused_into);
     }
-    std::printf("decomp_insn_eboot_test: %zu functions (%zu with jump tables), %zu instructions, %zu not decoded to their end "
+    std::printf("decomp_insn_eboot: %zu functions (%zu with jump tables), %zu instructions, %zu not decoded to their end "
                 "or first table\n",
                 fns.size(), with_tables, insns, bad);
-    std::printf("decomp_insn_eboot_test: entries the decomp list can take: %zu (before: %zu); %zu shorter than 5 bytes; "
+    std::printf("decomp_insn_eboot: entries the decomp list can take: %zu (before: %zu); %zu shorter than 5 bytes; "
                 "refused: %zu with a loop/jrcxz, %zu branching back into the entry\n",
                 movable, movable_before, small, refused_loop, refused_into);
     return bad ? 1 : 0;

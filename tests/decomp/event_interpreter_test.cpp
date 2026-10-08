@@ -1,5 +1,5 @@
 // The event-script interpreter (decomp/events/interpreter.cpp) against the game's own
-// code (tests/eboot_kit.h). Its eight functions take the game's place at their
+// code (tests/decomp/eboot_kit.h). Its eight functions take the game's place at their
 // entries for "ours" and give it back for "the game's", so every caller -
 // the game's own code included - reaches the version under test, as in the
 // game. Everything they touch lives in one arena (the events, their scripts,
@@ -21,7 +21,7 @@
 // behaviour digit run as they are; the heap, the event-sync broadcast, the
 // restart queue and DL_PANIC are fakes that record. Skips without the 1.09
 // eboot (BBHOST_EBOOT, or eboot-109-decrypted.bin in the checkout).
-#include "../src/decomp/events/interpreter.cpp"
+#include "decomp/events/interpreter.cpp"
 
 #include "eboot_kit.h"
 
@@ -43,7 +43,7 @@ namespace {
 
 using eboot_kit::at;
 
-const char* const kTest = "sprj_emk_test";
+const char* const kTest = "decomp_event_interpreter";
 int g_bad = 0;
 
 // ---- The image: entries placed and restored -------------------------------
