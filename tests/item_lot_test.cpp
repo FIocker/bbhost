@@ -16,8 +16,6 @@
 #include <set>
 #include <vector>
 
-void decomp_add(const DecompFunction&) {}
-std::uint64_t decomp_guest(std::uint64_t bn) { return bn; }
 
 namespace {
 

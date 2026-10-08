@@ -23,8 +23,6 @@
 
 #include <sys/mman.h>
 
-std::uint64_t decomp_guest(std::uint64_t bn) { return bn; }  // the kit loads at the preferred slide
-void decomp_add(const DecompFunction&) {}
 void follow_cam_update(std::uint8_t* cam, std::uint8_t* chr, void* world, float dt);
 bool follow_camera_body_ok(const std::uint8_t* entry);
 

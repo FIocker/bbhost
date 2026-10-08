@@ -19,8 +19,6 @@
 #include <vector>
 
 
-std::uint64_t decomp_guest(std::uint64_t bn) { return bn; }  // the kit loads at the preferred slide
-void decomp_add(const DecompFunction&) {}
 
 namespace {
 

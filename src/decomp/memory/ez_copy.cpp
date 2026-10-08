@@ -16,6 +16,7 @@
 // group, which the caller already takes for "nothing to wait for": the job
 // is queued as before, its data in place.
 #include "decomp/decomp.h"
+#include "decomp/guest.h"
 
 #include "core/write_watch.h"
 
@@ -25,9 +26,9 @@
 
 #include "log.h"
 
-namespace {
+using namespace decomp;
 
-using ull = unsigned long long;
+namespace {
 
 // push rbp; mov rbp, rsp; push r15, r14, r13, r12, rbx; sub rsp, 0x48
 // (17 bytes; a rip-relative load follows).

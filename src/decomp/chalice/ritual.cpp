@@ -33,6 +33,7 @@
 // rates), the same order, the same float sums.
 #include "decomp/decomp.h"
 #include "decomp/events/flag_store.h"
+#include "decomp/guest.h"
 
 #include "log.h"
 
@@ -42,12 +43,9 @@
 #include <cstdint>
 #include <cstring>
 
-namespace {
+using namespace decomp;
 
-using u8 = std::uint8_t;
-using u32 = std::uint32_t;
-using s32 = std::int32_t;
-using u64 = std::uint64_t;
+namespace {
 
 constexpr u64 kRoll = 0x1eaeec0, kPick = 0x2316e70, kMapUid = 0x231fbc0, kPairs = 0x1eaf9d0;
 constexpr u64 kHolygrailRow = 0x231f720;   // writes {id, row} for a HolygrailExParam id
@@ -96,18 +94,6 @@ struct Pair {
     s32 lot, feature;
 };
 
-template <class T>
-T load(const u8* p, u64 at) {
-    T v;
-    std::memcpy(&v, p + at, sizeof v);
-    return v;
-}
-
-template <class F>
-F guest(u64 bn) {
-    return reinterpret_cast<F>(decomp_guest(bn));
-}
-
 u32 draw(void* rng) {
     const auto* vtable = *static_cast<void* const* const*>(rng);
     return reinterpret_cast<u32(GUEST_ABI*)(void*)>(vtable[2])(rng);
@@ -121,13 +107,13 @@ float point(u32 r, float total) { return (std::bit_cast<float>((r >> 9) | 0x3f80
 // Where the game would divide by a zero block size, or read through a
 // manager DL_PANIC let it go on without, ours reads the flag as clear.
 bool flag_set(s32 id) {
-    u64 man = *reinterpret_cast<const u64*>(decomp_guest(kEventFlagManSlot));
+    u64 man = load<u64>(game_address(kEventFlagManSlot));
     if (!man) {
-        guest<void(GUEST_ABI*)(const char*, int, const char*, ...)>(kDlPanic)(
-            reinterpret_cast<const char*>(decomp_guest(kSingletonFile)), kSingletonLine,
-            reinterpret_cast<const char*>(decomp_guest(kSingletonFormat)),
-            reinterpret_cast<const char*>(decomp_guest(kSingletonName)));
-        man = *reinterpret_cast<const u64*>(decomp_guest(kEventFlagManSlot));
+        game_function<void(GUEST_ABI*)(const char*, int, const char*, ...)>(kDlPanic)(
+            reinterpret_cast<const char*>(game_address(kSingletonFile)), kSingletonLine,
+            reinterpret_cast<const char*>(game_address(kSingletonFormat)),
+            reinterpret_cast<const char*>(game_address(kSingletonName)));
+        man = load<u64>(game_address(kEventFlagManSlot));
         if (!man) return false;
     }
     const auto plain = [](u64 at, auto* v) {
@@ -173,7 +159,7 @@ namespace {
 // positive or the pick fails.
 void roll_choice(Choice* c, s32 lot, void* rng, u8 selected) {
     Row r{-1, nullptr};
-    guest<void(GUEST_ABI*)(Row*, s32)>(kSubFeatLotRow)(&r, lot);
+    game_function<void(GUEST_ABI*)(Row*, s32)>(kSubFeatLotRow)(&r, lot);
     u32 count = 0;
     if (r.row)
         for (int k = 0; k < 10; ++k) count += load<float>(r.row, kRate + 4 * k) > 0.0f;
@@ -196,7 +182,7 @@ std::atomic<u64> g_rolls{0};
 // dungeon_ritual_config_initialize: the roll.
 DECOMP_LEAF void chalice_roll(Setup* s, s32 id, void* rng) {
     g_rolls.fetch_add(1, std::memory_order_relaxed);
-    guest<void(GUEST_ABI*)(Setup*, s32)>(kHolygrailRow)(s, id);
+    game_function<void(GUEST_ABI*)(Setup*, s32)>(kHolygrailRow)(s, id);
     s->variation = 0;
     const u32 first = draw(rng);
     u32 layouts = 1;
@@ -291,7 +277,7 @@ namespace {
 void pair_of(const Choice& c, Pair* p) {
     p->lot = c.lot;
     Row r{-1, nullptr};
-    guest<void(GUEST_ABI*)(Row*, s32)>(kSubFeatLotRow)(&r, c.lot);
+    game_function<void(GUEST_ABI*)(Row*, s32)>(kSubFeatLotRow)(&r, c.lot);
     p->feature = r.row && c.pick <= 9 ? static_cast<std::int8_t>(r.row[kSubFeature + c.pick]) : -1;
 }
 
@@ -345,7 +331,7 @@ GUEST_ABI void roll_compare(Setup* s, s32 id, void* rng) {
     const auto game = reinterpret_cast<void(GUEST_ABI*)(Setup*, s32, void*)>(g_roll_game);
     u64 vtable;
     std::memcpy(&vtable, rng, 8);
-    if (vtable != decomp_guest(kSfmtVtable)) {
+    if (vtable != game_address(kSfmtVtable)) {
         g_roll_unclonable.fetch_add(1, std::memory_order_relaxed);
         game(s, id, rng);
         return;

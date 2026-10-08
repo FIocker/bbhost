@@ -10,6 +10,7 @@
 // needs. Ours is the same wait, polite: a short pause-spin, then the core
 // given back while the counter has not moved.
 #include "decomp/decomp.h"
+#include "decomp/guest.h"
 
 #include "log.h"
 
@@ -20,11 +21,11 @@
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+
+using namespace decomp;
 #endif
 
 namespace {
-
-using ull = unsigned long long;
 
 std::atomic<std::uint64_t> g_waits{0}, g_waited_us{0}, g_longest_us{0};
 
