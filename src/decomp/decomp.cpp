@@ -172,6 +172,12 @@ void decomp_add(const DecompFunction& fn) { g_added.push_back(fn); }
 
 bool decomp_comparing() { return g_comparing; }
 
+int decomp_placed(const char* name) {
+    for (const Placed& p : g_placed)
+        if (std::strcmp(p.fn->name, name) == 0) return p.compared ? 2 : 1;
+    return 0;
+}
+
 std::uint64_t decomp_guest(std::uint64_t bn) { return g_decomp_slide + (bn - kPreferredGuestSlide); }
 
 void decomp_install(ElfImage* image) {

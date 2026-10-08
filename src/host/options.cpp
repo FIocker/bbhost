@@ -66,6 +66,7 @@ enum SettingId {
     kMouseSens,
     kMouseInvertX,
     kMouseInvertY,
+    kMouseAutoRotation,
     kDrawCursor,
     kButtonPrompts,
     kSsao,
@@ -149,6 +150,12 @@ Setting g_set[kSettingCount] = {
      "Reverses the mouse's horizontal camera movement.", false},
     {"mouse_invert_y", "Mouse Y-axis", {"Off", "On"}, 0,
      "Reverses the mouse's vertical camera movement.", false},
+    // Off by default: with the mouse the camera stays where it is put, as
+    // the community's "Disable Camera Auto Rotation" patch has it - but only
+    // while the keyboard and mouse were used last; a controller gets the
+    // game's own camera back (engine/mouse_camera.h).
+    {"mouse_auto_rotation", "Mouse auto-rotation", {"Off", "On"}, 0,
+     "Off: while the mouse turns the camera, it stays where you put it instead of swinging behind you as you move. A controller always has the game's own camera.", false},
     {"draw_cursor", "Draw the pointer", {"On", "Off"}, 0,
      "The host draws it; the game has no cursor of its own.", false},
     // The game's key guide and its tutorial notes name a pad button as an
@@ -249,6 +256,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kMouseSens},
     {Row::Option, nullptr, kMouseInvertX},
     {Row::Option, nullptr, kMouseInvertY},
+    {Row::Option, nullptr, kMouseAutoRotation},
     {Row::Option, nullptr, kDrawCursor},
     {Row::Option, nullptr, kButtonPrompts},
     {Row::Header, "GRAPHICS"},
@@ -602,6 +610,7 @@ void apply(int id) {
         case kMouseSens:
         case kMouseInvertX:
         case kMouseInvertY:
+        case kMouseAutoRotation:
         case kDrawCursor:
         case kButtonPrompts:
             break;  // the settings object carries them (host/settings.h)
@@ -722,6 +731,7 @@ void rebuild_settings() {
     h.mouse_sens = index_of(kMouseSens) < 0 || index_of(kMouseSens) > 10 ? 5 : index_of(kMouseSens);
     h.mouse_invert_x = on_of(kMouseInvertX);
     h.mouse_invert_y = on_of(kMouseInvertY);
+    h.mouse_auto_rotation = on_of(kMouseAutoRotation);
     h.draw_cursor = on_of(kDrawCursor);
     h.button_prompts = index_of(kButtonPrompts) < 0 ? 0 : index_of(kButtonPrompts);
     h.ssao = on_of(kSsao);

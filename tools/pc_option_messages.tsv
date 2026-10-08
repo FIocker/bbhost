@@ -30,7 +30,7 @@
 110008	PC Controls	The mouse: camera, sensitivity and the pointer.
 110009	Key Bindings	Keyboard and mouse bindings.
 110010	PC Effects	Post-processing: blur, bloom, vignette and lens effects.
-110011	PC Camera	The follow camera: field of view, distance and height.
+110011	PC Camera	The follow camera: field of view, distance, height, and auto-rotation with the mouse.
 110012	Steam Deck	Frame rate and model detail for the Steam Deck.
 110013	PC Enhancements	Additions to the game: the mirror, rebirth, five players. Each needs a restart.
 116000	Vertical Sync	Wait for the display. Off can tear.
@@ -61,6 +61,7 @@
 121020	PC Camera	
 121000	Camera Distance	How far behind the character the camera sits. 5 is the game's own.
 121001	Camera Height	How high above the character the camera looks. 5 is the game's own.
+121002	Mouse Auto-Rotation	Off: while the mouse turns the camera, it stays where you put it instead of swinging behind you as you move. A controller always has the game's own camera.
 117004	Resolution	What the game renders at (it shipped at 1920x1080). Wide and 16:10 screens are filled, the HUD kept 16:9 in the middle. Changes at once and asks to be kept - the largest may wait for the next start.
 117010	1280x720
 117011	1600x900

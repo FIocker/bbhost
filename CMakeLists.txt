@@ -89,6 +89,7 @@ add_executable(bbhost
   src/engine/loading.cpp
   src/engine/camera.cpp
   src/engine/mouse_camera.cpp
+  src/engine/mouse_camera_stubs.cpp
   src/engine/fmod_probe.cpp
   src/engine/menu_memory.cpp
   src/engine/frame_rate.cpp
@@ -421,7 +422,7 @@ if(UNIX)
   bbhost_decomp_test(item_lots SOURCES src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp)
   bbhost_decomp_test(talk_evaluator SOURCES src/engine/esd.cpp LIBS gcn)
   bbhost_decomp_test(chalice_ritual)
-  bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp ARGS 2000)
+  bbhost_decomp_test(follow_camera SOURCES src/decomp/camera/follow_camera.cpp src/engine/mouse_camera_stubs.cpp ARGS 2000)
   bbhost_decomp_test(sfx_ribbons SOURCES src/core/write_watch.cpp)
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)

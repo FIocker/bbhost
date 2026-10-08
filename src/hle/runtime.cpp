@@ -17,6 +17,7 @@
 #include "engine/gx_resources.h"
 #include "engine/gx_state.h"
 #include "engine/graphics_patch.h"
+#include "engine/mouse_camera.h"
 #include "engine/frame_pool.h"
 #include "engine/yebis.h"
 #include "engine/guest.h"
@@ -407,6 +408,9 @@ void hle_patch_guest(ElfImage* image) {
     // The game's functions as our source, in its place (decomp/, docs/decomp.md).
     decomp_add_areas();
     decomp_install(image);
+    // After the list: the mouse turns our follow camera when it is in place,
+    // else the game's by hooks (engine/mouse_camera.h).
+    mouse_camera_install(image);
 
     // The command-arena acquire (guest 0x2ad3b80) becomes hle_gx_arena_acquire
     // (gnm_exec.cpp): the same scan, but when no chunk is free it waits for the
