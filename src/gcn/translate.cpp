@@ -88,6 +88,12 @@ struct Translator {
     // TranslateOptions::tess_role: LDS is the buffer at StageParams::lds_address.
     bool lds_in_buffer = false;
     Id lds_base64 = 0;
+    // TranslateOptions::tess_lds_bound: how many bytes from lds_base64 the
+    // stage may touch - the patch's window, or StageParams::lds_bytes - and
+    // whether member 3 of the params block is the uvec4 that holds the latter.
+    Id lds_limit = 0;
+    Id lds_patch_ok = 0;  // bool: the window's patch lies inside lds_bytes (0: not checked)
+    bool params_head_v4 = false;
     Id p_in_v4f, p_in_v4u, p_in_u32, p_in_f32, p_in_v3u, p_in_bool, p_out_v4f, p_out_f32, p_uc_sampler;
     Id t_fn_main;
 
@@ -784,7 +790,8 @@ struct Translator {
                                             {cu(member), cu(static_cast<std::uint32_t>(index / 4)), cu(static_cast<std::uint32_t>(index % 4))}));
     }
     Id buffer_bound(std::size_t index) {
-        const Id valid_bits = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(3)}));
+        const Id valid_bits = m.load(t_u32, params_head_v4 ? m.access_chain(p_uni_u32, ubo_var, {cu(3), c_zero_u})
+                                                           : m.access_chain(p_uni_u32, ubo_var, {cu(3)}));
         return ine(iand(shr(valid_bits, cu(static_cast<std::uint32_t>(index))), c_one_u), c_zero_u);
     }
     // n dwords of buffers[index] from dword `first_dw` of the V# (whose base
@@ -2626,20 +2633,24 @@ struct Translator {
     }
 
     // ---- LDS
+    // An LDS byte address in the buffer standing in for LDS: the dword's
+    // offset from lds_base64, and (TranslateOptions::tess_lds_bound) whether
+    // it is inside the window and the window inside the buffer - 0 when
+    // nothing is checked. Outside, the offset is 0, which is always there.
+    std::pair<Id, Id> lds_buffer_at(Id byte_addr) {
+        const Id off = iand(byte_addr, cu(~3u));
+        if (!lds_limit) return {off, 0};
+        Id ok = ult(off, lds_limit);
+        if (lds_patch_ok) ok = band(ok, lds_patch_ok);
+        return {sel(ok, off, c_zero_u), ok};
+    }
+    Id lds_buffer_ptr(Id off) {
+        const Id at = m.emit(spv::OpIAdd, t_u64, {lds_base64, m.emit(spv::OpUConvert, t_u64, {off})});
+        const Id block = m.emit(spv::OpConvertUToPtr, p_psb_block, {at});
+        return m.access_chain(p_psb_u32, block, {c_zero_u});
+    }
     Id lds_ptr(Id byte_addr) {
-        if (lds_in_buffer) {
-            Id off = iand(byte_addr, cu(~3u));
-            // With a window a patch, every access the stages mean to make is
-            // inside the patch's own window. One past it - an offset worked
-            // out from a value nothing wrote, or a lane taken for another -
-            // reached memory the GPU has not mapped, and the device was lost
-            // (an RX 9070 XT in the game's own hull draws, 2026-10-08): it
-            // takes the window's last dword instead, a wrong value at worst.
-            if (opt.tess_window >= 4) off = m.ext_inst(t_u32, spv::GlslUMin, {off, cu((opt.tess_window - 4) & ~3u)});
-            const Id at = m.emit(spv::OpIAdd, t_u64, {lds_base64, m.emit(spv::OpUConvert, t_u64, {off})});
-            const Id block = m.emit(spv::OpConvertUToPtr, p_psb_block, {at});
-            return m.access_chain(p_psb_u32, block, {c_zero_u});
-        }
+        if (lds_in_buffer) return lds_buffer_ptr(lds_buffer_at(byte_addr).first);
         const Id idx = shr(byte_addr, cu(2));
         return m.access_chain(p_wg_u32, v_lds, {idx});
     }
@@ -2660,7 +2671,14 @@ struct Translator {
             // One control point a patch, so the per-vertex array has one entry.
             return m.load(t_u32, m.access_chain(m.type_pointer(spv::ScInput, t_u32), v_attr_in, {c_zero_u, slot, comp}));
         }
-        if (lds_in_buffer) return m.emit(spv::OpLoad, t_u32, {lds_ptr(byte_addr), 2u /* Aligned */, 4u});
+        if (lds_in_buffer) {
+            // Bounded, the load is of a dword that is there whatever the
+            // address, and what it gives is 0 past the end - every lane runs
+            // it, EXEC or not, so a lane switched off reads too.
+            const auto [off, ok] = lds_buffer_at(byte_addr);
+            const Id v = m.emit(spv::OpLoad, t_u32, {lds_buffer_ptr(off), 2u /* Aligned */, 4u});
+            return ok ? sel(ok, v, c_zero_u) : v;
+        }
         return m.load(t_u32, lds_ptr(byte_addr));
     }
     void lds_store(Id byte_addr, Id v) {
@@ -2671,7 +2689,14 @@ struct Translator {
             return;
         }
         if (lds_in_buffer) {
-            m.emit_void(spv::OpStore, {lds_ptr(byte_addr), v, 2u /* Aligned */, 4u});
+            // Past the end the write is dropped, as the hardware drops it.
+            const auto [off, ok] = lds_buffer_at(byte_addr);
+            const auto store = [&, off = off] { m.emit_void(spv::OpStore, {lds_buffer_ptr(off), v, 2u /* Aligned */, 4u}); };
+            if (ok) {
+                if_then(ok, store);
+            } else {
+                store();
+            }
             return;
         }
         m.store(lds_ptr(byte_addr), v);
@@ -2743,7 +2768,11 @@ struct Translator {
             const Id below_hi = iand(bhi, sel(lt32, c_zero_u, isub(shl(c_one_u, isub(l, cu(32))), c_one_u)));
             const Id rank = iadd(popcnt(below_lo), popcnt(below_hi));
             const Id result = m.local_variable(p_fn_u32, c_zero_u);
-            const Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+            Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+            // A counter past the buffer's end is left alone (0 comes back).
+            if (lds_in_buffer) {
+                if (const Id ok = lds_buffer_at(base).second) first = band(first, ok);
+            }
             if_then(first, [&] {
                 const Id p = lds_ptr(base);
                 const Id delta = in.op == 62 ? total : isub(c_zero_u, total);
@@ -3308,6 +3337,11 @@ struct Translator {
                                                                t_bias_arr, t_v4f, t_v4u}
                                   : vertex_w3 ? std::vector<Id>{t_u64, t_u64, t_user_arr, t_u32, t_bias_arr, t_bias_arr, t_bias_arr, t_bias_arr}
                                               : std::vector<Id>{t_u64, t_u64, t_user_arr, t_u32, t_bias_arr, t_bias_arr, t_bias_arr};
+        // A tessellation stage's LDS buffer has an end (StageParams::lds_bytes,
+        // the dword after cb_valid): member 3 becomes the uvec4 of both, the
+        // same 16 bytes at the same offset.
+        params_head_v4 = opt.tess_role != TranslateOptions::TessRole::None && opt.tess_lds_bound;
+        if (params_head_v4) members[3] = t_v4u;
         // TranslateOptions::bindless: StageParams::image_index and
         // sampler_index follow whatever the stage declares, at their own offsets.
         if (opt.bindless) {
@@ -3532,11 +3566,25 @@ struct Translator {
             m.store(sgpr_var(k), m.load(t_u32, p));
         }
         sym_user_data();
+        Id lds_bytes = 0;
         if (lds_in_buffer) {
             lds_base64 = m.load(t_u64, m.access_chain(p_uni_u64, ubo_var, {cu(1)}));  // StageParams::lds_address
+            if (params_head_v4) {
+                // TranslateOptions::tess_lds_bound: a window's accesses stay
+                // inside the window, anything else inside the buffer.
+                lds_bytes = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(3), c_one_u}));  // StageParams::lds_bytes
+                lds_limit = opt.tess_window ? cu(opt.tess_window) : lds_bytes;
+            }
         }
         // TranslateOptions::tess_window: the patch's own window of the buffer.
+        // Bounded, a patch whose window would end past lds_bytes reads 0 and
+        // writes nothing (lds_patch_ok), and its base stays the buffer's.
         const auto window_of = [&](Id patch) {
+            if (lds_bytes) {
+                const Id windows = m.emit(spv::OpUDiv, t_u32, {lds_bytes, cu(opt.tess_window)});
+                lds_patch_ok = ult(patch, windows);
+                patch = sel(lds_patch_ok, patch, c_zero_u);
+            }
             lds_base64 = m.emit(spv::OpIAdd, t_u64, {lds_base64, m.emit(spv::OpUConvert, t_u64, {imul(patch, cu(opt.tess_window))})});
         };
         const bool windowed = opt.tess_window && lds_in_buffer;
@@ -3594,7 +3642,7 @@ struct Translator {
                 const Id near = m.emit(spv::OpBitcast, t_f32, {extract(t_u32, layout, 2)});
                 const Id at = iadd(pbase, imul(p, stride));
                 auto row_w = [&](int dword) {
-                    return f(m.load(t_u32, lds_ptr(iadd(at, cu(static_cast<std::uint32_t>(dword) * 4)))));
+                    return f(lds_load(iadd(at, cu(static_cast<std::uint32_t>(dword) * 4))));
                 };
                 const Id px = row_w(15), py = row_w(19), pz = row_w(23);
                 Id w = fmul(extract(t_f32, cull, 0), px);

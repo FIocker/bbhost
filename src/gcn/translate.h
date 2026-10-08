@@ -314,6 +314,19 @@ struct TranslateOptions {
     // stage's), and DomainTes reads the window of gl_PrimitiveID. No access
     // leaves its window: an offset past it takes the window's last dword.
     std::uint32_t tess_window = 0;
+    // The LDS buffer is reached through a raw device address, which nothing
+    // bounds: a ds_read whose address is garbage - a lane EXEC has switched
+    // off (the translation runs reads for every lane), or an offset worked
+    // out of a value that went wrong - reads wherever that lands. The GCN LDS
+    // returns 0 for a read past the wave's allocation and drops such a
+    // write; NVIDIA's driver mostly reads some other allocation there, AMD's
+    // faults and loses the device (an RX 7600 XT in the Forbidden Woods'
+    // hull draws). With this every access is checked against its window
+    // (tess_window), or against StageParams::lds_bytes without one, and the
+    // window's patch is held inside lds_bytes: past the end a read is 0 and
+    // a write is dropped, as on the hardware. The host turns it off with
+    // BBHOST_TESS_LDS_BOUND=0.
+    bool tess_lds_bound = true;
     bool tess_quads = true;            // VGT_TF_PARAM type 2; triangles otherwise
     int tess_spacing = 0;              // 0 integer, 1 fractional-odd, 2 fractional-even
     bool tess_cw = true;               // topology 2 (cw) against 3 (ccw)
@@ -394,7 +407,10 @@ struct StageParams {
     std::uint64_t lds_address;    // TranslateOptions::tess_role: the device address of the buffer standing in for LDS
     std::uint32_t user_sgpr[16];  // SPI_SHADER_USER_DATA_*
     std::uint32_t cb_valid;       // bit n: buffers[n] is bound; otherwise the shader walks the page table
-    std::uint32_t pad[3];
+    // TranslateOptions::tess_lds_bound: the bytes from lds_address the stage
+    // may touch (0: none - every read is 0).
+    std::uint32_t lds_bytes;
+    std::uint32_t pad[2];
     std::uint32_t cb_bias_dw[16];  // buffers[n]: dword index of the V# base inside its bound range
     std::uint32_t cb_stride[16];   // buffers[n] read by index (BufferBinding::indexed): the V#'s stride in bytes
     std::uint32_t cb_w3[16];       // the same: the V#'s word 3 (data and number format, DST_SEL)

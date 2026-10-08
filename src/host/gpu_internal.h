@@ -476,6 +476,7 @@ enum DrawFail : int {
     kFailPipelineCreate,    // creating the (lean-first) pipeline object
     kFailIndexBuffer,       // the index buffer is not in imported memory
     kFailIndirectArgs,      // the indirect arguments are not in imported memory
+    kFailGpuGone,           // no GPU to draw with: the device is lost (or never came up)
     kFailCount
 };
 static_assert(kFailCount <= 16, "Gpu::draw_fail_why has 16 slots");
