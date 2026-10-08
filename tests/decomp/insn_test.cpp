@@ -187,6 +187,6 @@ void check_runs() {
 int main() {
     check_cases();
     check_runs();
-    std::printf("decomp_insn_test: %zu decodes and four relocated runs, %d wrong\n", std::size(kCases), g_bad);
+    std::printf("decomp_insn: %zu decodes and four relocated runs, %d wrong\n", std::size(kCases), g_bad);
     return g_bad ? 1 : 0;
 }

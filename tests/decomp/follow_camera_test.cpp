@@ -1,5 +1,5 @@
 // The follow camera's step (decomp/camera/follow_camera.cpp) against the game's own
-// code (tests/eboot_kit.h): generated cameras run frame after frame through
+// code (tests/decomp/eboot_kit.h): generated cameras run frame after frame through
 // the game's ChrExFollowCam::Update and through ours - each its own copy,
 // fed the same characters, sticks, flags, worlds and dt - and after every
 // frame the whole 0x350-byte object, the GameStateMan overrides it consumes,
@@ -302,7 +302,7 @@ bool same(const u8* a, const u8* b, std::size_t n, std::size_t* where) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const char* test = "follow_camera_test";
+    const char* test = "decomp_follow_camera";
     eboot_kit::load(test);
     static const u8 kEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
                                 0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0xd8, 0x03, 0x00, 0x00};

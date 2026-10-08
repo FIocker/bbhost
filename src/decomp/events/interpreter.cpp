@@ -415,7 +415,7 @@ DECOMP_LEAF void SprjEmkEventIns_EndOrRestart(Ev* ev, std::uint32_t restart) {
 // EndOrRestart's effects are predicted from the event before the game's runs
 // - its fields, the restart record it queues, the completion flag - and
 // checked after. The loop and the dispatcher have no compare: they call bank
-// functions that act on the world, which cannot run twice; tests/sprj_emk_test
+// functions that act on the world, which cannot run twice; tests/decomp_event_interpreter
 // runs them against the game's on synthetic events.
 
 namespace {
