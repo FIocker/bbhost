@@ -88,6 +88,7 @@ add_executable(bbhost
   src/decomp/item_lot.cpp
   src/decomp/player_data.cpp
   src/decomp/chalice.cpp
+  src/decomp/talk_script.cpp
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
@@ -320,6 +321,7 @@ set_source_files_properties(src/decomp/sfx_ribbon.cpp PROPERTIES COMPILE_OPTIONS
 set_source_files_properties(src/decomp/item_lot.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/player_data.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
 set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/chalice.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
+set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/talk_script.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
 
 if(MSVC)
   target_compile_options(bbhost PRIVATE /W4)
@@ -408,6 +410,14 @@ if(UNIX)
   target_link_libraries(player_data_test PRIVATE eboot_kit)
   add_test(NAME player_data_test COMMAND player_data_test)
   set_tests_properties(player_data_test PROPERTIES SKIP_RETURN_CODE 77)
+  # The talk scripts' evaluator against the game's (skips without the eboot;
+  # the dump's scripts, BBHOST_APP0, join the random expressions when named).
+  add_executable(talk_script_test tests/talk_script_test.cpp src/engine/esd.cpp)
+  target_compile_options(talk_script_test PRIVATE -fno-stack-protector -ffp-contract=off)
+  target_compile_features(talk_script_test PRIVATE cxx_std_17)
+  target_link_libraries(talk_script_test PRIVATE eboot_kit gcn)
+  add_test(NAME talk_script_test COMMAND talk_script_test)
+  set_tests_properties(talk_script_test PROPERTIES SKIP_RETURN_CODE 77)
   # The effect ribbons' writers against the game's code (skips without the eboot).
   add_executable(sfx_ribbon_test tests/sfx_ribbon_test.cpp src/core/write_watch.cpp)
   target_compile_options(sfx_ribbon_test PRIVATE -ffp-contract=off)
