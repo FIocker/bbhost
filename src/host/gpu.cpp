@@ -1941,6 +1941,7 @@ bool init_locked() {
     f2.features.vertexPipelineStoresAndAtomics = VK_TRUE;
     f2.features.pipelineStatisticsQuery = g.profile_stats ? VK_TRUE : VK_FALSE;
     glitch_device_features(f2.features);  // BBHOST_GLITCH=1 only: precise occlusion queries
+    occlusion_device_features(f2.features, dext, &f13.pNext);  // precise queries, conditional rendering
     // DB_DEPTH_CONTROL bit 3: the deferred lights cull by depth range.
     VkPhysicalDeviceFeatures supported{};
     vkGetPhysicalDeviceFeatures(g.phys, &supported);
@@ -2130,6 +2131,7 @@ bool init_locked() {
     busy_init_locked();
     g.cmd_ = g.slots[0].cmd;
     g.fence = g.slots[0].fence;
+    occlusion_device_ready_locked();
     // The pipeline cache persists under the data root, so a later run creates
     // the pipelines this one compiled without the driver compiling them again.
     // The driver ignores data from another device or driver version.
@@ -2367,6 +2369,7 @@ void begin_recording_locked() {
         g.recording = true;
         busy_begin_locked(g.slots[g.slot]);
         glitch_begin_recording_locked();
+        occlusion_begin_recording_locked();
         if (g.profile) {
             Gpu::Slot& sl = g.slots[g.slot];
             vkCmdResetQueryPool(g_cmd(), sl.qpool, 0, kQueriesPerSlot);
@@ -4439,6 +4442,9 @@ void submit_locked() {
     if (!g.recording) {
         return;
     }
+    // The occlusion counters this recording dumped land before its labels,
+    // as the PS4's DBs write them before the end-of-pipe event that follows.
+    occlusion_submit_locked();
     flush_deferred_writes_locked();  // (its transfer batch puts deferred copy-backs in place first)
     transfer_flush_locked();
     render_end_pass_locked();
@@ -6044,5 +6050,6 @@ void host_gpu_report() {
         host_log("gpu: draw failures by reason: %s", line.c_str());
     }
     if (glitch_on()) host_log("%s", glitch_report().c_str());
+    if (occlusion_on()) host_log("%s", occlusion_report(true).c_str());
     render_report();
 }

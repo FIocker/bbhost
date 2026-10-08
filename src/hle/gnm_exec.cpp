@@ -43,6 +43,7 @@ constexpr std::uint32_t kWaitRegMem = 0x3C;
 constexpr std::uint32_t kIndirectBuffer = 0x3F;
 constexpr std::uint32_t kEventWrite = 0x46;
 constexpr std::uint32_t kEventWriteEop = 0x47;
+constexpr std::uint32_t kSetPredication = 0x20;
 constexpr unsigned kPixelPipeStatDump = 57;   // EventType::PixelPipeStatDump
 constexpr unsigned kEventIndexZpassDone = 1;  // EventIndex::ZpassDone: the packet carries an address
 constexpr std::uint32_t kEventWriteEos = 0x48;
@@ -1025,6 +1026,12 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
             }
             if (type == kPixelPipeStatDump && index == kEventIndexZpassDone && n >= 3) {
                 const std::uint64_t va = gpu_va(b[1], b[2]);
+                // The real counters (host/occlusion.cpp): the draws after the
+                // dump are measured by Vulkan occlusion queries and the GPU
+                // writes the counts here once it has run them, before the
+                // labels that follow. Nothing is written now - the game zeroed
+                // the block and reads it as not ready until then.
+                if (host_gpu_zpass_dump(va)) break;
                 // Per pixel pipe: [this sample, the next one], 16 bytes apart.
                 constexpr int kPixelPipes = 8;  // 16 on a Neo; the game reads as many as it wrote
                 constexpr std::uint64_t kValid = 1ull << 63;
@@ -1039,7 +1046,8 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     // Every pipe reports the same count, and a sample is
                     // ahead of the one before it. HLE fake: the pixels a draw
                     // covers are not counted, so a light behind a wall keeps
-                    // its glare (host occlusion queries are the real fix).
+                    // its glare and the game culls nothing by its queries
+                    // (the real counts are host_gpu_zpass_dump's, above).
                     const std::uint64_t now = counter.fetch_add(step, std::memory_order_relaxed) + step;
                     // Only the dump's own words, one per pipe, 16 bytes apart:
                     // the query's end dump lands at block+8 (Gnm's writer,
@@ -1068,10 +1076,29 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     static std::atomic<int> logs{0};
                     if (logs.fetch_add(1) == 0) {
                         host_log("HLE fake: the pixel-pipe counters an occlusion query samples are a rising count, not the pixels drawn "
-                                 "(first dump to 0x%llx)", static_cast<unsigned long long>(va));
+                                 "(first dump to 0x%llx; BBHOST_OCCLUSION=0, or the block is not in imported memory)",
+                                 static_cast<unsigned long long>(va));
                     }
                 }
             }
+            break;
+        }
+        case kSetPredication: {
+            // [0] start address lo (16-byte aligned), [1] address hi[7:0] |
+            // PRED_BOOL[8] (1: draw if visible) | HINT[12] | PRED_OP[18:16]
+            // (0 clear, 1 ZPASS, 2 primitive count) | CONTINUE[31]. Gnm's
+            // setZPassPredicationEnable/Disable; the draws between are GX
+            // tokens, not packets carrying the predicate bit, so the span
+            // between a set and its clear is what is predicated
+            // (host/occlusion.cpp). BBHOST_PREDICATION=0 ignores it.
+            if (n < 2) break;
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 4) {
+                host_log("gnm exec: SET_PREDICATION block 0x%llx op %u draw-if-visible %u hint %u continue %u",
+                         static_cast<unsigned long long>(gpu_va(b[0] & ~0xfu, b[1] & 0xff)), (b[1] >> 16) & 7, (b[1] >> 8) & 1,
+                         (b[1] >> 12) & 1, b[1] >> 31);
+            }
+            host_gpu_set_predication(gpu_va(b[0] & ~0xfu, b[1] & 0xff), (b[1] >> 16) & 7, ((b[1] >> 8) & 1) != 0, (b[1] >> 31) != 0);
             break;
         }
         case kWriteConstRam: {

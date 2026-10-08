@@ -859,6 +859,21 @@ void glitch_begin_recording_locked();                         // a recording's f
 void glitch_draw_locked(DrawCall& call);                      // a query for draw g_draw_rec_next
 void glitch_slot_done_locked(Gpu::Slot& sl);                  // its fence has signalled
 std::string glitch_report();
+
+// ---- occlusion queries and predication (occlusion.cpp) ----
+// The PS4's depth-block sample counters behind ZPASS_DONE dumps, from Vulkan
+// occlusion queries, written into guest memory on the GPU's timeline; and
+// SET_PREDICATION, on the CPU when the result is known, else by conditional
+// rendering. BBHOST_OCCLUSION=0: the old fake (every query reads visible).
+bool occlusion_on();
+void occlusion_device_features(VkPhysicalDeviceFeatures& enable, std::vector<const char*>& exts, void** chain);  // before vkCreateDevice
+void occlusion_device_ready_locked();     // after the slots are made
+void occlusion_begin_recording_locked();  // a recording's first commands
+bool occlusion_draw_entry();              // host_gpu_draw's start: false when SET_PREDICATION culls the draw
+void occlusion_draw_locked(DrawCall& call);
+void occlusion_submit_locked();  // before the submission's label writes
+void occlusion_record_cond(VkCommandBuffer cmd, const DrawCall& call, bool begin);
+std::string occlusion_report(bool totals);
 // BBHOST_GLITCH_WATCH=<pipeline prefix>[,...]: the guest ranges those
 // pipelines' draws bind are hashed when recorded and again once the GPU has
 // run them, and a spike's report says whether its inputs changed in between.
@@ -1186,8 +1201,15 @@ struct DrawCall {
     std::int32_t vertex_offset = 0;
     VkBuffer buffer = VK_NULL_HANDLE;  // indirect arguments
     VkDeviceSize offset = 0;
-    VkQueryPool query_pool = VK_NULL_HANDLE;  // BBHOST_GLITCH=1: the draw's coverage query
+    // An occlusion query around the draw: its coverage (BBHOST_GLITCH=1) or
+    // the PS4's sample counters (occlusion.cpp).
+    VkQueryPool query_pool = VK_NULL_HANDLE;
     std::uint32_t query = 0;
+    VkQueryControlFlags query_flags = 0;
+    // SET_PREDICATION resolved on the GPU (occlusion.cpp): the draw goes ahead
+    // only if this word is nonzero (VK_EXT_conditional_rendering).
+    VkBuffer cond_buffer = VK_NULL_HANDLE;
+    VkDeviceSize cond_offset = 0;
 };
 constexpr std::uint32_t kMaxVertexBindings = 16;
 void record_library_state(VkCommandBuffer cmd, const DrawLibraryState& s, bool has_depth_bounds);

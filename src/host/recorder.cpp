@@ -730,13 +730,15 @@ const bool g_render_min = [] {
 
 void record_draw_call(VkCommandBuffer cmd, const DrawCall& c) {
     if (g_render_min) return;
-    if (c.query_pool) vkCmdBeginQuery(cmd, c.query_pool, c.query, glitch_query_flags());
+    if (c.query_pool) vkCmdBeginQuery(cmd, c.query_pool, c.query, c.query_flags);
+    if (c.cond_buffer) occlusion_record_cond(cmd, c, true);
     switch (c.kind) {
     case DrawCall::kIndexedIndirect: vkCmdDrawIndexedIndirect(cmd, c.buffer, c.offset, 1, 20); break;
     case DrawCall::kIndirect: vkCmdDrawIndirect(cmd, c.buffer, c.offset, 1, 16); break;
     case DrawCall::kIndexed: vkCmdDrawIndexed(cmd, c.count, c.instances, 0, c.vertex_offset, 0); break;
     case DrawCall::kDirect: vkCmdDraw(cmd, c.count, c.instances, static_cast<std::uint32_t>(c.vertex_offset), 0); break;
     }
+    if (c.cond_buffer) occlusion_record_cond(cmd, c, false);
     if (c.query_pool) vkCmdEndQuery(cmd, c.query_pool, c.query);
 }
 

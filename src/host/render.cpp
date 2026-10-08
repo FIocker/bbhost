@@ -10735,6 +10735,9 @@ bool host_gpu_draw(const GpuDraw& d) {
     // The windows given since the last draw are this one's (host_gpu_draw_window).
     t_draw_windows.swap(t_given_windows);
     t_given_windows.clear();
+    // Under a SET_PREDICATION whose block already reads occluded: not drawn,
+    // as the PS4's command processor would skip it (occlusion.cpp).
+    if (!occlusion_draw_entry()) return true;
     probe_tessellated_draw(d);
     // Whether this is a tessellated draw at all. A draw that took a token
     // wrote no VGT_SHADER_STAGES_EN for the command stream to hold, so its GX
@@ -13089,6 +13092,7 @@ static bool draw_impl(const GpuDraw& d) {
         call.buffer = loc.buffer;
         call.offset = loc.offset;
         glitch_draw_locked(call);
+        occlusion_draw_locked(call);
         cmds.draw(call);
     } else if (d.index_va) {
         DrawCall call;
@@ -13097,6 +13101,7 @@ static bool draw_impl(const GpuDraw& d) {
         call.instances = d.instance_count;
         call.vertex_offset = vtx_off;
         glitch_draw_locked(call);
+        occlusion_draw_locked(call);
         cmds.draw(call);
     } else {
         DrawCall call;
@@ -13105,6 +13110,7 @@ static bool draw_impl(const GpuDraw& d) {
         call.instances = d.instance_count;
         call.vertex_offset = vtx_off;
         glitch_draw_locked(call);
+        occlusion_draw_locked(call);
         cmds.draw(call);
     }
     if (!g.profile_passes) profile_end_locked();
