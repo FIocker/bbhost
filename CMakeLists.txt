@@ -108,6 +108,7 @@ add_executable(bbhost
   src/hle/np_matching2.cpp
   src/hle/np_signaling.cpp
   src/host/window.cpp
+  src/host/text_entry.cpp
   src/host/overlay.cpp
   src/host/ingame_menu.cpp
   src/host/options.cpp
@@ -359,6 +360,9 @@ if(UNIX)
   target_include_directories(config_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   add_dependencies(config_test bbhost_version)
   add_test(NAME config_test COMMAND config_test)
+  add_executable(text_entry_test tests/text_entry_test.cpp src/host/text_entry.cpp)
+  target_include_directories(text_entry_test PRIVATE src)
+  add_test(NAME text_entry_test COMMAND text_entry_test)
   add_executable(engine_layout tests/engine_layout.cpp)
   target_include_directories(engine_layout PRIVATE src)
   add_test(NAME engine_layout COMMAND engine_layout)
