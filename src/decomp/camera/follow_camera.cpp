@@ -1659,7 +1659,7 @@ void decomp_follow_camera_add() {
     // push rbp; mov rbp, rsp; push r15; push r14; push r13; push r12; push rbx; sub rsp, 0x3d8
     static const std::uint8_t kEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
                                           0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0xd8, 0x03, 0x00, 0x00};
-    decomp_add({"NS_SPRJ::ChrExFollowCam::Update", "Camera", kUpdate, kEntry, sizeof kEntry,
+    decomp_add({"NS_SPRJ::ChrExFollowCam::Update", "camera", kUpdate, kEntry, sizeof kEntry,
                 reinterpret_cast<void*>(&follow_cam_update), DecompKind::Leaf, &g_update_game,
                 reinterpret_cast<void*>(&update_compare), &g_counts, &report, &follow_camera_body_ok});
 }

@@ -60,7 +60,7 @@ void report() {
 }  // namespace
 
 void decomp_ez_copy_add() {
-    DecompFunction fn{"sub_23bde30", "Core (CSEzWorkPool)", 0x23bde30, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&ez_copy),
+    DecompFunction fn{"sub_23bde30", "memory", 0x23bde30, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&ez_copy),
                       DecompKind::Leaf};
     fn.report = &report;
     decomp_add(fn);

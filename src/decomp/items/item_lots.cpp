@@ -466,6 +466,6 @@ void report() {
 }  // namespace
 
 void decomp_item_lots_add() {
-    decomp_add({"sub_1bceaf0", "Item lots", kRoll, kEntry, sizeof kEntry, reinterpret_cast<void*>(&roll_entry), DecompKind::Hosted,
+    decomp_add({"sub_1bceaf0", "items", kRoll, kEntry, sizeof kEntry, reinterpret_cast<void*>(&roll_entry), DecompKind::Hosted,
                 &g_game_roll, reinterpret_cast<void*>(&compare_roll), &g_compare, &report});
 }

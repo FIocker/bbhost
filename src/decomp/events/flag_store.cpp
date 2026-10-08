@@ -238,7 +238,7 @@ std::atomic<bool> g_watch{false};
 }  // namespace
 
 void decomp_flag_store_add() {
-    const char* area = "event flags";
+    const char* area = "events";
     decomp_add({"IsEventFlag", area, 0x17cfc00, kIsEntry, sizeof(kIsEntry), reinterpret_cast<void*>(&IsEventFlag),
                 DecompKind::Leaf, &g_game_is, reinterpret_cast<void*>(&compare_is), &g_cmp_is});
     decomp_add({"SetEventFlag", area, 0x17cfcc0, kSetEntry, sizeof(kSetEntry), reinterpret_cast<void*>(&SetEventFlag),

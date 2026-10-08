@@ -717,7 +717,7 @@ void report() {
 
 void decomp_talk_evaluator_add() {
     using namespace talk_script;
-    DecompFunction f{"sub_2b73910", "Talk (NPCs)", 0x2b73910, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&evaluate),
+    DecompFunction f{"sub_2b73910", "talk", 0x2b73910, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&evaluate),
                      DecompKind::Leaf, &g_game, reinterpret_cast<void*>(&compare), &g_cmp};
     f.report = &report;
     decomp_add(f);
