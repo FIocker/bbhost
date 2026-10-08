@@ -55,6 +55,10 @@ struct DecompFunction {
     DecompCompare* counts = nullptr;
     // A line of its own at exit (what it did), when placed.
     void (*report)() = nullptr;
+    // For one whose body ours mirrors as a whole: the body at the entry is
+    // still the one it was written against (patches it knows of aside), or
+    // it is refused like a changed entry.
+    bool (*body_ok)(const std::uint8_t* entry) = nullptr;
 };
 
 void decomp_add(const DecompFunction& fn);
@@ -86,6 +90,7 @@ void decomp_item_lot_add();          // decomp/item_lot.cpp
 void decomp_player_data_add();       // decomp/player_data.cpp
 void decomp_chalice_add();           // decomp/chalice.cpp
 void decomp_talk_script_add();       // decomp/talk_script.cpp
+void decomp_follow_camera_add();     // decomp/follow_camera.cpp
 
 // A leaf's entry points. The file holding them is built with
 // -fno-stack-protector as well (CMakeLists.txt), for helpers not inlined.

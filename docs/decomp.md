@@ -62,6 +62,7 @@ when there is a reason to change them, not for their own sake.
 | chalice map uid (`sub_231fbc0`) | `0x231fbc0` | the setup's map uid: `m29_AA_BB_CC` from the layout, or the row's own for a fixed chalice | 60,000 against the game's own code; 6,000 compared in the game, 0 differences |
 | chalice feature pairs (`sub_1eaf9d0`) | `0x1eaf9d0` | the nine (lot, feature) pairs the dungeon loads with | 40,000 sets against the game's own code; 1,500 compared in the game, 0 differences |
 | the EzState evaluator (`sub_2b73910`) | `0x2b73910` | evaluates every condition and command argument of the engine's state machines: the NPCs' talk scripts and the menus | every expression of the 271 talk scripts (42,016, each on six states) and 60,000 random expressions against the game's own code (`tests/talk_script_test.cpp`): 0 differences; in three world sessions by an NPC near the seed's lamp, 222,468 talk-script expressions compared with the game's, the environment's answers replayed: 0 differences |
+| the follow camera's step (`NS_SPRJ::ChrExFollowCam::Update`) | `0x183ac60` | the player camera, once a frame: LockCamParam easing, a moving floor, the character's frame, reset, lock-on and turn-behind angles, the stick and the fast turn, the wanted position, the wall casts and the wall escape, the chase and the view basis, the camera's collision, the NaN guard, the keep-out spheres, the near clamp | 400,000 generated cameras, 24 million frames, against the game's own code (`tests/follow_camera_test.cpp`: casts and the debug draw as stubs both versions call, the fov-uncap and 60 fps variants), every line of its phases run but the panics for a missing singleton and two of the param file's three layouts; 12,586 frames compared in a world session: 0 differences |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -99,6 +100,22 @@ no script uses. The same interpreter runs the menus' state machines, so
 besides every talk-script expression the game ships, the test runs random
 ones over every opcode a script can use. It is the base for talk functions
 and commands of a mod's own: the calls an expression makes pass through it.
+The follow camera's step is 20,077 bytes of hand-scheduled SIMD - 550
+multiplies, 248 shuffles, reciprocal square roots refined by Newton steps,
+sine and cosine series summed with horizontal adds - where only the same
+operations in the same order give the same bits. Ours is its 23 phases as
+functions named for what they do, over a struct of the camera's fields with
+every offset checked at compile time. The game's idioms are small helpers
+that perform its operations in its order - the length from `rsqrtps` and two
+Newton steps, its two ways of summing a row times a matrix, the angle wraps
+through integer conversions, the sine, cosine and arcsine series - and the
+rest is plain C++. Its denormals come along too: under the game's MXCSR
+`minss` turns a denormal into zero where a branch keeps it, and ours chooses
+each value the way the game's instruction does. Three places in the game's
+code are rewritten at load - the fov-uncap patch and two 60 fps sites - and
+ours reads them where the game would; any other change to the function's
+body, or to a constant it reads, keeps the game's version in place. The
+stick's phase marks where a mouse turn goes.
 
 The four event-flag functions are every read and write the game makes through
 its flag store - event scripts, Lua, talk scripts, the online session. With
@@ -210,8 +227,6 @@ argument bits the original tests.
 
 - **Player data**: adding and removing items, levelling up, paying echoes -
   item and progression mods, NG+ rules.
-- **The lock-on camera** (`0x183ac60`): camera behaviour beyond what its params
-  reach.
 - **Damage and stamina**: the functions that apply attack params and attribute
   scaling, for balance changes params cannot express.
 - **The event system's instructions and conditions**: the interpreter is source
