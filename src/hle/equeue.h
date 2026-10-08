@@ -1,9 +1,9 @@
 #pragma once
 
-#include <condition_variable>
+#include "core/futex.h"
+
 #include <cstdint>
 #include <deque>
-#include <mutex>
 #include <string>
 
 struct HostEvent {
@@ -15,9 +15,13 @@ struct HostEvent {
     void* udata = nullptr;
 };
 
+// The game's flip and GPU events arrive here from the vblank clock and the
+// command processor. Its lock and sleep are core/futex.h's (WaitOnAddress on
+// Windows, not winpthreads'), so a short timed wait is slept out on the
+// high-resolution timer rather than rounded to the system tick.
 struct HostEqueue {
-    std::mutex mu;
-    std::condition_variable cv;
+    HostLock mu;
+    HostCondVar cv;
     std::string name;
     std::deque<HostEvent> q;
     bool dead = false;

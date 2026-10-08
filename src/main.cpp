@@ -2,6 +2,7 @@
 #include "engine/key_prompts.h"
 #include "decomp/decomp.h"
 #include "core/config.h"
+#include "core/host_clock.h"
 #include "core/portable.h"
 #include "core/thunk.h"
 #include "core/elf.h"
@@ -185,7 +186,12 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
 #endif
                 _exit(0);
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(windowed ? 4 : 50));
+            // The window's input and events every 4 ms, on the high-resolution
+            // timer: sleep_for is winpthreads' Sleep on Windows, a 15.6 ms
+            // step whenever the timer resolution is not raised (before the
+            // first host_sleep_us used to raise it, or a hidden window on
+            // Windows 11 without the power-throttling opt-out).
+            host_sleep_us(windowed ? 4000 : 50000);
         }
     };
 #if defined(_WIN32)
@@ -850,6 +856,7 @@ int main(int argc, char** argv) {
                      static_cast<double>(ms.ullTotalPageFile) / kGiB, static_cast<double>(ms.ullAvailPageFile) / kGiB);
         }
     }
+    host_timing_init();  // 1 ms timer resolution and no power throttling from here on (core/host_clock.h)
     {
         // The process's standing with Windows' schedulers, left as Windows
         // makes it unless asked.

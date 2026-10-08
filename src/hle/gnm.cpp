@@ -3,6 +3,7 @@
 #include "core/portable.h"
 #include "engine/graphics_patch.h"
 #include "engine/rebirth.h"
+#include "engine/frame_rate.h"
 #include "hle/equeue.h"
 #include "hle/fs.h"
 #include "hle/hle.h"
@@ -514,6 +515,17 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         if (!prof.empty()) host_log("  gpu profile:%s", prof.c_str());
         if (const std::string busy = host_gpu_busy_report(); !busy.empty()) host_log("  %s", busy.c_str());
         host_log("  fill: %s", host_gpu_fill_stats().c_str());
+        // The guest's clock reads and sync slow paths a second (hle/kernel.cpp),
+        // and the pacing: the frame limiter's margin and spin
+        // (engine/frame_rate.cpp), the vblank clock's lateness and the flips'
+        // latencies (hle/video.cpp).
+        {
+            std::string sync;
+            const std::string clocks = hle_timing_window(secs, &sync);
+            host_log("  clocks: %s", clocks.c_str());
+            host_log("  sync: %s", sync.c_str());
+            host_log("  pacing: %s; %s", frame_rate_limiter_window().c_str(), hle_video_pacing_window().c_str());
+        }
         host_log("  %s", host_gpu_shadow_report().c_str());
         if (const std::string r = host_gpu_recorder_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_occlusion_report(); !r.empty()) host_log("  %s", r.c_str());
