@@ -787,7 +787,7 @@ Bytes build_option_movie(const Bytes& src) {
     section("PCControls", 118020, 385, 6, 0, {});
     section("PCKeys", 119020, 386, std::nullopt, 2, {});
     section("PCEffects", 120020, 387, 6, 0, {});
-    section("PCCamera", 121020, 388, 3, 0, {"Item_3_0", "Item_4_0", "Item_5_0"});
+    section("PCCamera", 121020, 388, 4, 0, {"Item_4_0", "Item_5_0"});
     section("PCDeck", 123020, 389, 2, 0, {"Item_2_0", "Item_3_0", "Item_4_0", "Item_5_0"});
     section("PCEnhance", 124020, 390, 3, 0, {"Item_3_0", "Item_4_0", "Item_5_0"});
     return add_scrollbar(m, "Top", 1290, 354.5);

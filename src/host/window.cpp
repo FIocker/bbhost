@@ -6,6 +6,7 @@
 
 #include "engine/graphics_patch.h"
 #include "engine/menu_pointer.h"
+#include "engine/mouse_camera_step.h"
 #include "engine/option_menu.h"
 #include "hle/modules.h"
 #include "host/bindings.h"
@@ -78,9 +79,6 @@ unsigned g_display_w = 0, g_display_h = 0;
 std::atomic<bool> g_mouse_visible{true};
 std::atomic<bool> g_mouse_relative{false};
 std::atomic<bool> g_mouse_relative_applied{false};
-// Relative motion while the mouse turns the camera, for the camera itself
-// (engine/mouse_camera.h), under g_mouse_mu: raw counts since its last take.
-float g_cam_dx = 0.0f, g_cam_dy = 0.0f;
 // BBHOST_IME_TEST: opens the text box once at startup and again on F11.
 std::atomic<bool> g_ime_test_reopen{true};
 
@@ -1585,11 +1583,8 @@ bool host_window_pump() {
         want != g_mouse_relative_applied.load(std::memory_order_relaxed)) {
         g_mouse_relative_applied.store(want, std::memory_order_relaxed);
         SDL_SetWindowRelativeMouseMode(g_window, want);
-        {
-            // Motion from before the switch was the pointer's, not the camera's.
-            std::lock_guard<std::mutex> lock(g_mouse_mu);
-            g_cam_dx = g_cam_dy = 0.0f;
-        }
+        // Motion from before the switch was the pointer's, not the camera's.
+        mouse_camera::g_counts.store(0, std::memory_order_relaxed);
         if (!want) {
             // Leaving camera mode, the absolute position is whatever SDL
             // restored the pointer to; take it now so the first menu frame
@@ -1722,9 +1717,10 @@ bool host_window_pump() {
                 // should not have to care which mode the window is in.
                 g_mouse.dx += e.motion.xrel;
                 g_mouse.dy += e.motion.yrel;
+                // The camera's own, in raw counts, while the mouse turns it
+                // (engine/mouse_camera_step.h): the camera takes them itself.
                 if (g_mouse_relative_applied.load(std::memory_order_relaxed)) {
-                    g_cam_dx += e.motion.xrel;
-                    g_cam_dy += e.motion.yrel;
+                    mouse_camera::add(mouse_camera::g_counts, e.motion.xrel, e.motion.yrel);
                 }
                 if (!g_mouse_relative.load(std::memory_order_relaxed)) {
                     mouse_moved_locked(e.motion.x, e.motion.y);
@@ -2209,13 +2205,6 @@ MouseState host_mouse_state() {
     g_mouse.moved = false;
     g_mouse.dx = g_mouse.dy = 0.0f;
     return m;
-}
-
-void host_mouse_take_camera(float& dx, float& dy) {
-    std::lock_guard<std::mutex> lock(g_mouse_mu);
-    dx = g_cam_dx;
-    dy = g_cam_dy;
-    g_cam_dx = g_cam_dy = 0.0f;
 }
 
 bool host_mouse_position(float& x, float& y) {

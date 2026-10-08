@@ -1558,6 +1558,13 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         const HostSettings hs = host_settings();
         const bool want = hs.mouse_camera && !host_options_open() && !ingame_menu_open() &&
                           !menu_pointer_in_menu() && !host_text_entry_open();
+        // What the follow camera turns by, and whether its own turns as the
+        // character moves are held: the keyboard and mouse used last, the
+        // mouse turning the camera, and Mouse auto-rotation off. A controller
+        // picked up gives the game's camera back (engine/mouse_camera.h).
+        mouse_camera_publish(hs.mouse_sens, hs.mouse_invert_x, hs.mouse_invert_y,
+                             !hs.mouse_auto_rotation && hs.mouse_camera &&
+                                 host_input_device() == InputDevice::KeyboardMouse);
         if (want != host_mouse_relative()) {
             host_mouse_set_relative(want);
         }

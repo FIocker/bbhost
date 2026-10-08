@@ -133,7 +133,7 @@ layout and any rites, or open every range.
 
 | Function | Address | What it does | Checked |
 |---|---|---|---|
-| the follow camera's step (`NS_SPRJ::ChrExFollowCam::Update`) | `0x183ac60` | the player camera, once a frame: `LockCamParam` easing, a moving floor, the character's frame, reset, lock-on and turn-behind angles, the stick and the fast turn, the wanted position, the wall casts and the wall escape, the chase and the view basis, the camera's collision, the NaN guard, the keep-out spheres, the near clamp | 400,000 generated cameras, 24 million frames, against the game's own code (casts and the debug draw as stubs both versions call; the fov-uncap and 60 fps variants), every line of its phases run but the panics for a missing singleton and two of the param file's three layouts; 12,586 frames compared in a world session: 0 differences |
+| the follow camera's step (`NS_SPRJ::ChrExFollowCam::Update`) | `0x183ac60` | the player camera, once a frame: `LockCamParam` easing, a moving floor, the character's frame, reset, lock-on and turn-behind angles, the stick and the fast turn, the wanted position, the wall casts and the wall escape, the chase and the view basis, the camera's collision, the NaN guard, the keep-out spheres, the near clamp | 400,000 generated cameras, 24 million frames, against the game's own code (casts and the debug draw as stubs both versions call; the fov-uncap and 60 fps variants; the auto-rotation patch's nops and the mouse's stubs), every line of its phases run but the panics for a missing singleton and two of the param file's three layouts; 12,586 frames compared in a world session, and 1,494 in the Hunter's Dream with the mouse turning it, auto-rotation held and a controller picked up: 0 differences |
 
 The step is 20,077 bytes of hand-scheduled SIMD - 550 multiplies, 248
 shuffles, reciprocal square roots refined by Newton steps, sine and cosine
@@ -149,7 +149,27 @@ branch keeps it, and ours chooses each value the way the game's instruction
 does. Three places in the game's code are rewritten at load - the fov-uncap
 patch and two 60 fps sites - and ours reads them where the game would; any
 other change to the function's body, or to a constant it reads, keeps the
-game's version in place. The stick's phase marks where a mouse turn goes.
+game's version in place.
+
+Being source, the step is where two PC additions live, neither in the game's
+function. The mouse turns the free camera as Dark Souls III's does - an angle
+a count, after the stick and only without it - in the stick's phase, where
+hooks on the game's code put it before (`engine/mouse_camera.h`; the hooks
+remain for when the game's version runs). And while the keyboard and mouse
+were used last, the camera's own turns as the character moves are held. The
+community patch "Disable Camera Auto Rotation via Movement" removes four
+stores: the yaw read back from where the camera is, the pitch return's weight
+ramping down, the turn away from a wall - and the auto turn's step of the
+yaw, whose only cause is the lock-on button finding no target (the
+turn-behind request has one writer, `sub_1c8e900`), so that one only takes
+away the recentre. The mouse holds the first three, each exactly as the
+patch's nop leaves the game's code (a value the game goes on using from a
+register, ours goes on using too), and leaves the recentre to the player.
+The body check accepts the patch's nops at all four, which ours then
+mirrors. The test checks all of it against the game's code: the patch's
+nops at all four stores, at each alone, and at the three the mouse holds
+against ours holding them by its flag; and the mouse camera's own stubs in
+the game's code turning it by the same counts as ours.
 
 ### GX (`src/decomp/gx/`)
 

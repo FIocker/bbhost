@@ -27,10 +27,22 @@
 // from memory as the game reads them; the game's other constants are
 // literals here, and the body check hashes them with the code.
 //
+// Two things the PC port adds, neither in the game's function: the mouse
+// turns the free camera after the stick, where Dark Souls III turns it
+// (engine/mouse_camera.h), and while the keyboard and mouse were used last the
+// camera's own turns as the character moves are held - the four stores the
+// community patch "Disable Camera Auto Rotation via Movement" removes, which
+// the body check accepts as nops too (engine/mouse_camera_step.h). Without
+// mouse movement or the hold, the step is the game's to the bit.
+//
 // tests/decomp/follow_camera_test.cpp runs the game's version and ours in the
-// eboot kit over generated cameras, frame after frame.
+// eboot kit over generated cameras, frame after frame - with the community
+// patch's nops in the game's code against our hold, and with the mouse
+// camera's hook in the game's code against our mouse step.
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
+#include "engine/mouse_camera.h"
+#include "engine/mouse_camera_step.h"
 
 #include "log.h"
 
@@ -457,6 +469,32 @@ struct Saved {
     Vec basis_x, basis_y, basis_z, chr_neg_x, chr_y, chr_neg_z;
 };
 
+// The camera's own turns as the character moves, each held or not in this
+// update: the three the mouse holds (all but R3's recentre) while
+// auto-rotation is held, and each whose store in the game's code is a nop - a
+// patch's, or a compare run's holding the game's update beside ours
+// (engine/mouse_camera_step.h).
+struct Hold {
+    bool read_back = false;      // the yaw read back from where the camera is (P11, the game's 0x183c6e8)
+    bool auto_turn = false;      // the auto turn's step of the yaw (P11, 0x183c870)
+    bool return_weight = false;  // the pitch return's weight ramping down (P12, 0x183c984)
+    bool wall_turn = false;      // the turn away from a wall (P17, 0x183dde6)
+};
+
+Hold held_turns() {
+    const bool mouse = mouse_camera::held();
+    const auto held = [mouse](int i) {
+        return (mouse && (mouse_camera::kHeldWithMouse >> i & 1)) ||
+               load<u8>(game_address(mouse_camera::kHoldSites[i].bn)) == 0x90;
+    };
+    Hold h;
+    h.read_back = held(0);
+    h.auto_turn = held(1);  // R3's recentre: held only by the patch's own nop
+    h.return_weight = held(2);
+    h.wall_turn = held(3);
+    return h;
+}
+
 // What the phases hand each other.
 struct Step {
     float dt;
@@ -465,6 +503,7 @@ struct Step {
     Saved saved;
     Vec stick;         // the right stick: x turns the pitch, y the yaw (P7)
     bool stick_turns;  // and it turns the camera this frame
+    Hold hold;
 };
 
 // ---- P1, P2: the camera's LockCamParam row, eased toward --------------------
@@ -857,7 +896,7 @@ bool step_auto_turn(FollowCam& cam, const Step& step) {
     cam.pitch = pitch;
     const float auto_yaw = cam.auto_yaw;
     const float yaw = wrap_angle(cam.yaw + rate * wrap_angle(auto_yaw - cam.yaw));
-    cam.yaw = yaw;
+    if (!step.hold.auto_turn) cam.yaw = yaw;  // held, the end test below still takes this yaw, as the game's does
     if (cam.turn_behind_sets_reference) cam.pitch_reference = pitch;
     const bool pitch_there = kOneDegree > __builtin_fabsf(wrap_angle(pitch - auto_pitch));
     if (pitch_there && kOneDegree > __builtin_fabsf(wrap_angle(yaw - auto_yaw))) {
@@ -916,7 +955,7 @@ bool choose_angles(FollowCam& cam, const Step& step) {
         cam.auto_turn_timer = cam.auto_turn_duration;
     } else {
         cam.pitch = pitch_along(cam.focus - cam.wanted, cam.pitch);
-        cam.yaw = yaw_along(cam.focus - cam.wanted, cam.yaw);
+        if (!step.hold.read_back) cam.yaw = yaw_along(cam.focus - cam.wanted, cam.yaw);
         if (!cam.auto_turn) return false;
     }
     return step_auto_turn(cam, step);
@@ -926,12 +965,15 @@ bool choose_angles(FollowCam& cam, const Step& step) {
 
 // After the stick lets go (P13 restarts them), the pitch return waits (+0x134,
 // from +0x1e0), then its weight (+0x130) ramps from 1 down to 0 over the
-// release time (+0x1e4).
-void run_return_timers(FollowCam& cam, float dt) {
+// release time (+0x1e4). Held, the ramp is not stored - but the clamp to 0
+// still tests the value it would have had, as the game's does.
+void run_return_timers(FollowCam& cam, const Step& step) {
+    const float dt = step.dt;
     cam.return_wait = max_ss(0.0f, cam.return_wait - dt);
     if (0.0f >= cam.return_wait) {
-        cam.return_weight = cam.return_weight - dt / cam.return_release_time;
-        if (0.0f > cam.return_weight) cam.return_weight = 0.0f;
+        const float weight = cam.return_weight - dt / cam.return_release_time;
+        if (!step.hold.return_weight) cam.return_weight = weight;
+        if (0.0f > weight) cam.return_weight = 0.0f;
     }
 }
 
@@ -1044,17 +1086,20 @@ void steer_by_stick(FollowCam& cam, const Step& step, bool auto_turning) {
         cam.yaw = yaw_along(to_focus, cam.yaw);
     }
     const float ramp = fast_turn_ramp(cam, step.stick, step.dt);
-    if (ramp != 0.0f)
-        fast_turn(cam, step, ramp);
-    else
+    mouse_camera::free_camera_ran();
+    bool turned = step.stick_turns;
+    if (ramp != 0.0f) {
+        fast_turn(cam, step, ramp);  // the stick has the camera: the mouse waits
+    } else {
         turn_by_stick(cam, step, ramp);
-
-    // ---- The mouse step: where PR #24's DS3-style mouse turn (an angle per
-    // raw count, on top of what the stick did) goes - after both the stick's
-    // and the fast turn's angles are stored, before a turn restarts the pitch
-    // return. In the game's code, 0x183ce67.
-
-    if (step.stick_turns) {
+        // The mouse, as Dark Souls III turns it (engine/mouse_camera.h): an
+        // angle a count, only when the stick has not turned the camera -
+        // after the stick's angles are stored, where the game's code goes on
+        // to 0x183ce67 - and a turn restarts the pitch return as the stick's does.
+        if (mouse_camera::turn(step.stick[0], step.stick[1], cam.pitch, cam.yaw, cam.pitch_min, cam.pitch_max))
+            turned = true;
+    }
+    if (turned) {
         cam.pitch_reference = cam.pitch;
         cam.return_weight = 1.0f;
         cam.return_wait = cam.return_wait_time;
@@ -1225,7 +1270,7 @@ void steer_around_walls(FollowCam& cam, const Step& step, void* world) {
                 }
                 correction = correction + escape_rate(cam, fraction_b) * step.dt;
             }
-            cam.yaw_correction = correction;
+            if (!step.hold.wall_turn) cam.yaw_correction = correction;
             one_side = true;
         }
     }
@@ -1496,9 +1541,8 @@ void pull_toward_reference(FollowCam& cam) {
     cam.position = cam.orbit_reference + (_mm_set1_ps(1.0f) / length) * (out * _mm_set1_ps(length[0] - in));
 }
 
-}  // namespace
-
-DECOMP_LEAF void follow_cam_update(u8* cam_bytes, u8* chr, void* world, float dt) {
+// The step, once the update has taken the mouse's counts.
+void follow_cam_step(u8* cam_bytes, u8* chr, void* world, float dt) {
     g_frames.fetch_add(1, std::memory_order_relaxed);
     FollowCam& cam = *reinterpret_cast<FollowCam*>(cam_bytes);
     if (const u8* row = lock_cam_row(camera_param_id(cam))) ease_toward_lock_cam_param(cam, row);  // P1, P2
@@ -1508,6 +1552,7 @@ DECOMP_LEAF void follow_cam_update(u8* cam_bytes, u8* chr, void* world, float dt
     step.dt = dt;
     step.dt4 = _mm_set1_ps(dt);
     step.world = world;
+    step.hold = held_turns();
     ride_moving_floor(cam, chr, step);                                       // P5
     take_wanted_distance(cam, step);                                         // P6
     step.stick = read_stick(cam, chr);                                       // P7
@@ -1515,7 +1560,7 @@ DECOMP_LEAF void follow_cam_update(u8* cam_bytes, u8* chr, void* world, float dt
     place_origins(cam, follow_character_frame(cam, chr, step), step);        // P8, P9
     chase_wanted_point(cam, step);                                           // P10
     const bool auto_turning = choose_angles(cam, step);                      // P11
-    run_return_timers(cam, dt);                                              // P12
+    run_return_timers(cam, step);                                            // P12
     steer_by_stick(cam, step, auto_turning);                                 // P13
     return_pitch(cam);                                                       // P14
     place_wanted(cam, step);                                                 // P15
@@ -1529,13 +1574,24 @@ DECOMP_LEAF void follow_cam_update(u8* cam_bytes, u8* chr, void* world, float dt
     pull_toward_reference(cam);                                              // P23
 }
 
+}  // namespace
+
+// Every update first takes the mouse's counts, as the mouse camera's hook on
+// the game's prologue does where ours is not in place.
+DECOMP_LEAF void follow_cam_update(u8* cam_bytes, u8* chr, void* world, float dt) {
+    mouse_camera::begin_update();
+    follow_cam_step(cam_bytes, chr, world, dt);
+}
+
 // ---- Placing it -------------------------------------------------------------
 
 namespace {
 
-// The body ours mirrors, hashed (FNV-1a) with the three run-time sites masked;
-// each site must hold the game's bytes or the known patch's.
-constexpr u64 kBodyHash = 0xacdaf310e150a65bull;
+// The body ours mirrors, hashed (FNV-1a) with the run-time sites masked; each
+// site must hold the game's bytes or the known patch's - the three below, and
+// the four stores holding auto-rotation removes (mouse_camera::kHoldSites),
+// which ours mirrors as nops whoever wrote them.
+constexpr u64 kBodyHash = 0xc106b99ce56d67baull;
 constexpr struct Site {
     u64 at;
     unsigned n;
@@ -1557,22 +1613,30 @@ constexpr u64 kReadAtRunTime[] = {kDistanceEase, kChaseRateEase};
 
 u64 fnv1a(u64 h, u8 b) { return (h ^ b) * 0x100000001b3ull; }
 
+bool masked(u64 a) {
+    for (const Site& s : kSites)
+        if (a >= s.at && a < s.at + s.n) return true;
+    for (const mouse_camera::HoldSite& s : mouse_camera::kHoldSites)
+        if (a >= s.bn && a < s.bn + sizeof s.game) return true;
+    return false;
+}
+
 }  // namespace
 
 // The body check, for decomp_add and the test.
 bool follow_camera_body_ok(const std::uint8_t* entry) {
     u64 h = 0xcbf29ce484222325ull;
-    for (u64 a = kUpdate; a < kUpdateEnd; ++a) {
-        u8 b = entry[a - kUpdate];
-        for (const Site& s : kSites)
-            if (a >= s.at && a < s.at + s.n) b = 0;
-        h = fnv1a(h, b);
-    }
+    for (u64 a = kUpdate; a < kUpdateEnd; ++a) h = fnv1a(h, masked(a) ? 0 : entry[a - kUpdate]);
     if (h != kBodyHash) return false;
     for (const Site& s : kSites) {
         u32 v = 0;
         std::memcpy(&v, entry + (s.at - kUpdate), s.n);
         if (v != s.game && v != s.patched) return false;
+    }
+    for (const mouse_camera::HoldSite& s : mouse_camera::kHoldSites) {
+        const u8* at = entry + (s.bn - kUpdate);
+        if (std::memcmp(at, s.game, sizeof s.game) != 0 && std::memcmp(at, mouse_camera::kNop9, sizeof s.game) != 0)
+            return false;
     }
     h = 0xcbf29ce484222325ull;
     for (const Span& span : kConstants) {
@@ -1615,6 +1679,10 @@ bool same_object(const u8* a, const u8* b, std::size_t n, std::size_t* where) {
 
 GUEST_ABI void update_compare(u8* cam, u8* chr, void* world, float dt) {
     const auto game = reinterpret_cast<void(GUEST_ABI*)(u8*, u8*, void*, float)>(g_update_game);
+    // The mouse's counts once, for both: the game's update turns by them
+    // through the mouse camera's hook at its free camera's store, ours in its
+    // own step - and the game's holds auto-rotation when ours does.
+    mouse_camera_compare_begin();
     if (cam[0x2d1]) {
         g_not_compared.fetch_add(1, std::memory_order_relaxed);
         game(cam, chr, world, dt);
@@ -1630,7 +1698,7 @@ GUEST_ABI void update_compare(u8* cam, u8* chr, void* world, float dt) {
         after_game = load<u64>(gsm + 0x14);
         store<u64>(gsm + 0x14, overrides);
     }
-    follow_cam_update(ours, chr, world, dt);
+    follow_cam_step(ours, chr, world, dt);
     if (gsm) {
         after_ours = load<u64>(gsm + 0x14);
         store<u64>(gsm + 0x14, after_game);
