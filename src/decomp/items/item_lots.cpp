@@ -51,7 +51,7 @@
 #include "decomp/decomp.h"
 
 #include "core/thunk.h"
-#include "decomp/sprj_event_flag_man.h"
+#include "decomp/events/flag_store.h"
 #include "hle/guest_fs.h"
 #include "log.h"
 
@@ -474,7 +474,7 @@ void report() {
 
 }  // namespace
 
-void decomp_item_lot_add() {
+void decomp_item_lots_add() {
     decomp_add({"sub_1bceaf0", "Item lots", kRoll, kEntry, sizeof kEntry, reinterpret_cast<void*>(&roll_entry), DecompKind::Hosted,
                 &g_game_roll, reinterpret_cast<void*>(&compare_roll), &g_compare, &report});
 }

@@ -78,20 +78,6 @@ add_executable(bbhost
   src/engine/dream_mirror_layout.cpp
   src/engine/five_players.cpp
   src/engine/maiden_events.cpp
-  src/decomp/decomp.cpp
-  src/decomp/insn.cpp
-  src/decomp/sprj_event_flag_man.cpp
-  src/decomp/gx_flush_wait.cpp
-  src/decomp/gx_block_reclaim.cpp
-  src/decomp/game_memcpy.cpp
-  src/decomp/ez_copy.cpp
-  src/decomp/sfx_ribbon.cpp
-  src/decomp/sprj_emk.cpp
-  src/decomp/item_lot.cpp
-  src/decomp/player_data.cpp
-  src/decomp/chalice.cpp
-  src/decomp/talk_script.cpp
-  src/decomp/follow_camera.cpp
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
@@ -238,7 +224,7 @@ elseif(WIN32)
   # The SysV convention our guest-facing functions follow lets a leaf keep
   # data in the 128 bytes below rsp, and on Windows an exception - a
   # write-watch fault in a decomp leaf's write, say - builds its frame right
-  # there (decomp/sfx_ribbon.cpp). Clang leaves it out on this target today;
+  # there (decomp/sfx/ribbons.cpp). Clang leaves it out on this target today;
   # the flag makes sure no compiler does.
   target_compile_options(bbhost PRIVATE -mno-red-zone)
   # The image must stay out of the guest's fixed windows (4-10 GiB CPU dmem,
@@ -322,23 +308,33 @@ else()
   message(STATUS "bbhost: SDL3/Vulkan not found; headless only")
 endif()
 
-# The game's functions as ours (src/decomp, docs/decomp.md): a leaf runs on the
-# game's thread state, where FS is the game's, so nothing in its file may read
-# the stack protector's canary through it.
-set_source_files_properties(src/decomp/sprj_event_flag_man.cpp src/decomp/game_memcpy.cpp src/decomp/ez_copy.cpp
-                            src/decomp/sprj_emk.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
-# The effect ribbons' writers reproduce the game's floating point bit for bit:
-# no multiply-add fused into one rounding.
-set_source_files_properties(src/decomp/sfx_ribbon.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
-# The item-lot roll weighs its slots in floats as the game does.
-set_source_files_properties(src/decomp/item_lot.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
-set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/player_data.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
-set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/chalice.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
-set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/talk_script.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
-# The follow camera's step reproduces the game's floating point bit for bit:
-# no multiply-add fused, and the game's own AVX instructions (every CPU that
-# runs the eboot has AVX).
-set_source_files_properties(src/decomp/follow_camera.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off;-mavx")
+# The game's functions as ours (src/decomp, docs/decomp.md), one folder per
+# engine area. A leaf runs on the game's thread state, where FS may be the
+# game's, so no decomp file reads the stack protector's canary through it; and
+# ours reproduces the game's floating point bit for bit, so nothing is fused
+# into a multiply-add.
+set(BBHOST_DECOMP_SOURCES
+  src/decomp/decomp.cpp
+  src/decomp/insn.cpp
+  src/decomp/areas.cpp
+  src/decomp/events/flag_store.cpp
+  src/decomp/events/interpreter.cpp
+  src/decomp/player/player_data.cpp
+  src/decomp/items/item_lots.cpp
+  src/decomp/talk/evaluator.cpp
+  src/decomp/chalice/ritual.cpp
+  src/decomp/camera/follow_camera.cpp
+  src/decomp/gx/flush_wait.cpp
+  src/decomp/gx/block_reclaim.cpp
+  src/decomp/memory/game_memcpy.cpp
+  src/decomp/memory/ez_copy.cpp
+  src/decomp/sfx/ribbons.cpp
+)
+target_sources(bbhost PRIVATE ${BBHOST_DECOMP_SOURCES})
+set_source_files_properties(${BBHOST_DECOMP_SOURCES} PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
+# The follow camera's step is the game's own AVX, intrinsic for intrinsic
+# (every CPU that runs the eboot has AVX).
+set_property(SOURCE src/decomp/camera/follow_camera.cpp APPEND PROPERTY COMPILE_OPTIONS -mavx)
 
 if(MSVC)
   target_compile_options(bbhost PRIVATE /W4)
@@ -446,7 +442,7 @@ if(UNIX)
   target_include_directories(decomp_insn_test PRIVATE src)
   add_test(NAME decomp_insn_test COMMAND decomp_insn_test)
   # The event-script interpreter against the game's code (skips without the eboot).
-  add_executable(sprj_emk_test tests/sprj_emk_test.cpp src/decomp/sprj_event_flag_man.cpp)
+  add_executable(sprj_emk_test tests/sprj_emk_test.cpp src/decomp/events/flag_store.cpp)
   target_include_directories(sprj_emk_test PRIVATE include)
   target_compile_options(sprj_emk_test PRIVATE -fno-stack-protector)
   target_link_libraries(sprj_emk_test PRIVATE eboot_kit pthread)
@@ -459,7 +455,7 @@ if(UNIX)
   add_test(NAME chalice_test COMMAND chalice_test)
   set_tests_properties(chalice_test PROPERTIES SKIP_RETURN_CODE 77)
   # The follow camera's step against the game's code (skips without the eboot).
-  add_executable(follow_camera_test tests/follow_camera_test.cpp src/decomp/follow_camera.cpp)
+  add_executable(follow_camera_test tests/follow_camera_test.cpp src/decomp/camera/follow_camera.cpp)
   target_link_libraries(follow_camera_test PRIVATE eboot_kit)
   add_test(NAME follow_camera_test COMMAND follow_camera_test 2000)
   set_tests_properties(follow_camera_test PROPERTIES SKIP_RETURN_CODE 77)

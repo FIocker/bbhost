@@ -1,4 +1,4 @@
-// The follow camera's step (decomp/follow_camera.cpp) against the game's own
+// The follow camera's step (decomp/camera/follow_camera.cpp) against the game's own
 // code (tests/eboot_kit.h): generated cameras run frame after frame through
 // the game's ChrExFollowCam::Update and through ours - each its own copy,
 // fed the same characters, sticks, flags, worlds and dt - and after every

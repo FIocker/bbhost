@@ -3,7 +3,7 @@
 #include "core/elf.h"
 #include "core/portable.h"
 #include "core/thunk.h"
-#include "decomp/sprj_event_flag_man.h"
+#include "decomp/events/flag_store.h"
 #include "engine/addr.h"
 #include "guest_abi.h"
 #include "host/plugins.h"

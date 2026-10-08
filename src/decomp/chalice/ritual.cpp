@@ -32,7 +32,7 @@
 // thread's runtime heap; ours keep them in fixed arrays (15 ranges, 10
 // rates), the same order, the same float sums.
 #include "decomp/decomp.h"
-#include "decomp/sprj_event_flag_man.h"
+#include "decomp/events/flag_store.h"
 
 #include "log.h"
 
@@ -117,7 +117,7 @@ u32 draw(void* rng) {
 // scaled to the candidates' total weight.
 float point(u32 r, float total) { return (std::bit_cast<float>((r >> 9) | 0x3f800000u) + -1.0f) * total; }
 
-// The flag store read the roll makes inline (decomp/sprj_event_flag_man.h).
+// The flag store read the roll makes inline (decomp/events/flag_store.h).
 // Where the game would divide by a zero block size, or read through a
 // manager DL_PANIC let it go on without, ours reads the flag as clear.
 bool flag_set(s32 id) {
@@ -405,7 +405,7 @@ void report() {
 
 }  // namespace
 
-void decomp_chalice_add() {
+void decomp_chalice_ritual_add() {
     static const std::uint8_t kRollEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55,
                                               0x41, 0x54, 0x53, 0x48, 0x81, 0xec, 0x88, 0x00, 0x00, 0x00};
     static const std::uint8_t kPickEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41,

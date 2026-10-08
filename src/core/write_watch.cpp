@@ -441,7 +441,7 @@ bool write_watch_install() {
 
 // No lock, no thread-local, no stack protector, no lambda (whose body the
 // compiler may outline with the protector in it): a decomp leaf calls this on
-// the game's thread as the game left it (decomp/game_memcpy.cpp).
+// the game's thread as the game left it (decomp/memory/game_memcpy.cpp).
 __attribute__((no_stack_protector)) bool write_watch_release(void* p, std::size_t n) {
     if (!g_enabled || !p || !n) return false;
     const std::uint64_t va = reinterpret_cast<std::uintptr_t>(p);

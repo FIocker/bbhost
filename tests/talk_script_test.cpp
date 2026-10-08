@@ -1,4 +1,4 @@
-// The talk scripts' evaluator (decomp/talk_script.cpp) against the game's
+// The talk scripts' evaluator (decomp/talk/evaluator.cpp) against the game's
 // own, sub_2b73910, in the loaded eboot (tests/eboot_kit.h): the same
 // expression run by both on two states built alike - a machine (variables,
 // call arguments, a child's return value, an environment), a context (a
@@ -17,7 +17,7 @@
 // Stubbed in the image: the heap lookup a string's destruction asks
 // (sub_247b720: our allocator) and the wide-string imports. Skips without the
 // 1.09 eboot.
-#include "../src/decomp/talk_script.cpp"
+#include "../src/decomp/talk/evaluator.cpp"
 
 #include "eboot_kit.h"
 #include "engine/esd.h"

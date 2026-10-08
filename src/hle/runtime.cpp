@@ -21,7 +21,7 @@
 #include "engine/yebis.h"
 #include "engine/guest.h"
 #include "decomp/decomp.h"
-#include "decomp/sprj_event_flag_man.h"
+#include "decomp/events/flag_store.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"
 #include "engine/world_chr.h"
@@ -405,18 +405,7 @@ void hle_patch_guest(ElfImage* image) {
     rebirth_install(image);
     five_players_install(image);
     // The game's functions as our source, in its place (decomp/, docs/decomp.md).
-    decomp_sprj_event_flag_man_add();
-    decomp_gx_flush_wait_add();
-    decomp_gx_block_reclaim_add();
-    decomp_game_memcpy_add();
-    decomp_ez_copy_add();
-    decomp_sfx_ribbon_add();
-    decomp_sprj_emk_add();
-    decomp_item_lot_add();
-    decomp_player_data_add();
-    decomp_chalice_add();
-    decomp_talk_script_add();
-    decomp_follow_camera_add();
+    decomp_add_areas();
     decomp_install(image);
 
     // The command-arena acquire (guest 0x2ad3b80) becomes hle_gx_arena_acquire
