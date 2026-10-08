@@ -6,10 +6,12 @@
 //
 // load() maps the image the way bbhost does (core/elf.cpp: at 0x400000,
 // relocated, its TLS reads moved to GS), with every import a trap that
-// names itself if called and the calling thread made a guest thread (a TLS
-// block, the console's MXCSR and x87 control word). The game's static
+// names itself if called - but the C library's memory and string functions
+// (memset, memcpy, memmove, memcmp, strlen, strcmp, strncmp, strcpy), which
+// are the host's as in the game - and the calling thread made a guest thread
+// (a TLS block, the console's MXCSR and x87 control word). The game's static
 // constructors do not run: a test sets up what the function under test
-// reads.
+// reads, and stubs (stub()) what reaches further than it can set up.
 #pragma once
 
 #include <cmath>
@@ -56,6 +58,13 @@ struct Relocated {
     std::uint64_t slot, target;
 };
 const std::vector<Relocated>& relocated();
+// The calling thread's guest TCB (what the game's fs:[0] gives): its TLS
+// block lies below it (PT_TLS, 0x750 bytes). After load().
+void* tcb();
+// The game's function at `bn` replaced by `host` (SysV) in the loaded image:
+// both the game's code and ours then reach the stub - for what a test
+// cannot set up (a param lookup, a heap search).
+void stub(std::uint64_t bn, const void* host);
 // A Binary Ninja address in the loaded image.
 inline std::uint8_t* at(std::uint64_t bn) { return reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(bn)); }
 template <class F>
