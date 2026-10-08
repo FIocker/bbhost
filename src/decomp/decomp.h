@@ -85,6 +85,7 @@ void decomp_sprj_emk_add();          // decomp/sprj_emk.cpp
 void decomp_item_lot_add();          // decomp/item_lot.cpp
 void decomp_player_data_add();       // decomp/player_data.cpp
 void decomp_chalice_add();           // decomp/chalice.cpp
+void decomp_talk_script_add();       // decomp/talk_script.cpp
 
 // A leaf's entry points. The file holding them is built with
 // -fno-stack-protector as well (CMakeLists.txt), for helpers not inlined.
