@@ -11,7 +11,10 @@
 # Environment: BBHOST_EXE (default build-win/bbhost.exe); PERF_TOML, a config
 # with [paths] app0 and eboot (default the per-user %APPDATA%/bbhost/bbhost.toml);
 # PERF_SAVES, the saves folder copied in before each run (default the per-user
-# config's data/saves); PERF_SECONDS (150), PERF_HEADLESS (1).
+# config's data/saves); PERF_SECONDS (150), PERF_HEADLESS (1); PERF_UNCAPPED
+# (1, the default: BBHOST_UNCAP=1 BBHOST_BENCH_UNCAPPED=1 - no frame target and
+# flips complete at once, the machine's true frame rate standing still; 0: the
+# 60 cap).
 # Runs play on build/perf/data (a copy of the saves; the pipeline cache stays
 # between runs so compiles do not land in the measured seconds) and write
 # build/perf/NAME.log, NAME.perfmon.
@@ -59,9 +62,11 @@ rm -f "$out/data/bbhost/gpu-device-lost.txt" "$out/$NAME.perfmon"
 taps="20:cross,25:cross,30:cross,35:cross,40:cross,45:cross,50:cross"
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/win/perfmon.ps1 -Name bbhost -Seconds "$secs" -Out "$root/$out/$NAME.perfmon" > /dev/null 2>&1 &
 mon=$!
+uncap=()
+[ "${PERF_UNCAPPED:-1}" = 1 ] && uncap=(BBHOST_UNCAP=1 BBHOST_BENCH_UNCAPPED=1)
 env BBHOST_CONFIG_DIR="$root/$out/cfg" BBHOST_SETUP_WINDOW=0 BBHOST_NO_GAMEPAD=1 BBHOST_SKIP_INTRO=1 \
     BBHOST_HEADLESS=${PERF_HEADLESS:-1} BBHOST_FRAME_STATS=1 BBHOST_GAME_FPS=60 \
-    BBHOST_EXIT_FLIP=$((secs * 60)) BBHOST_AUTOPRESS="$taps" "$@" \
+    BBHOST_EXIT_SECONDS=$secs BBHOST_AUTOPRESS="$taps" "${uncap[@]}" "$@" \
     timeout $((secs + 120)) "$exe" --config "$root/$out/cfg/bbhost.toml" > "$out/$NAME.log" 2>&1
 echo "exit $?" >> "$out/$NAME.log"
 wait $mon 2>/dev/null
