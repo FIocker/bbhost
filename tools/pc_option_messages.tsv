@@ -38,15 +38,13 @@
 116002	Mouse in Menus	Move and click to select.
 116003	Draw the Pointer	Show the mouse pointer.
 116004	Skip Company Logos	Skips the logos and the Exit Game warning at startup. Applies on the next run.
-116005	Frame Cap	30 is the game's own pace; 60 or more runs the game at 60 (applies on the next run). Above 60 only caps presentation.
+116005	Frame Rate	30 is the game's own pace; 60 and 90 run its logic at that rate; Uncapped steps it by the frame time (the display's refresh rate with V-Sync on). Applies on the next run.
 116007	FPS Counter	Frames per second actually presented, in the top right corner.
 116020	PC Settings	
 116030	30	
 116031	60	
-116032	90	
-116033	120	
-116034	144	
-116035	Unlimited	
+116032	90
+116035	Uncapped
 117000	Ambient Occlusion	Screen-space ambient occlusion.
 117005	Motion Blur	The blur on fast camera and character movement.
 117001	Anti-Aliasing	The game's own anti-aliasing pass.

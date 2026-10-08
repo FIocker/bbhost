@@ -19,7 +19,8 @@ void loading_bind(std::uint64_t slide);
 void loading_tick(std::uint64_t flip);
 // The last tick's answer: a loading screen is up.
 bool loading_screen_up();
-// A loading screen is up, the game runs at 60 and no Remo cutscene is
+// A loading screen is up, the game runs above 30 (60, 90 or uncapped: its
+// steps follow the frame time through the FPS++ cave) and no Remo cutscene is
 // requested or running: the frame-time manager waits for nothing
 // (engine/frame_rate.cpp) and flips complete at once
 // (hle_video_set_loading_uncapped), so the loaders, which step once a frame,
