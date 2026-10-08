@@ -16,11 +16,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 10 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 11 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 117 |
-| **Taken over in all** | **131** |
-| With any code byte changed (including byte patches and redirected calls) | 154; 236 at 60 fps |
+| **Taken over in all** | **132** |
+| With any code byte changed (including byte patches and redirected calls) | 155; 237 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -43,6 +43,7 @@ when there is a reason to change them, not for their own sake.
 | parallel resource copy (`sub_23bde30`) | `0x23bde30` | the copy of streamed resource data across the engine's worker pool | copies on the calling thread; removes a ~1 s wait per area tour |
 | effect ribbon tail, facing the eye (`sub_2cce7b0`) | `0x2cce7b0` | the last one to three points of an effect ribbon as vertices, the strip turned to the camera | 400,000 random strips against the game's own code (`tests/sfx_ribbon_test.cpp`), 21 calls compared in a world session: 0 differences |
 | effect ribbon tail, along normals (`sub_2cceec0`) | `0x2cceec0` | the same for a ribbon laid along its points' normals | 400,000 random strips, 426 calls compared in a world session: 0 differences |
+| item-lot roll (`sub_1bceaf0`) | `0x1bceaf0` | what an enemy, a corpse, a chest or a scripted award gives from `ItemLotParam`: each slot's weight (drop rate, item discovery, the cumulative counters that make a missed drop likelier), one draw from the game's random generator a row, the picks merged by their flags | 200,000 random lots against the game's own code (`tests/item_lot_test.cpp`) - results, generator and every flag after: 0 differences; 317 rolls compared in a world session (the frozen seed), the game's results, generator and counters: 0 differences |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -54,6 +55,12 @@ its own pointers back as zero and crashed at `0x2cce9b5` (the crash the
 community's "Intel 12th Gen+ SFX workaround" patch avoids by not drawing
 those effects). The rewrites keep nothing below the stack pointer. Linux
 skips the red zone when it delivers a signal, so only Windows crashed.
+
+The item-lot roll is the drop rules as source: how discovery scales a slot,
+how the cumulative counters raise a missed drop's weight and reset when it
+drops, which flags pass a slot over. The rows themselves stay `ItemLotParam`'s,
+editable by field name as before. Its debug-menu variant and preview stay the
+game's.
 
 The four event-flag functions are every read and write the game makes through
 its flag store - event scripts, Lua, talk scripts, the online session. With
