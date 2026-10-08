@@ -79,18 +79,9 @@ std::uint64_t decomp_guest(std::uint64_t bn);
 extern std::uint64_t g_decomp_slide;
 inline std::uint64_t decomp_leaf_guest(std::uint64_t bn) { return g_decomp_slide + (bn - 0x400000); }
 
-// The areas (hle/runtime.cpp adds each before decomp_install).
-void decomp_gx_flush_wait_add();     // decomp/gx_flush_wait.cpp
-void decomp_gx_block_reclaim_add();  // decomp/gx_block_reclaim.cpp
-void decomp_game_memcpy_add();       // decomp/game_memcpy.cpp
-void decomp_ez_copy_add();           // decomp/ez_copy.cpp
-void decomp_sfx_ribbon_add();        // decomp/sfx_ribbon.cpp
-void decomp_sprj_emk_add();          // decomp/sprj_emk.cpp
-void decomp_item_lot_add();          // decomp/item_lot.cpp
-void decomp_player_data_add();       // decomp/player_data.cpp
-void decomp_chalice_add();           // decomp/chalice.cpp
-void decomp_talk_script_add();       // decomp/talk_script.cpp
-void decomp_follow_camera_add();     // decomp/follow_camera.cpp
+// Every area's functions added to the list (decomp/areas.cpp): hle/runtime.cpp
+// calls it once, before decomp_install.
+void decomp_add_areas();
 
 // A leaf's entry points. The file holding them is built with
 // -fno-stack-protector as well (CMakeLists.txt), for helpers not inlined.

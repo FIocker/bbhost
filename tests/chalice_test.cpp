@@ -1,4 +1,4 @@
-// Chalice dungeons (decomp/chalice.cpp) against the game's own code
+// Chalice dungeons (decomp/chalice/ritual.cpp) against the game's own code
 // (tests/eboot_kit.h): the roll, a rite's pick, the map uid and the feature
 // pairs run in the loaded eboot and as ours on the same inputs - synthetic
 // HolygrailExParam and DungeonSubFeatLotParam rows served by stubs both
@@ -6,7 +6,7 @@
 // every byte they write, every draw they make, compared. The game's roll and
 // pick keep their candidates on the thread's runtime heap; the test gives
 // the thread one (malloc behind the heap's vtable).
-#include "../src/decomp/chalice.cpp"
+#include "../src/decomp/chalice/ritual.cpp"
 
 #include "eboot_kit.h"
 
@@ -85,7 +85,7 @@ void give_thread_a_heap() {
     std::memcpy(static_cast<std::uint8_t*>(eboot_kit::tcb()) - 0x730, &runtime, 8);  // rel_dlruntime_obj_mb
 }
 
-// ---- the flag store (decomp/sprj_event_flag_man.h's layout) ------------------
+// ---- the flag store (decomp/events/flag_store.h's layout) ------------------
 
 struct FlagStore {
     alignas(16) std::uint8_t man[0x40] = {};

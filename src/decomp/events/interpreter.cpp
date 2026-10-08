@@ -45,10 +45,10 @@
 // The completion flag is written as the game writes it: straight into the flag
 // store - an inlined copy of SetEventFlag(id, 1), which does nothing besides
 // that write - and the change is passed to the flag log and plugins'
-// on_event_flag (decomp/sprj_event_flag_man.h), which until now never saw an
+// on_event_flag (decomp/events/flag_store.h), which until now never saw an
 // event end.
 #include "decomp/decomp.h"
-#include "decomp/sprj_event_flag_man.h"
+#include "decomp/events/flag_store.h"
 
 #include "bbhost/engine/fd4.hpp"
 #include "bbhost/engine/sprj/emk_system.hpp"
@@ -607,7 +607,7 @@ void report_end() {
 
 }  // namespace
 
-void decomp_sprj_emk_add() {
+void decomp_event_interpreter_add() {
     const char* area = "Events";
     DecompFunction dispatch{"emevd_dispatch_instruction", area, 0x1bb93a0, kDispatchEntry, sizeof(kDispatchEntry),
                             reinterpret_cast<void*>(&emevd_dispatch_instruction), DecompKind::Leaf, &g_game_dispatch};

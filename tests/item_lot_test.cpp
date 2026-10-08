@@ -1,4 +1,4 @@
-// The item-lot roll (decomp/item_lot.cpp) against the game's own
+// The item-lot roll (decomp/items/item_lots.cpp) against the game's own
 // (tests/eboot_kit.h): sub_1bceaf0 and ours on the same random lots - rows of
 // every slot shape, counters at every count, discovery, category-15 levels,
 // flags on and off, results to free - from the same flag store, generator and
@@ -6,7 +6,7 @@
 // every flag block afterwards, the heap hint, and what is left allocated.
 // Skips without the 1.09 eboot (BBHOST_EBOOT, or eboot-109-decrypted.bin in
 // the checkout).
-#include "../src/decomp/item_lot.cpp"
+#include "../src/decomp/items/item_lots.cpp"
 
 #include "eboot_kit.h"
 
@@ -87,7 +87,7 @@ void stub_lvdep_row(Lookup* out, std::int32_t id, std::uint32_t level) {
 
 // ---- The flag store --------------------------------------------------------
 //
-// SprjEventFlagMan (decomp/sprj_event_flag_man.h): blocks of kBlock flags in
+// SprjEventFlagMan (decomp/events/flag_store.h): blocks of kBlock flags in
 // a tree keyed by block number, stored by pointer (kind 2) or in a pool
 // (kind 1).
 

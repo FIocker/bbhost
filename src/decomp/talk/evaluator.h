@@ -1,4 +1,4 @@
-// The talk scripts' expression evaluator (decomp/talk_script.cpp): the
+// The talk scripts' expression evaluator (decomp/talk/evaluator.cpp): the
 // values, context and call object it works on, shared with its test.
 #pragma once
 
@@ -50,7 +50,7 @@ static_assert(offsetof(Context, reg) == 0x400 && offsetof(Context, sp) == 0x480 
 // A function call as the environment sees it: the game's call class
 // (vtable 0x56c8850: slot 2 the id, 3 the count, 4 a copy of value i), the
 // count of values (arguments + 1), value 0 the function's id. The game's has
-// room for seven values; ours for eight (decomp/talk_script.cpp, 0x8b).
+// room for seven values; ours for eight (decomp/talk/evaluator.cpp, 0x8b).
 struct Call {
     void** vtable;
     std::int32_t count;

@@ -86,9 +86,6 @@ bool locate(std::uint64_t man, std::uint32_t id, const Load& load, std::uint64_t
 
 }  // namespace sprj_event_flag
 
-// Adds the four to the decomp list (hle/runtime.cpp, before decomp_install).
-void decomp_sprj_event_flag_man_add();
-
 // The game's own GetEventFlagValue while ours has its place (the
 // trampoline), else nullptr: its entry is then still the game's.
 void* sprj_event_flag_game_get_value();

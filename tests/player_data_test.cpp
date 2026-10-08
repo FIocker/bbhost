@@ -1,4 +1,4 @@
-// The player-data decomps (decomp/player_data.cpp) against the game's own
+// The player-data decomps (decomp/player/player_data.cpp) against the game's own
 // code (tests/eboot_kit.h): item discovery, the echo gain, the kill reward,
 // the death penalty and the level-up price check run in the loaded eboot and
 // as ours on the same generated state - effect lists, a player and its
@@ -6,7 +6,7 @@
 // could write is compared, with what each returns and every call it makes
 // (the player's virtuals, the kill's hand-on and the param lookup are stubs
 // here, the same for both). Skips without the 1.09 eboot.
-#include "../src/decomp/player_data.cpp"
+#include "../src/decomp/player/player_data.cpp"
 
 #include "eboot_kit.h"
 
