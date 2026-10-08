@@ -78,6 +78,7 @@ void decomp_game_memcpy_add();       // decomp/game_memcpy.cpp
 void decomp_ez_copy_add();           // decomp/ez_copy.cpp
 void decomp_sfx_ribbon_add();        // decomp/sfx_ribbon.cpp
 void decomp_sprj_emk_add();          // decomp/sprj_emk.cpp
+void decomp_item_lot_add();          // decomp/item_lot.cpp
 
 // A leaf's entry points. The file holding them is built with
 // -fno-stack-protector as well (CMakeLists.txt), for helpers not inlined.
