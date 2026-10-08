@@ -121,6 +121,7 @@ Shipped patches:
 | `deflate-level.toml` | the game's run-time compression at level 1 instead of 9, removing a periodic ~25 ms hitch |
 | `old-hunters.toml` | makes the game treat itself as The Old Hunters edition, so the DLC is available (Kyo's 1.09 patch) |
 | `debug-camera.toml` | restores the debug free camera (Lance McDonald's 1.09 patch): hold Action and press L3 to cycle its modes. Off by default; it replaces a debug-menu test step, which then must not be used |
+| `intel-sfx-workaround.toml` | stops one kind of special effect from being drawn, emoose's 1.09 workaround for a crash reported on Windows with Intel 12th-generation and newer CPUs. Off by default |
 
 Patches whose bytes depend on settings, and anything that needs a hook rather
 than fixed bytes, are written in code or as plugins.

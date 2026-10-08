@@ -1,0 +1,27 @@
+# Intel 12th Gen+ SFX workaround: emoose's patch for 1.09, from the community
+# patch list (PatchVer 1.0), byte for byte - a `ret` at the first instruction
+# of sub_2cf83e0 (addresses are Binary Ninja's).
+#
+# The game is reported to crash on Windows with Intel's 12th-generation and
+# newer CPUs in its special-effects code. sub_2cf83e0 draws one kind of
+# effect: it sets the renderer's state for it, reserves a strip of vertices
+# (two a point, 0x38 bytes each) and has sub_2ec4270 fill it. Returning at once
+# leaves that kind of effect undrawn and nothing else - its callers read
+# nothing from it. bbhost runs this code on the CPU as the console did, so a
+# crash in it on those CPUs would be the game's own: this is the workaround,
+# not a fix, and the crash has not been seen here (a Cascade Lake Xeon).
+#
+# Off by default: the setup window's Patches tab, or
+# `intel-sfx-workaround = true` under [patches] in bbhost.toml, turns it on for
+# the next start. The log then says "patch: intel-sfx-workaround: 1 of 1 sites
+# written".
+[patch]
+name = "intel-sfx-workaround"
+eboot = "941f887a562aae054fac35af8cc8f27cf075f3d4cc2e029fb5ae2a663aaa5ae7"
+description = "Intel 12th Gen+ SFX workaround (emoose): one kind of effect is not drawn, for a crash reported on Windows with newer Intel CPUs"
+enabled = false
+
+[site.sfx-draw]
+address = "0x02cf83e0"
+expect = "55"
+bytes = "c3"

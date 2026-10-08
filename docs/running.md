@@ -114,6 +114,12 @@ fifth of the size on disk, written over a few seconds in the background.
 `BBHOST_F12_TEXTURES=1` adds every texture the frame sampled, and the game
 pauses while it writes them.
 
+**A crash on Windows with an Intel 12th-generation or newer CPU.** The game
+is reported to crash in its special-effects code on those CPUs. The setup
+window's Patches tab has emoose's workaround, `intel-sfx-workaround` (off by
+default): it stops one kind of effect from being drawn. Turn it on only if the
+game crashes there.
+
 **Black or broken image in the world.** On cards with little video memory,
 check the log for `video memory is full`. bbhost sizes its own buffers to the
 card's budget and falls back to system memory rather than failing, but other
