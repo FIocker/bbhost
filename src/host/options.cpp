@@ -12,6 +12,7 @@
 #include "net/account.h"
 #include "log.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -109,10 +110,14 @@ Setting g_set[kSettingCount] = {
      "Fullscreen is borderless: the desktop resolution, no mode switch.", false},
     {"vsync", "V-Sync", {"On", "Off"}, 0,
      "Off presents as soon as a frame is ready, and can tear.", false},
-    // The same six the game's Frame Cap pick list offers (engine/option_menu.cpp):
-    // 90 and 144 were missing here, so choosing either in the game did nothing.
-    {"frame_cap", "Frame cap", {"30", "60", "90", "120", "144", "Off"}, 0,
-     "30 is the game's own pace; 60 or more runs the game at 60 (on the next run). Above 60 only caps presentation.", false},
+    // The game's own pace (engine/frame_rate.h), the same four the game's Frame
+    // Rate pick list offers (engine/option_menu.cpp). The key is the old Frame
+    // cap's, so a file keeps its 30 or 60; an older file's 90, 120, 144 and
+    // Off, which ran the game at 60, read as 60 (host_options_load).
+    {"frame_cap", "Frame rate", {"30", "60", "90", "Uncapped"}, 0,
+     "30 is the game's own pace; 60 and 90 run its logic at that rate; Uncapped steps it by the frame time "
+     "(the display's refresh rate with V-Sync on, up to 240 off). Applies on the next run.",
+     false},
     // What reaches the screen, counted by the presenter (host/window.cpp).
     {"fps_counter", "FPS counter", {"Off", "On"}, 0,
      "Frames per second actually presented, in the top right corner.", false},
@@ -513,9 +518,8 @@ void edit_poll() {
     g_edit_field = -1;
 }
 
-// The frame-cap values are the labels themselves: "Off" is no cap, anything
-// else is the number. A bbhost.toml asking for something not in the list gets
-// it added, so the screen never silently changes what the file said.
+// The frame-rate values are the labels themselves: "Uncapped" is 0, anything
+// else is the number.
 int fps_from_label(const char* v) { return std::atoi(v); }
 
 int fps_index(int fps) {
@@ -634,7 +638,10 @@ void apply(int id) {
 // version was written by a build where it defaulted to Off, and every save
 // writes every setting - so its "Off" is that old default far more often
 // than a choice, and reads as On (once: the next save writes version 2).
-constexpr int kOptionsVersion = 2;
+// 3: frame_cap is the game's frame rate (30, 60, 90, Uncapped); an older
+// file's 90, 120, 144 and Off were caps on presentation that ran the game at
+// 60, and read as 60.
+constexpr int kOptionsVersion = 3;
 
 void save() {
     if (!g_dirty) {
@@ -819,12 +826,13 @@ void host_options_load() {
     g_set[kChangeAppearance].index = config().change_appearance ? 0 : 1;
     g_set[kRebirth].index = config().rebirth ? 0 : 1;
     g_set[kFivePlayers].index = config().five_players ? 0 : 1;
-    if (const int i = fps_index(config().fps_cap); i >= 0) {
-        g_set[kFrameCap].index = i;
-    } else {
-        static std::string custom = std::to_string(config().fps_cap);
-        g_set[kFrameCap].values.insert(g_set[kFrameCap].values.begin(), custom.c_str());
-        g_set[kFrameCap].index = 0;
+    // video.fps_cap is the frame rate's default: 30, 60, 90 or 0 (uncapped);
+    // another number takes the nearest rate below it.
+    {
+        const int cap = config().fps_cap;
+        const int mode = cap <= 0 ? 0 : cap >= 90 ? 90 : cap >= 60 ? 60 : 30;
+        if (mode != cap) host_log("options: video.fps_cap = %d is not a frame rate; %d", cap, mode);
+        g_set[kFrameCap].index = std::max(0, fps_index(mode));
     }
     // A package's own (video.resolution, video.window_mode: the Steam Deck
     // kit's 1280x800, fullscreen; video.model_detail), by the entry's name.
@@ -848,6 +856,7 @@ void host_options_load() {
         std::string acct_name, acct_token;
         int file_version = 1;
         bool old_hunters_off = false;  // v0.2.9's PC enhancement, turned off
+        std::string frame_cap_val;
         while (std::fgets(line, sizeof(line), f)) {
             if (line[0] == '[') {
                 keys = std::strncmp(line, "[keys]", 6) == 0;
@@ -890,6 +899,8 @@ void host_options_load() {
                 old_hunters_off = val == "Off";
                 continue;
             }
+            // Looked at again once the file's version is known (below).
+            if (key == "frame_cap") frame_cap_val = val;
             // The four named steps mouse_sens used to have, on the new scale.
             if (key == "mouse_sens") {
                 const char* old[] = {"Low", "Medium", "High", "Very high"};
@@ -910,6 +921,16 @@ void host_options_load() {
             }
         }
         std::fclose(f);
+        // Before version 3 the frame_cap was a cap on presentation, and its 90,
+        // 120, 144 and Off ran the game at 60: the frame rate that ran is 60
+        // (before any save below writes version 3).
+        if (file_version < 3 &&
+            (frame_cap_val == "90" || frame_cap_val == "120" || frame_cap_val == "144" || frame_cap_val == "Off")) {
+            g_set[kFrameCap].index = std::max(0, fps_index(60));
+            g_dirty = true;
+            host_log("options: frame_cap \"%s\" (a cap that ran the game at 60) reads as the frame rate 60",
+                     frame_cap_val.c_str());
+        }
         if (!acct_name.empty() && !acct_token.empty()) {
             net::account_set(acct_name, acct_token);
             g_field[0] = acct_name;
@@ -1481,7 +1502,7 @@ bool host_steam_deck() {
 }
 
 namespace {
-// The Deck's configurations, by the frame cap: 60 or more (or none) is 60 fps.
+// The Deck's configurations, by the frame rate: 60 or more (or uncapped) is 60 fps.
 int deck_profile_of(int fps) { return fps == 0 || fps >= 60 ? 1 : 0; }
 }  // namespace
 

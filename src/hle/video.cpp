@@ -4,7 +4,6 @@
 #include "core/portable.h"
 #include "hle/platform.h"
 #include "hle/hle.h"
-#include "engine/frame_rate.h"
 #include "engine/guest.h"
 #include "host/gpu.h"
 #include "core/config.h"
@@ -242,10 +241,9 @@ void vblank_tick(std::uint64_t vcount) {
 
 void start_vsync() {
     std::call_once(g_vsync_once, [] {
-        g_flip_uncapped.store([] {
-            const char* e = std::getenv("BBHOST_UNCAP");
-            return e && e[0] == '1';
-        }());
+        // Set, never cleared: the game at 90 or uncapped has set it already
+        // (hle_video_set_game_pace).
+        if (const char* e = std::getenv("BBHOST_UNCAP"); e && e[0] == '1') g_flip_uncapped.store(true);
         std::thread([] {
 #if !defined(_WIN32)
             pthread_setname_np(pthread_self(), "bb-vblank");
@@ -564,13 +562,36 @@ std::uint64_t hle_video_flip_count() { return g_flips_done.load(); }
 
 void hle_video_set_loading_uncapped(bool on) { g_flip_loading.store(on, std::memory_order_relaxed); }
 
+// The game's pace once engine/frame_rate.cpp chose it; -1 before.
+std::atomic<int> g_game_pace{-1};
+
+void hle_video_set_game_pace(int fps) {
+    g_game_pace.store(fps);
+    if (fps == 90 || fps == 0) {
+        // The game paces itself - our SprjFlipper::Update waits out 1/90 s, or
+        // the uncapped limit - and steps by the frame time it measured, so a
+        // flip completes as soon as the frame is recorded, as under
+        // BBHOST_UNCAP: held to the display's refresh, 90 on a 60 Hz display
+        // would run at 60 with 90's steps. The presenter still shows one frame
+        // a refresh with V-Sync on (host/window.cpp drops the others).
+        g_flip_uncapped.store(true);
+        g_fps_cap.store(0);
+        host_log("video: flips complete as soon as they are recorded (the game paces itself at %s)", fps ? "90" : "uncapped");
+    } else {
+        g_fps_cap.store(fps);
+    }
+}
+
 void hle_video_set_fps_cap(int fps) {
-    // A game started at 60 steps 1/60 s a frame: capping it below 60 now would
-    // slow the game itself down. The lower cap waits for the next run, as the
-    // game's pace does (engine/frame_rate.h).
-    if (frame_rate_game_fps() == 60 && fps > 0 && fps < 60) {
-        host_log("video: frame cap %d applies on the next run (the game is running at 60)", fps);
-        fps = 60;
+    // The game's pace is chosen when it starts (engine/frame_rate.h): its
+    // steps are converted for that rate, so capping it lower now would slow
+    // the game itself down. A frame rate picked while it runs applies on the
+    // next run.
+    if (const int pace = g_game_pace.load(); pace >= 0) {
+        if (fps != pace) {
+            host_log("video: frame rate %d applies on the next run (the game is running at %d; 0 is uncapped)", fps, pace);
+        }
+        return;
     }
     g_fps_cap.store(fps);
 }

@@ -190,8 +190,9 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                                                "3200x1800",        "3840x2160",        "2560x1080 (21:9)", "3440x1440 (21:9)",
                                                "5120x2160 (21:9)", "3840x1080 (32:9)", "5120x1440 (32:9)", "1280x800 (16:10)",
                                                "960x600 (16:10, upscaled)", "1024x640 (16:10, upscaled)"};
-    static const int kCaps[] = {30, 60, 0};
-    int cap_choice = frame_cap == 30 ? 0 : frame_cap == 60 ? 1 : 2;
+    // The game's frame rate (engine/frame_rate.h): 0 is uncapped.
+    static const int kCaps[] = {30, 60, 90, 0};
+    int cap_choice = frame_cap == 30 ? 0 : frame_cap == 60 ? 1 : frame_cap == 90 ? 2 : 3;
     // The PC enhancements, through the same calls: each is read when the
     // game starts (main.cpp, config_set_enhancements).
     struct Enhancement {
@@ -609,8 +610,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Lance McDonald's free camera: hold Interact (E) and press L3 (Left Ctrl). The debug menu's LOAD TEST crashes while it is on.");
         ImGui::SetNextItemWidth(200 * scale);
-        static const char* const kCapLabels[] = {"30 fps", "60 fps", "Off"};
-        ImGui::Combo("Frame cap", &cap_choice, kCapLabels, 3);
+        static const char* const kCapLabels[] = {"30 fps", "60 fps", "90 fps", "Uncapped"};
+        ImGui::Combo("Frame rate", &cap_choice, kCapLabels, 4);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("The game's own speed. Uncapped steps it by the frame time: the display's refresh rate with V-Sync on, up to 240 fps off.");
         ImGui::SetNextItemWidth(200 * scale);
         ImGui::Combo("Render resolution", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
         ImGui::TextDisabled("F10 in the game has every other setting.");

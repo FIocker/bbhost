@@ -20,7 +20,7 @@ struct HostSettings {
     // Display
     bool fullscreen = false;
     bool vsync = true;
-    int frame_cap = 30;   // frames a second presented; 0 is no cap
+    int frame_cap = 30;   // the game's frame rate (engine/frame_rate.h): 30, 60, 90; 0 is uncapped
     bool fps_counter = false;
     int res_width = 1920, res_height = 1080;  // the render resolution (BBHOST_RES wins)
 

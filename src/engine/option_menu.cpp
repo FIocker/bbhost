@@ -544,12 +544,13 @@ Slider g_fx_bloom{"bloom", kFxBloom, 10, 0xff};
 Slider g_fx_saturation{"saturation", kFxSaturation, 5, 0xff};
 constexpr int kEffectsRows = kEffectsCount + 2;
 
-// The frame cap, as a pick-list. The row stores the chosen entry's int32, so
-// the values are the caps themselves and 0 is no cap. Six entries because the
-// widget's list has six slots: four left two of them empty and the panel drew
-// with a gap under the last one.
+// The frame rate (engine/frame_rate.h), as a pick-list. The row stores the
+// chosen entry's int32, so the values are the rates themselves and 0 is
+// uncapped. Four entries: the widget's list has six slots, and with four (as
+// before 90 and 144 were added to the old Frame cap) the panel draws with a
+// gap under the last one.
 const Choice kFrameCaps[] = {
-    {30, 116030}, {60, 116031}, {90, 116032}, {120, 116033}, {144, 116034}, {0, 116035},
+    {30, 116030}, {60, 116031}, {90, 116032}, {0, 116035},
 };
 std::int32_t g_frame_cap = 30;
 
@@ -1803,7 +1804,7 @@ void option_menu_poll() {
     if (g_frame_cap != g_last_frame_cap) {
         g_last_frame_cap = g_frame_cap;
         host_opt_set_frame_cap(g_frame_cap);
-        host_log("pc-options: frame cap %d from the System menu", g_frame_cap);
+        host_log("pc-options: frame rate %d from the System menu (0 is uncapped; applies on the next run)", g_frame_cap);
     }
     if (g_keys_save.exchange(false)) {
         host_options_save_now();

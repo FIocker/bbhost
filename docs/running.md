@@ -147,8 +147,22 @@ and every press acts twice. `tools/steamdeck/STEAMDECK.md` has the setup.
 The picture keeps its aspect ratio, with ultrawide resolutions (21:9, 32:9)
 available in the settings. The resolution can be changed while playing.
 bbhost paces the game to the refresh rate of the display its window is on;
-`[video] vblank_hz` overrides a display that reports the wrong rate. The frame
-cap (30, 60 or higher) is an in-game setting.
+`[video] vblank_hz` overrides a display that reports the wrong rate.
+
+The frame rate is the game's own speed, chosen when it starts (a change
+applies on the next run): 30 is the game as it shipped; 60 and 90 run its
+logic at that rate with its fixed steps converted (Kyo's 60 and 90 FPS++
+lists, `engine/frame_rate.cpp`); Uncapped steps it by the measured frame time
+(1/240 to 1/30 s), at the display's refresh rate with V-Sync on and up to 240
+fps with it off. At 90 and Uncapped the game paces itself and its frames are
+shown as they come, so 90 on a 60 Hz display shows 60 of them a second.
+`BBHOST_GAME_FPS=30|60|90|0` overrides the setting for a run (0 is uncapped),
+`BBHOST_UNCAPPED_FPS=N` sets the uncapped limit (30-240) whatever V-Sync says,
+and `BBHOST_UNCAPPED_LOG=1` logs once a second the frame time uncapped steps
+by and the values it wrote. The start of the log says which rate runs and how
+many values and code sites were converted (`frame rate:` lines), and names
+any site whose bytes were not the expected ones (that rate is then refused:
+90 or uncapped falls back to 60).
 
 ## Online
 
