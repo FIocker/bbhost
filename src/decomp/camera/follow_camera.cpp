@@ -27,7 +27,7 @@
 // from memory as the game reads them; the game's other constants are
 // literals here, and the body check hashes them with the code.
 //
-// tests/decomp/decomp_follow_camera.cpp runs the game's version and ours in the
+// tests/decomp/follow_camera_test.cpp runs the game's version and ours in the
 // eboot kit over generated cameras, frame after frame.
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
