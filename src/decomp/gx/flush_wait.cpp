@@ -75,7 +75,7 @@ void report() {
 }  // namespace
 
 void decomp_gx_flush_wait_add() {
-    DecompFunction fn{"sub_15d7030", "GX device context", 0x15d7030, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&flush_wait),
+    DecompFunction fn{"sub_15d7030", "gx", 0x15d7030, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&flush_wait),
                       DecompKind::Hosted};
     fn.report = &report;
     decomp_add(fn);
