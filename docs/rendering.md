@@ -33,6 +33,15 @@ are tightly interleaved with the constant engine's memory traffic, and most
 of them are fills and copies that never run a shader, which bbhost recognises
 and performs directly.
 
+**Recording.** The command processor leaves the Vulkan calls to a thread of
+its own, `bb-record`. Each draw goes into a packet, and most of its other
+commands - barriers, fills, copies and the like - into the same ordered
+stream as typed records (`src/host/recorder.cpp`, `src/host/stream_ops.h`).
+`bb-record` replays the stream into command buffers, begins and ends each one
+and hands it to the thread that submits, while the command processor goes on
+to the next draw. With `BBHOST_STREAM_SUBMIT=0` the command processor begins,
+ends and submits the command buffers itself, to compare.
+
 **Shaders.** GCN shaders are converted to SPIR-V when the game creates them
 (the few that cannot be, at their first draw), so most pipelines are ready
 before they are needed. There are two compilers:
@@ -106,3 +115,4 @@ path at all:
 | `BBHOST_CAPTURE_DRAW` + `drawreplay` | captures one draw with its inputs and replays it outside the game |
 | `BBHOST_VK_VALIDATE=1` | runs with the Vulkan validation layer |
 | `BBHOST_GPU_PROFILE=1` | per-pass GPU timings |
+| `bbhost --stream-selftest[=N]` | checks the command stream headless against a CPU model, N rounds (16 by default), and exits with 0 when it matched; run it with `BBHOST_VK_VALIDATE=1` too |

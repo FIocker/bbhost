@@ -9,6 +9,7 @@
 #include "gcn/translate.h"
 #include "hle/modules.h"
 #include "host/gpu.h"
+#include "host/stream_ops.h"
 
 #include <vulkan/vulkan.h>
 
@@ -1176,9 +1177,9 @@ void render_pipeline_time_us(std::uint64_t out[5]);
 // A shader copies a render target's memory elsewhere: copy the image into a snapshot at dst.
 bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes);
 
-// ---- recorder.cpp: draws recorded on their own thread (BBHOST_RECORDER) ----
+// ---- recorder.cpp: the command stream (BBHOST_RECORDER, BBHOST_STREAM_SUBMIT) ----
 // The command buffer being recorded, once the recorder has replayed every
-// draw handed to it: whatever records next lands after them. Under g.mu.
+// block handed to it: whatever records next lands after them. Under g.mu.
 VkCommandBuffer g_cmd();
 // BBHOST_GPU_PROFILE=2: a recording site (g_cmd()'s caller) noted for the gap
 // the next profiled draw or dispatch closes.
@@ -1186,6 +1187,96 @@ void profile_note_site_locked(void* site);
 void recorder_drain();
 bool recorder_enabled();
 std::string recorder_report();
+// The stream carries the command buffers too: the recorder begins and ends
+// them and hands their submissions to bb-submit, and rec() appends ops
+// (BBHOST_STREAM_SUBMIT, on unless 0, and the recorder on).
+bool stream_on();
+// Until submission `serial` has gone to the queue (or failed): a fence the
+// command processor waits for must have been submitted. Under g.mu.
+void stream_wait_submitted(std::uint64_t serial);
+// Until the recorder has replayed every block published so far (queue_drain;
+// any thread but the recorder).
+void stream_drain_published();
+std::string stream_last_op();  // for the device-loss and hang reports
+// gpu.cpp: a submission handed to bb-submit, or submitted here under the
+// queue's lock without it; `serial` (a game submission's Gpu::flushes, ~0
+// otherwise) and `foreign_id` (kForeignSubmit's) are published once it went.
+void stream_submit_job(const VkCommandBuffer* cmds, std::uint32_t ncmds, VkSemaphore wait, VkPipelineStageFlags wait_stage, VkSemaphore signal,
+                       VkFence fence, std::uint32_t items, std::uint64_t serial, std::uint64_t foreign_id);
+std::uint64_t stream_submitted_serial();  // the game submissions gone to the queue: the last one's serial + 1
+// What a submission costs on its way (recorder.cpp reports it): the command
+// buffers' begin and end, wherever they run; slot retirement and its fence
+// wait.
+struct StreamStats {
+    std::atomic<std::uint64_t> endbegin_ns{0}, endbegin_n{0}, retire_ns{0}, retires{0}, fence_ns{0}, submits{0};
+};
+extern StreamStats g_stream_stats;
+// The self-test (stream_selftest.cpp): the recorder's mode between rounds -
+// 0 none (everything in place), 1 inline, 2 its thread - and whether the
+// stream carries the submissions. False while anything is open or recording.
+bool stream_test_set_mode(int mode, bool submit);
+struct StreamTestCounts {
+    std::uint64_t blocks = 0, draws = 0, ops = 0, submits = 0, drains = 0, drain_waits = 0;
+};
+StreamTestCounts stream_test_counts();
+extern std::atomic<std::uint64_t> g_validation_messages;  // gpu.cpp: what BBHOST_VK_VALIDATE=1's layer reported
+
+// Flushes this core's write-combining buffers. AMD's Windows driver records
+// into write-combined memory, and a release store does not order those
+// buffers against another core (recorder.cpp, "Write combining"): every
+// hand-over of a command buffer, or of host-visible memory the GPU reads,
+// fences first.
+inline void write_combine_fence() {
+#if defined(__x86_64__)
+    __builtin_ia32_sfence();
+#else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
+
+// The command processor's vkCmd* calls without the command buffer: with the
+// stream on, each appends an op the recorder replays in order (its arrays
+// copied, so the caller's may go at once); otherwise each records in place on
+// g_cmd()'s command buffer. Under g.mu.
+class Rec {
+public:
+    // Stream only (stream_on()): the slot's command buffer begun; ended and
+    // its submission handed over (published at once); another thread's
+    // command buffer submitted in stream order, an id host_gpu_wait_submitted
+    // takes.
+    void begin(VkCommandBuffer cmd);
+    void end_submit(const stream::EndSubmit& s);
+    std::uint64_t foreign_submit(VkCommandBuffer cmd, VkSemaphore wait, VkPipelineStageFlags wait_stage, VkSemaphore signal, VkFence fence);
+    void pipeline_barrier(VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags dep, std::uint32_t nmem,
+                          const VkMemoryBarrier* mem, std::uint32_t nbuf, const VkBufferMemoryBarrier* buf, std::uint32_t nimg,
+                          const VkImageMemoryBarrier* img);
+    void transfer_barrier(bool begin);  // record_transfer_barrier
+    void copy_order_barrier();          // record_copy_order_barrier
+    void pass_barrier();                // record_pass_barrier
+    void end_rendering(bool barrier);   // record_end_rendering
+    void begin_rendering(const VkRenderingInfo& ri);
+    void fill_buffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, std::uint32_t data);
+    void copy_buffer(VkBuffer src, VkBuffer dst, std::uint32_t n, const VkBufferCopy* regions);
+    void copy_buffer_to_image(VkBuffer buffer, VkImage image, VkImageLayout layout, std::uint32_t n, const VkBufferImageCopy* regions);
+    void copy_image_to_buffer(VkImage image, VkImageLayout layout, VkBuffer buffer, std::uint32_t n, const VkBufferImageCopy* regions);
+    void clear_color_image(VkImage image, VkImageLayout layout, const VkClearColorValue& color, std::uint32_t n,
+                           const VkImageSubresourceRange* ranges);
+    void reset_query_pool(VkQueryPool pool, std::uint32_t first, std::uint32_t count);
+    void begin_query(VkQueryPool pool, std::uint32_t query, VkQueryControlFlags flags);
+    void end_query(VkQueryPool pool, std::uint32_t query);
+    void copy_query_results(VkQueryPool pool, std::uint32_t first, std::uint32_t count, VkBuffer dst, VkDeviceSize offset, VkDeviceSize stride,
+                            VkQueryResultFlags flags);
+    void write_timestamp(VkPipelineStageFlagBits stage, VkQueryPool pool, std::uint32_t query);
+    void bind_pipeline(VkPipelineBindPoint bind_point, VkPipeline pipeline);
+    void bind_sets(VkPipelineBindPoint bind_point, VkPipelineLayout layout, std::uint32_t first, std::uint32_t n, const VkDescriptorSet* sets,
+                   std::uint32_t ndynamic = 0, const std::uint32_t* dynamic = nullptr);
+    void push_constants(VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* data);
+    // vkUpdateDescriptorSets at this point of the stream (a set the op
+    // stream's earlier commands may still bind in this command buffer).
+    void update_sets(std::uint32_t n, const VkWriteDescriptorSet* writes);
+    void dispatch(std::uint32_t x, std::uint32_t y, std::uint32_t z);
+};
+Rec& rec();
 
 // State a pipeline linked from libraries takes per draw.
 struct DrawLibraryState {

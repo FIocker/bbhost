@@ -492,6 +492,10 @@ std::string host_gpu_capture_dir();
 const char* host_gpu_capture_ext();
 // BBHOST_RT_REFILL_TEST=1: a re-created target starts with the fill its old image took (render.cpp).
 void host_gpu_refill_selftest();
+// --stream-selftest[=N] / BBHOST_STREAM_SELFTEST=N (host/stream_selftest.cpp):
+// the command stream run N rounds four ways against a CPU model, headless,
+// before anything of the game loads; 0 when every way matched the model.
+int host_gpu_stream_selftest(int rounds);
 void host_gpu_stall_test(unsigned ms);
 void host_gpu_watch_display(std::uint64_t display_va);  // BBHOST_DUMP_ON_BRIGHT: dump when a frame washes out
 void host_gpu_glitch_watch(std::uint64_t display_va, std::uint64_t mark);  // BBHOST_GLITCH=1: the glitch hunt (host/glitch.cpp)

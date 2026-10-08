@@ -45,6 +45,7 @@
 namespace gpu {
 
 Gpu g;
+std::atomic<std::uint64_t> g_validation_messages{0};  // warnings and errors the validation layer reported
 
 void device_lost_locked(const char* where);  // below, with the reports it makes
 bool take_marked_start(std::string& why);    // the same: a start after a lost device runs with markers
@@ -74,6 +75,7 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
     if (severity < VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
         return VK_FALSE;
     }
+    g_validation_messages.fetch_add(1, std::memory_order_relaxed);
     static std::atomic<int> logs{0};
     if (logs.fetch_add(1) < 40) {
         host_log("vk validation: %s", data && data->pMessage ? data->pMessage : "?");
@@ -111,6 +113,8 @@ struct SubmitJob {
     VkFence fence = VK_NULL_HANDLE;
     std::uint32_t items = 0;
     std::uint64_t ticket = 0;
+    std::uint64_t serial = ~0ull;  // a game submission's Gpu::flushes, published once it went (stream_submitted_serial)
+    std::uint64_t foreign = 0;     // a kForeignSubmit's id, published the same way (host_gpu_wait_submitted)
 };
 std::mutex g_sub_mu;
 std::condition_variable g_sub_cv, g_sub_idle;
@@ -126,6 +130,41 @@ const bool g_submit_thread_on = [] {
     return !(e && e[0] == '0');
 }();
 
+// The game's submissions gone to the queue (the last one's serial + 1), and
+// the last kForeignSubmit id: published after vkQueueSubmit returned.
+std::atomic<std::uint64_t> g_stream_submitted{0};
+std::atomic<std::uint64_t> g_foreign_submitted{0};
+constexpr std::uint64_t kForeignTicket = 1ull << 63;  // host_gpu_submit_presenter's tickets for a kForeignSubmit
+
+// One job to the queue, under its lock; a failure is kept for the command
+// processor (take_submit_failure_locked).
+void submit_job_now(const SubmitJob& job) {
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = job.ncmds;
+    si.pCommandBuffers = job.cmds;
+    if (job.wait) {
+        si.waitSemaphoreCount = 1;
+        si.pWaitSemaphores = &job.wait;
+        si.pWaitDstStageMask = &job.wait_stage;
+    }
+    if (job.signal) {
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &job.signal;
+    }
+    VkResult r;
+    {
+        std::lock_guard<std::mutex> q(g.queue_mu);
+        r = vkQueueSubmit(g.queue, 1, &si, job.fence);
+    }
+    if (r != VK_SUCCESS) {
+        int none = 0;
+        g_sub_failed.compare_exchange_strong(none, static_cast<int>(r));
+        g_sub_failed_items.fetch_add(job.items);
+    }
+    if (job.serial != ~0ull) g_stream_submitted.store(job.serial + 1, std::memory_order_release);
+    if (job.foreign) g_foreign_submitted.store(job.foreign, std::memory_order_release);
+}
+
 void submit_thread() {
     host_thread_set_name("bb-submit");
     host_thread_set_class(HostThreadClass::GpuFeed, "bb-submit");  // core/host_clock.h
@@ -138,28 +177,7 @@ void submit_thread() {
             g_sub_jobs.pop_front();
             g_sub_busy = true;
         }
-        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        si.commandBufferCount = job.ncmds;
-        si.pCommandBuffers = job.cmds;
-        if (job.wait) {
-            si.waitSemaphoreCount = 1;
-            si.pWaitSemaphores = &job.wait;
-            si.pWaitDstStageMask = &job.wait_stage;
-        }
-        if (job.signal) {
-            si.signalSemaphoreCount = 1;
-            si.pSignalSemaphores = &job.signal;
-        }
-        VkResult r;
-        {
-            std::lock_guard<std::mutex> q(g.queue_mu);
-            r = vkQueueSubmit(g.queue, 1, &si, job.fence);
-        }
-        if (r != VK_SUCCESS) {
-            int none = 0;
-            g_sub_failed.compare_exchange_strong(none, static_cast<int>(r));
-            g_sub_failed_items.fetch_add(job.items);
-        }
+        submit_job_now(job);
         std::lock_guard<std::mutex> lk(g_sub_mu);
         g_sub_busy = false;
         g_sub_submitted.store(job.ticket, std::memory_order_release);
@@ -496,12 +514,37 @@ void map_import_pages_locked(std::uint32_t index, const Chunk& c, std::uint64_t 
 }
 }  // namespace
 
-// Waits until the submission thread has submitted everything it was given.
+// Waits until the submission thread has submitted everything it was given -
+// and, first, until the recorder has handed over every submission in the
+// blocks published so far (the command stream's kEndSubmit and
+// kForeignSubmit): work queued after this goes behind them.
 void queue_drain() {
+    stream_drain_published();
     if (!g_sub_running) return;
     std::unique_lock<std::mutex> lk(g_sub_mu);
     g_sub_idle.wait(lk, [] { return g_sub_jobs.empty() && !g_sub_busy; });
 }
+
+void stream_submit_job(const VkCommandBuffer* cmds, std::uint32_t ncmds, VkSemaphore wait, VkPipelineStageFlags wait_stage, VkSemaphore signal,
+                       VkFence fence, std::uint32_t items, std::uint64_t serial, std::uint64_t foreign_id) {
+    SubmitJob job;
+    job.ncmds = ncmds;
+    for (std::uint32_t k = 0; k < ncmds && k < 2; ++k) job.cmds[k] = cmds[k];
+    job.wait = wait;
+    job.wait_stage = wait_stage;
+    job.signal = signal;
+    job.fence = fence;
+    job.items = items;
+    job.serial = serial;
+    job.foreign = foreign_id;
+    if (g_sub_running) {
+        enqueue_submit(job);
+    } else {
+        submit_job_now(job);  // BBHOST_SUBMIT_THREAD=0: on the recorder, under the queue's lock
+    }
+}
+
+std::uint64_t stream_submitted_serial() { return g_stream_submitted.load(std::memory_order_acquire); }
 
 QueueGuard::QueueGuard() {
     queue_drain();
@@ -2398,9 +2441,16 @@ bool extract_program(std::uint64_t code_va, std::vector<std::uint32_t>& words, s
 
 void begin_recording_locked() {
     if (!g.recording) {
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(g_cmd(), &bi);
+        if (stream_on()) {
+            rec().begin(g.cmd_);  // the recorder begins it (kBegin)
+        } else {
+            VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            const VkCommandBuffer cmd = g_cmd();
+            const std::uint64_t t0 = host_clock_monotonic_ns();
+            vkBeginCommandBuffer(cmd, &bi);
+            bump(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+        }
         ++g.record_serial;  // dynamic state recorded so far is gone
         g.recording = true;
         busy_begin_locked(g.slots[g.slot]);
@@ -2408,9 +2458,9 @@ void begin_recording_locked() {
         occlusion_begin_recording_locked();
         if (g.profile) {
             Gpu::Slot& sl = g.slots[g.slot];
-            vkCmdResetQueryPool(g_cmd(), sl.qpool, 0, kQueriesPerSlot);
+            rec().reset_query_pool(sl.qpool, 0, kQueriesPerSlot);
             sl.qreset = true;
-            vkCmdWriteTimestamp(g_cmd(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.qpool, kQueriesPerSlot - 2);
+            rec().write_timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, sl.qpool, kQueriesPerSlot - 2);
             sl.span = true;
         }
     }
@@ -3634,7 +3684,7 @@ void device_lost_locked(const char* where) {
     if (!g.has_checkpoints) host_log("gpu: no progress markers this run; the next %d starts run with them", kMarkedRuns);
     // Everything stops after this, so say what was in flight: the last draws
     // name the pipeline that faulted or hung.
-    host_gpu_hang_report();
+    host_gpu_hang_report();  // with the command stream's last op (recorder.cpp)
     const std::string hooks = host_foreign_hooks();
     if (!hooks.empty()) host_log("gpu: hooked into this process: %s - such hooks are a common cause of lost devices", hooks.c_str());
     const std::string path = device_lost_note_path();
@@ -3715,6 +3765,18 @@ void staging_let_go_locked(const DevBuffer& b) {
 void retire_slot_locked(int k) {
     Gpu::Slot& sl = g.slots[k];
     if (!sl.in_flight) return;
+    // A fence that never went to the queue would hold the wait below for its
+    // ten seconds: the recorder hands the submission over first (it has, 16
+    // submissions on, unless it fell that far behind).
+    stream_wait_submitted(sl.serial);
+    const std::uint64_t retire_t0 = host_clock_monotonic_ns();
+    struct RetireTime {
+        std::uint64_t t0;
+        ~RetireTime() {
+            bump(g_stream_stats.retire_ns, host_clock_monotonic_ns() - t0);
+            bump(g_stream_stats.retires);
+        }
+    } retire_time{retire_t0};
     take_submit_failure_locked();
     if (!g.ok && g_sub_failed.load(std::memory_order_relaxed)) {
         // Its submission may never have gone in: the fence would never signal.
@@ -3729,7 +3791,9 @@ void retire_slot_locked(int k) {
     g.waiting_slot.store(k, std::memory_order_relaxed);
     const VkResult r = vkWaitForFences(g.device, 1, &sl.fence, VK_TRUE, 10000000000ull);
     g.waiting_slot.store(-1, std::memory_order_relaxed);
-    g.gpu_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    const auto fence_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    g.gpu_us.fetch_add(fence_us);
+    bump(g_stream_stats.fence_ns, static_cast<std::uint64_t>(fence_us) * 1000);
     if (r != VK_SUCCESS) {
         host_log("gpu: waiting for submission %d failed (%d)%s", k, r,
                  r == VK_ERROR_DEVICE_LOST ? "; device lost, GPU execution disabled" : "");
@@ -4488,17 +4552,26 @@ void submit_locked() {
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0,
-                         nullptr);
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     if (g.profile && g.slots[g.slot].span) {
         g.slots[g.slot].tail_gap = g_gap_sites;
         g_gap_sites = {};
         g_in_profiler = true;
-        vkCmdWriteTimestamp(g_cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.slots[g.slot].qpool, kQueriesPerSlot - 1);
+        rec().write_timestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.slots[g.slot].qpool, kQueriesPerSlot - 1);
         g_in_profiler = false;
     }
     busy_end_locked(g.slots[g.slot]);
-    vkEndCommandBuffer(g_cmd());
+    bump(g_stream_stats.submits);
+    // With the stream the recorder ends the command buffer and hands it to
+    // bb-submit (kEndSubmit, below); otherwise the command processor does.
+    const bool streamed = stream_on();
+    if (!streamed) {
+        const VkCommandBuffer cmd = g_cmd();
+        const std::uint64_t t0 = host_clock_monotonic_ns();
+        vkEndCommandBuffer(cmd);
+        bump(g_stream_stats.endbegin_ns, host_clock_monotonic_ns() - t0);
+        bump(g_stream_stats.endbegin_n);
+    }
     g.recording = false;
     // The vertex and index copies this recording's draws read go first.
     const VkCommandBuffer cmds[2] = {shadow_end_uploads_locked(), g.cmd_};
@@ -4524,7 +4597,20 @@ void submit_locked() {
     }();
     if (test_lost && g.ok && hle_video_flip_count() >= test_lost) device_lost_locked("BBHOST_TEST_DEVICE_LOST");
     take_submit_failure_locked();
-    if (g_sub_running) {
+    if (streamed) {
+        stream::EndSubmit es{};
+        es.ncmds = si.commandBufferCount;
+        es.cmds[0] = si.pCommandBuffers[0];
+        if (es.ncmds > 1) es.cmds[1] = si.pCommandBuffers[1];
+        es.items = g.queued;
+        es.wait = bind_sem;
+        es.wait_stage = bind_stage;
+        es.fence = cur.fence;
+        es.serial = cur.serial;
+        busy_submitted_locked(cur);  // before the recorder can hand it over
+        rec().end_submit(es);        // published now: the recorder ends it, bb-submit submits it
+        cur.in_flight = true;
+    } else if (g_sub_running) {
         SubmitJob job;
         job.ncmds = si.commandBufferCount;
         job.cmds[0] = si.pCommandBuffers[0];
@@ -4532,12 +4618,14 @@ void submit_locked() {
         job.wait = bind_sem;
         job.fence = cur.fence;
         job.items = g.queued;
+        job.serial = cur.serial;
         busy_submitted_locked(cur);  // before the thread can submit it
         enqueue_submit(job);
         cur.in_flight = true;
     } else {
         busy_submitted_locked(cur);
         const VkResult r = vkQueueSubmit(g.queue, 1, &si, cur.fence);
+        g_stream_submitted.store(cur.serial + 1, std::memory_order_release);
         if (r != VK_SUCCESS) {
             host_log("gpu: submit of %u items failed (%d)%s", g.queued, r,
                      r == VK_ERROR_DEVICE_LOST ? "; device lost, GPU execution disabled" : "");
@@ -4573,6 +4661,7 @@ void wait_submission_locked(std::uint64_t serial) {
     if (g.completed_submits > serial || serial >= g.flushes) return;
     Gpu::Slot& sl = g.slots[serial % static_cast<std::uint64_t>(g.slot_count)];
     if (!sl.in_flight || sl.serial != serial) return;  // retired, and its slot taken again
+    stream_wait_submitted(serial);                      // its fence has gone to the queue
     const auto t0 = std::chrono::steady_clock::now();
     vkWaitForFences(g.device, 1, &sl.fence, VK_TRUE, 10000000000ull);
     g.gpu_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
@@ -4665,6 +4754,13 @@ void host_gpu_queue_lock_only() { g.queue_mu.lock(); }
 
 std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wait_stage, void* signal, void* fence) {
     if (!g_sub_running) return 0;
+    if (stream_on()) {
+        // Into the stream behind the frame's kEndSubmit: a job given straight
+        // to bb-submit could pass a submission the recorder has not handed
+        // over yet. Published with a fence (R2): this thread recorded it.
+        return kForeignTicket | rec().foreign_submit(static_cast<VkCommandBuffer>(cmd), static_cast<VkSemaphore>(wait), wait_stage,
+                                                     static_cast<VkSemaphore>(signal), static_cast<VkFence>(fence));
+    }
     SubmitJob job;
     job.cmds[0] = static_cast<VkCommandBuffer>(cmd);
     job.ncmds = 1;
@@ -4678,6 +4774,13 @@ std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wai
 void host_gpu_wait_submitted(std::uint64_t ticket) {
     if (!ticket) return;
     std::unique_lock<std::mutex> lk(g_sub_mu);
+    if (ticket & kForeignTicket) {
+        // A kForeignSubmit: once the recorder has replayed up to it and
+        // bb-submit has submitted it. Its publish woke the recorder.
+        const std::uint64_t id = ticket & ~kForeignTicket;
+        g_sub_idle.wait(lk, [id] { return g_foreign_submitted.load(std::memory_order_acquire) >= id; });
+        return;
+    }
     g_sub_idle.wait(lk, [ticket] { return g_sub_submitted.load(std::memory_order_acquire) >= ticket; });
 }
 
@@ -5359,7 +5462,7 @@ void transfer_begin_locked() {
     copy_versions_flush_locked();  // copy-backs still in their copies (BBHOST_COPY_VERSIONS=2) land before this batch
     // Into the open packet when it can take it (a copy token's own).
     DrawCmds* c = DrawCmds::open();
-    if (!c || !c->transfer_begin()) record_transfer_barrier(g_cmd(), true);
+    if (!c || !c->transfer_begin()) rec().transfer_barrier(true);
     g.in_transfer = true;
     g_batch_spans.clear();
     bump(g.transfer_batches);
@@ -5367,7 +5470,7 @@ void transfer_begin_locked() {
 
 // Before a transfer into the open batch that reads src [src_off, +bytes) (no
 // src: a fill) and writes dst [dst_off, +bytes). `in_place`: the caller
-// records it with g_cmd(), not into the open packet; the barrier goes there too.
+// records it through rec(), not into the open packet; the barrier goes there too.
 void transfer_order_locked(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize bytes,
                            bool in_place = false) {
     bool wait = false;
@@ -5380,7 +5483,7 @@ void transfer_order_locked(VkBuffer src, VkDeviceSize src_off, VkBuffer dst, VkD
     }
     if (wait) {
         DrawCmds* c = in_place ? nullptr : DrawCmds::open();
-        if (!c || !c->copy_order()) record_copy_order_barrier(g_cmd());
+        if (!c || !c->copy_order()) rec().copy_order_barrier();
         g_batch_spans.clear();
         g_batch_orders.fetch_add(1, std::memory_order_relaxed);
     }
@@ -5461,16 +5564,16 @@ void flush_deferred_writes_locked() {
             VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
+            rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
                                  nullptr);
             filled.clear();
         }
         std::uint32_t d[2] = {0, 0};
         std::memcpy(d, w.data, w.bytes);
         if (w.bytes == 8 && d[0] == d[1]) {
-            vkCmdFillBuffer(g_cmd(), loc.buffer, loc.offset, 8, d[0]);
+            rec().fill_buffer(loc.buffer, loc.offset, 8, d[0]);
         } else {
-            for (std::uint32_t k = 0; k < w.bytes; k += 4) vkCmdFillBuffer(g_cmd(), loc.buffer, loc.offset + k, 4, d[k / 4]);
+            for (std::uint32_t k = 0; k < w.bytes; k += 4) rec().fill_buffer(loc.buffer, loc.offset + k, 4, d[k / 4]);
         }
         for (std::uint32_t k = 0; k < w.bytes; k += 4) filled.insert(w.va + k);
     }
@@ -5483,7 +5586,7 @@ void transfer_flush_locked() {
     g_batch_spans.clear();
     // Into the open packet when it can take it (a draw's, before its pass).
     DrawCmds* c = DrawCmds::open();
-    if (!c || !c->transfer_end()) record_transfer_barrier(g_cmd(), false);
+    if (!c || !c->transfer_end()) rec().transfer_barrier(false);
 }
 
 void record_transfer_barrier(VkCommandBuffer cmd, bool begin) {
@@ -5663,12 +5766,12 @@ bool host_gpu_mem_write_serial(std::uint64_t va, const void* data, std::size_t b
     std::memcpy(staging.map, data, bytes);
     // Into a packet of the recorder's, as the copy tokens' are.
     std::optional<DrawCmds> own;
-    if (!DrawCmds::open()) own.emplace(!g.profile && !g.has_checkpoints);
+    if (!DrawCmds::open() && !stream_on()) own.emplace(!g.profile && !g.has_checkpoints);  // with the stream, ops of their own
     transfer_begin_locked();
     transfer_order_locked(VK_NULL_HANDLE, 0, loc.buffer, loc.offset, bytes);  // the staging bytes are new: only the destination can clash
     VkBufferCopy region{staging_offset, loc.offset, bytes};
     DrawCmds* c = DrawCmds::open();
-    if (!c || !c->copy_buffer(staging.buffer, loc.buffer, region)) vkCmdCopyBuffer(g_cmd(), staging.buffer, loc.buffer, 1, &region);
+    if (!c || !c->copy_buffer(staging.buffer, loc.buffer, region)) rec().copy_buffer(staging.buffer, loc.buffer, 1, &region);
     transfer_end_locked();
     shadow_written_locked(va, bytes, true);
     note_pending_write_locked(va, static_cast<const std::uint8_t*>(data), bytes);
@@ -5727,7 +5830,7 @@ bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes)
     note_gpu_write_over_marker("fill", va, value, bytes);
     transfer_begin_locked();
     transfer_order_locked(VK_NULL_HANDLE, 0, loc.buffer, loc.offset, bytes, true);
-    vkCmdFillBuffer(g_cmd(), loc.buffer, loc.offset, bytes, value);
+    rec().fill_buffer(loc.buffer, loc.offset, bytes, value);
     transfer_end_locked();
     return true;
 }
@@ -5742,7 +5845,7 @@ bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes) 
     transfer_begin_locked();
     transfer_order_locked(sr.buffer, sr.offset, d.buffer, d.offset, bytes, true);
     VkBufferCopy region{sr.offset, d.offset, bytes};
-    vkCmdCopyBuffer(g_cmd(), sr.buffer, d.buffer, 1, &region);
+    rec().copy_buffer(sr.buffer, d.buffer, 1, &region);
     transfer_end_locked();
     return true;
 }
@@ -5777,7 +5880,7 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
     // in a packet of their own; recorded in place, each waited for the recorder
     // to finish every draw before it (~1.5% of the command processor).
     std::optional<DrawCmds> own;
-    if (!DrawCmds::open()) own.emplace(!g.profile && !g.has_checkpoints);
+    if (!DrawCmds::open() && !stream_on()) own.emplace(!g.profile && !g.has_checkpoints);  // with the stream, ops of their own
     for (std::size_t done = 0; done < bytes;) {
         const Located d = locate(dst + done, bytes - done), s = locate(src + done, bytes - done);
         if (!d.buffer || !s.buffer) return false;
@@ -5788,7 +5891,7 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
         transfer_order_locked(s.buffer, s.offset, d.buffer, d.offset, n);
         VkBufferCopy region{s.offset, d.offset, n};
         DrawCmds* c = DrawCmds::open();
-        if (!c || !c->copy_buffer(s.buffer, d.buffer, region)) vkCmdCopyBuffer(g_cmd(), s.buffer, d.buffer, 1, &region);
+        if (!c || !c->copy_buffer(s.buffer, d.buffer, region)) rec().copy_buffer(s.buffer, d.buffer, 1, &region);
         transfer_end_locked();
         done += n;
     }
@@ -5951,8 +6054,8 @@ void copy_versions_flush_locked() {
     g_cv_lo = ~0ull;
     g_cv_hi = 0;
     std::optional<DrawCmds> own;
-    if (!DrawCmds::open()) own.emplace(!g.profile && !g.has_checkpoints);
-    if (DrawCmds* c = DrawCmds::open(); !c || !c->transfer_begin()) record_transfer_barrier(g_cmd(), true);
+    if (!DrawCmds::open() && !stream_on()) own.emplace(!g.profile && !g.has_checkpoints);  // with the stream, ops of their own
+    if (DrawCmds* c = DrawCmds::open(); !c || !c->transfer_begin()) rec().transfer_barrier(true);
     // Newest first, each byte from the newest version that has it: copies in
     // one batch run in any order, and a range GX copied back twice since the
     // last batch (most of them, a constant buffer a draw) was two writes of
@@ -5967,7 +6070,7 @@ void copy_versions_flush_locked() {
         auto copy_piece = [&](std::uint64_t lo, std::uint64_t hi) {
             const VkBufferCopy region{v.offset + (lo - v.dst), v.canon.offset + (lo - v.dst), hi - lo};
             DrawCmds* c = DrawCmds::open();
-            if (!c || !c->copy_buffer(v.copy.buffer, v.canon.buffer, region)) vkCmdCopyBuffer(g_cmd(), v.copy.buffer, v.canon.buffer, 1, &region);
+            if (!c || !c->copy_buffer(v.copy.buffer, v.canon.buffer, region)) rec().copy_buffer(v.copy.buffer, v.canon.buffer, 1, &region);
             transfer_end_locked();
             ++copies;
         };
@@ -5993,7 +6096,7 @@ void copy_versions_flush_locked() {
         covered.emplace(lo, hi);
     }
     g_cv_overwritten.fetch_add(pending.size() > copies ? pending.size() - copies : 0, std::memory_order_relaxed);
-    if (DrawCmds* c = DrawCmds::open(); !c || !c->transfer_end()) record_transfer_barrier(g_cmd(), false);
+    if (DrawCmds* c = DrawCmds::open(); !c || !c->transfer_end()) rec().transfer_barrier(false);
     g_cv_batches.fetch_add(1, std::memory_order_relaxed);
     g_cv_copies.fetch_add(copies, std::memory_order_relaxed);
 }
@@ -6042,7 +6145,10 @@ std::uint64_t host_gpu_submissions_completed() {
     if (!g.ok) return ~0ull;  // nothing more will run: nothing to wait for
     std::uint64_t done = g.completed_submits;
     for (const Gpu::Slot& sl : g.slots) {
-        if (sl.in_flight && sl.serial + 1 > done && vkGetFenceStatus(g.device, sl.fence) == VK_SUCCESS) done = sl.serial + 1;
+        // Only a fence already submitted (bb-submit may be submitting it now).
+        if (sl.in_flight && sl.serial + 1 > done && sl.serial < stream_submitted_serial() && vkGetFenceStatus(g.device, sl.fence) == VK_SUCCESS) {
+            done = sl.serial + 1;
+        }
     }
     return done;
 }
