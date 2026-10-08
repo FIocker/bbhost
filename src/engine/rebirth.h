@@ -11,8 +11,14 @@
 // behind the player's own overlay; the host's half of its handshake runs once a
 // frame. Off, the altar is the game's.
 
+#include <string>
+
 struct ElfImage;
 
 void rebirth_install(ElfImage* image);
-// Once a frame on the game's main thread (engine/frame_rate.cpp).
+// Once a frame on the game's main thread (engine/frame_rate.cpp). Outside
+// the altar's map it only reads where the hunter is.
 void rebirth_tick();
+// For the 300-flip report: the frames since the last call that read the
+// altar's flags and that did not; empty when there were none.
+std::string rebirth_report();

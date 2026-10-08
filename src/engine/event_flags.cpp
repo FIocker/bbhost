@@ -59,6 +59,27 @@ bool event_flag_get(std::uint32_t id, bool* value) {
     return true;
 }
 
+bool event_flags_get(const std::uint32_t* ids, std::size_t n, bool* out) {
+    const std::uint64_t man = manager();
+    std::uint32_t size = 0;
+    if (!man || !Safe{}(man + sprj_event_flag::kBlockSize, &size) || !size) return false;
+    std::uint32_t walked = 0;
+    std::uint64_t data = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        // As sprj_event_flag::locate splits an id, with the block's storage
+        // found once for the ids that share it.
+        const std::uint32_t block = ids[i] / size, bit = ids[i] - block * size;
+        if (i == 0 || block != walked) {
+            data = sprj_event_flag::block_data(man, block, Safe{});
+            walked = block;
+        }
+        std::uint8_t v = 0;
+        if (!data || !Safe{}(data + (bit >> 3), &v)) return false;
+        out[i] = (v & sprj_event_flag::mask_of(bit)) != 0;
+    }
+    return true;
+}
+
 bool event_flag_set(std::uint32_t id, bool value) {
     const std::uint64_t man = manager();
     std::uint64_t byte = 0;

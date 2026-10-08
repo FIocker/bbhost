@@ -95,6 +95,17 @@ void five_players_install(ElfImage* image) {
         host_log("five players: rewrote %d of %zu maps' maiden events in %s", made, maiden_event_maps().size(),
                  out.string().c_str());
     }
+    // Mounted only with a script in it: a dump whose scripts are not the 1.09
+    // ones leaves the folder empty, and an overlay with nothing to serve was
+    // one more folder every file the game opened was looked for in.
+    std::size_t scripts = 0;
+    for (const MaidenEventMap& m : maiden_event_maps()) scripts += fs::exists(out / script_path(m.map)) ? 1 : 0;
+    if (!scripts) {
+        host_log("five players: off - no map's maiden events could be rewritten from this dump; the maidens are the game's");
+        return;
+    }
     hle_fs_add_generated_root(out.string().c_str());
-    host_log("five players: Mensis, Mergo's Loft, the Nightmare Frontier and the Old Hunters' areas hold two invaders");
+    host_log("five players: Mensis, Mergo's Loft, the Nightmare Frontier and the Old Hunters' areas hold two invaders "
+             "(%zu of %zu maps' scripts)",
+             scripts, maiden_event_maps().size());
 }

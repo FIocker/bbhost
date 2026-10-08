@@ -3,6 +3,7 @@
 #include "core/write_watch.h"
 #include "hle/common.h"
 #include "host/frame_stats.h"
+#include "core/portable.h"
 #include "hle/platform.h"
 
 #include <algorithm>
@@ -17,6 +18,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifndef EISDIR
@@ -69,11 +71,35 @@ std::string g_tmp;
 // against - and a modification set kept on its own is reviewable on its own.
 // Empty when there is no such directory.
 std::string g_mods;
+// The host's generated overlays are written at start, before they are
+// mounted, and nothing writes them after (engine/menu_assets.h, and the PC
+// enhancements' engine/change_appearance.h, rebirth.h, five_players.h). So
+// each is listed once as it is mounted, and a path it does not have passes it
+// by without touching the disk. Probing one cost a stat per path component
+// from the data folder down until one was missing, and one more for the file:
+// on Windows ~11 us a stat of a directory that is there and ~40 us of a path
+// that is not, so ~0.1 ms a layer on every /app0 open and stat - and with the
+// three PC enhancements on there are four such layers (the menus' and one
+// each), ~0.4 ms on every file the game asked for, its main loop's included,
+// for a handful of files in three maps. A path the index has is resolved on
+// disk exactly as before. BBHOST_FS_OVERLAY_INDEX=0: every layer probed on
+// disk for every path, as before.
+struct OverlayIndex {
+    bool valid = false;                     // listed; false: probe the disk
+    std::unordered_set<std::string> paths;  // files and directories: lowercase, '/'-separated, from the layer
+};
+const bool g_overlay_index_on = [] {
+    const char* e = std::getenv("BBHOST_FS_OVERLAY_INDEX");
+    return !(e && e[0] == '0');
+}();
+std::atomic<std::uint64_t> g_app0_lookups{0}, g_overlay_probes{0}, g_overlay_skips{0};
 std::string g_generated;  // hle_fs_set_generated_root
+OverlayIndex g_generated_index;
 // hle_fs_add_generated_root: fixed slots published by the count, as the
 // plugins' layers are.
 constexpr int kMaxGeneratedLayers = 4;
 std::array<std::string, kMaxGeneratedLayers> g_generated_more;
+std::array<OverlayIndex, kMaxGeneratedLayers> g_generated_more_index;
 std::atomic<int> g_generated_more_count{0};
 // The plugins' overlays (hle_fs_add_plugin_overlay), between mods and
 // generated. A plugin's first write can come while the game's file threads
@@ -87,17 +113,48 @@ std::mutex g_plugin_layer_mu;  // writers
 
 // The overlays in the order a read tries them: the player's mods, the
 // plugins' (in the order they were added), then the host's generated files.
+// The player's and the plugins' are read from disk every time (a plugin
+// writes its own while the game runs); the generated ones carry their index.
+struct OverlayLayer {
+    const std::string* dir;
+    const OverlayIndex* index;  // null: no index, probe the disk
+};
 thread_local bool t_without_plugins = false;  // hle_fs_map_path_base
-std::vector<const std::string*> overlay_layers() {
-    std::vector<const std::string*> v{&g_mods};
+std::vector<OverlayLayer> overlay_layers() {
+    std::vector<OverlayLayer> v{{&g_mods, nullptr}};
     if (!t_without_plugins) {
         const int n = g_plugin_layer_count.load(std::memory_order_acquire);
-        for (int i = 0; i < n; ++i) v.push_back(&g_plugin_layers[static_cast<std::size_t>(i)]);
+        for (int i = 0; i < n; ++i) v.push_back({&g_plugin_layers[static_cast<std::size_t>(i)], nullptr});
     }
-    v.push_back(&g_generated);
+    v.push_back({&g_generated, &g_generated_index});
     const int n = g_generated_more_count.load(std::memory_order_acquire);
-    for (int i = 0; i < n; ++i) v.push_back(&g_generated_more[static_cast<std::size_t>(i)]);
+    for (int i = 0; i < n; ++i) {
+        v.push_back({&g_generated_more[static_cast<std::size_t>(i)], &g_generated_more_index[static_cast<std::size_t>(i)]});
+    }
     return v;
+}
+
+// The index's key for a path relative to a layer: lowercase (the game's file
+// systems ignore case, and the generated files' names are lowercase),
+// '/'-separated, without empty or "." components. False when it has a ".."
+// - the disk decides those.
+bool overlay_key(const std::string& rest, std::string* key) {
+    key->clear();
+    std::size_t pos = 0;
+    while (pos <= rest.size()) {
+        std::size_t end = rest.find_first_of("/\\", pos);
+        if (end == std::string::npos) end = rest.size();
+        const std::size_t len = end - pos;
+        if (len == 2 && rest.compare(pos, 2, "..") == 0) return false;
+        if (len && !(len == 1 && rest[pos] == '.')) {
+            if (!key->empty()) key->push_back('/');
+            for (std::size_t i = pos; i < end; ++i) {
+                key->push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(rest[i]))));
+            }
+        }
+        pos = end + 1;
+    }
+    return !key->empty();
 }
 std::atomic<int> g_mod_hits{0};
 
@@ -545,9 +602,24 @@ std::string guest_to_host(const char* guest) {
     // The overlay shadows the dump and only the dump: a save or a temp file
     // still goes where it belongs. A path that is not in the overlay falls
     // through untouched, so a run without one behaves exactly as before.
-    for (const std::string* layer : overlay_layers()) {
-        if (mounted || root != g_app0 || rest.empty()) break;
+    // A generated layer's index answers for it when it does not have the path
+    // (OverlayIndex): no disk access for the layers the PC enhancements add.
+    const bool app0_lookup = !mounted && root == g_app0 && !rest.empty();
+    if (app0_lookup) g_app0_lookups.fetch_add(1, std::memory_order_relaxed);
+    std::string key;
+    int key_state = 0;  // 0 not made yet, 1 made, -1 none (the disk decides)
+    for (const OverlayLayer& layer_of : overlay_layers()) {
+        if (!app0_lookup) break;
+        const std::string* layer = layer_of.dir;
         if (layer->empty()) continue;
+        if (g_overlay_index_on && layer_of.index && layer_of.index->valid) {
+            if (key_state == 0) key_state = overlay_key(rest, &key) ? 1 : -1;
+            if (key_state == 1 && layer_of.index->paths.count(key) == 0) {
+                g_overlay_skips.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+        }
+        if (layer_of.index) g_overlay_probes.fetch_add(1, std::memory_order_relaxed);
         std::string over = confine(join_path(*layer, rest));
         if (!over.empty() && !path_exists(over.c_str())) {
             const std::string ci = resolve_nocase(*layer, rest);
@@ -1240,12 +1312,53 @@ std::string hle_fs_game_file(const std::string& rel) {
     }
     return join_path(g_app0, r);
 }
+
+namespace {
+
+// A generated layer's files and directories, listed once as it is mounted
+// (OverlayIndex). A layer too deep or too large to list (not one the host
+// makes) is left without an index, and probed on disk as before.
+void index_layer(const std::string& dir, OverlayIndex& idx) {
+    idx.paths.clear();
+    idx.valid = false;
+    if (!g_overlay_index_on) return;
+    std::vector<std::pair<std::string, int>> todo{{std::string(), 0}};  // relative directory, depth
+    std::vector<std::string> names;
+    while (!todo.empty()) {
+        const auto [rel, depth] = todo.back();
+        todo.pop_back();
+        if (depth > 16 || !host_list_dir(join_path(dir, rel).c_str(), &names)) return;
+        for (const std::string& name : names) {
+            const std::string child = rel.empty() ? name : rel + "/" + name;
+            std::string key;
+            if (!overlay_key(child, &key)) return;
+            idx.paths.insert(key);
+            if (idx.paths.size() > 65536) return;
+            if (is_dir_path(join_path(dir, child).c_str())) todo.emplace_back(child, depth + 1);
+        }
+    }
+    idx.valid = true;
+}
+
+void log_generated_layer(const std::string& d, const OverlayIndex& idx) {
+    if (idx.valid) {
+        host_log("FS generated overlay=%s (behind the mods overlay; %zu files and folders, indexed: a path it does not have "
+                 "passes it by without a disk lookup)",
+                 d.c_str(), idx.paths.size());
+    } else {
+        host_log("FS generated overlay=%s (behind the mods overlay)", d.c_str());
+    }
+}
+
+}  // namespace
+
 void hle_fs_set_generated_root(const char* dir) {
     g_generated = dir && *dir && is_dir_path(dir) ? canonical_dir(dir) : std::string();
     if (!g_generated.empty()) {
         // Under <data>, which is already an allowed root; listed for confine() all the same.
         g_allowed_roots.push_back(g_generated);
-        host_log("FS generated overlay=%s (behind the mods overlay)", g_generated.c_str());
+        index_layer(g_generated, g_generated_index);
+        log_generated_layer(g_generated, g_generated_index);
     }
 }
 void hle_fs_add_generated_root(const char* dir) {
@@ -1254,9 +1367,28 @@ void hle_fs_add_generated_root(const char* dir) {
     if (n >= kMaxGeneratedLayers) return;
     const std::string d = canonical_dir(dir);
     g_generated_more[static_cast<std::size_t>(n)] = d;
+    index_layer(d, g_generated_more_index[static_cast<std::size_t>(n)]);  // before it is published
     g_allowed_roots.push_back(d);
     g_generated_more_count.store(n + 1, std::memory_order_release);
-    host_log("FS generated overlay=%s (behind the mods overlay)", d.c_str());
+    log_generated_layer(d, g_generated_more_index[static_cast<std::size_t>(n)]);
+}
+std::string hle_fs_overlay_report() {
+    static std::uint64_t last_lookups = 0, last_probes = 0, last_skips = 0;
+    const std::uint64_t lookups = g_app0_lookups.load(std::memory_order_relaxed);
+    const std::uint64_t probes = g_overlay_probes.load(std::memory_order_relaxed);
+    const std::uint64_t skips = g_overlay_skips.load(std::memory_order_relaxed);
+    if (lookups == last_lookups) return {};
+    char buf[256];
+    std::snprintf(buf, sizeof(buf),
+                  "fs: %llu /app0 lookups; the generated overlays probed on disk %llu times, passed by through their index %llu "
+                  "(total %llu, %llu, %llu)",
+                  static_cast<unsigned long long>(lookups - last_lookups), static_cast<unsigned long long>(probes - last_probes),
+                  static_cast<unsigned long long>(skips - last_skips), static_cast<unsigned long long>(lookups),
+                  static_cast<unsigned long long>(probes), static_cast<unsigned long long>(skips));
+    last_lookups = lookups;
+    last_probes = probes;
+    last_skips = skips;
+    return buf;
 }
 void hle_fs_add_plugin_overlay(const char* dir) {
     if (!dir || !*dir || !is_dir_path(dir)) return;
@@ -1275,7 +1407,8 @@ void hle_fs_add_plugin_overlay(const char* dir) {
     host_log("FS plugin overlay=%s (behind the mods overlay)", d.c_str());
 }
 std::string hle_fs_overlay_file(const char* rel) {
-    for (const std::string* layer : overlay_layers()) {
+    for (const OverlayLayer& layer_of : overlay_layers()) {
+        const std::string* layer = layer_of.dir;
         if (layer->empty() || !rel) continue;
         const std::string p = join_path(*layer, rel[0] == '/' ? rel + 1 : rel);
         if (path_exists(p.c_str())) return p;

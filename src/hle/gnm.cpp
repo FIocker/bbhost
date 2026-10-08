@@ -1,7 +1,10 @@
 #include "hle/common.h"
 
 #include "core/portable.h"
+#include "engine/graphics_patch.h"
+#include "engine/rebirth.h"
 #include "hle/equeue.h"
+#include "hle/fs.h"
 #include "hle/hle.h"
 #include "core/imports.h"
 #include "hle/modules.h"
@@ -514,6 +517,12 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         if (const std::string r = host_gpu_recorder_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_image_heap_report(); !r.empty()) host_log("  %s", r.c_str());
         if (const std::string r = host_gpu_memory_budget_report(); !r.empty()) host_log("  %s", r.c_str());
+        // What the PC enhancements and Bloom cost in these flips: the file
+        // lookups that passed the generated overlays by, the frames that read
+        // the altar's flags, the views that drew YEBIS's glare.
+        if (const std::string r = hle_fs_overlay_report(); !r.empty()) host_log("  %s", r.c_str());
+        if (const std::string r = rebirth_report(); !r.empty()) host_log("  %s", r.c_str());
+        if (const std::string r = graphics_glare_report(); !r.empty()) host_log("  %s", r.c_str());
         static const bool count_calls = std::getenv("BBHOST_HLE_COUNT") != nullptr;
         if (count_calls) hle_call_counts_report();
         last = now;
