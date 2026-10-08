@@ -36,6 +36,7 @@ out=build/perf
 mkdir -p "$out/data" "$out/cfg"
 rm -rf "$out/data/saves"
 cp -r "$saves" "$out/data/saves"
+wm=""; [ -n "${PERF_FULLSCREEN:-}" ] && wm='window_mode = "Fullscreen"'
 cat > "$out/cfg/bbhost.toml" <<TOML
 [paths]
 app0 = "$app0"
@@ -49,6 +50,7 @@ ime = "auto"
 width = 1920
 height = 1080
 fps_cap = 60
+$wm
 [startup]
 skip_intro = true
 setup_window = false
@@ -62,6 +64,7 @@ rm -f "$out/data/bbhost/gpu-device-lost.txt" "$out/$NAME.perfmon"
 taps="20:cross,25:cross,30:cross,35:cross,40:cross,45:cross,50:cross"
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/win/perfmon.ps1 -Name bbhost -Seconds "$secs" -Out "$root/$out/$NAME.perfmon" > /dev/null 2>&1 &
 mon=$!
+[ -n "${PERF_FULLSCREEN:-}" ] && { PERF_HEADLESS=0; powershell -NoProfile -ExecutionPolicy Bypass -File tools/win/keep_focus.ps1 -Name bbhost -Seconds "$((secs + 60))" > /dev/null 2>&1 & }
 uncap=()
 [ "${PERF_UNCAPPED:-1}" = 1 ] && uncap=(BBHOST_UNCAP=1 BBHOST_BENCH_UNCAPPED=1)
 env BBHOST_CONFIG_DIR="$root/$out/cfg" BBHOST_SETUP_WINDOW=0 BBHOST_NO_GAMEPAD=1 BBHOST_SKIP_INTRO=1 \
