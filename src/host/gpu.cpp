@@ -5,6 +5,7 @@
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
 #include "host/translation_cache.h"
+#include "bbhost_build_id.h"
 
 #include "gcn/container.h"
 #include "gcn/half.h"
@@ -987,6 +988,47 @@ std::string translation_cache_path() {
     std::string path = pipeline_cache_path();
     if (path.empty()) return path;
     return path.substr(0, path.rfind('/') + 1) + "translation-cache.bin";
+}
+
+// The shader caches belong to the build that made them. A translation is keyed
+// by the translator's sources and the options hash_options names, a pipeline
+// by the driver - neither by the rest of the host, so a change there (a lift,
+// an option missing from the key) would leave the next build running the last
+// one's shaders. A build other than the one named in
+// <data root>/bbhost/shader-cache-build.txt starts both empty. The stage
+// manifest stays: it holds the guest's inputs, which the running build
+// translates again on the precompile workers, filling the caches before the
+// title. BBHOST_KEEP_SHADER_CACHE=1 keeps them across builds.
+static void shader_caches_check_build() {
+    const std::string pipelines = pipeline_cache_path();
+    if (pipelines.empty()) return;
+    const std::string dir = pipelines.substr(0, pipelines.rfind('/') + 1);
+    const std::string stamp = dir + "shader-cache-build.txt";
+    const std::string ours = BBHOST_BUILD_ID;
+    std::string theirs;
+    {
+        std::ifstream in(stamp);
+        std::getline(in, theirs);
+    }
+    if (theirs == ours) return;
+    std::error_code ec;
+    if (const char* e = std::getenv("BBHOST_KEEP_SHADER_CACHE"); e && e[0] == '1') {
+        host_log("gpu: shader caches made by %s kept for %s (BBHOST_KEEP_SHADER_CACHE=1)", theirs.empty() ? "an earlier build" : theirs.c_str(),
+                 ours.c_str());
+    } else {
+        std::uintmax_t freed = 0;
+        int removed = 0;
+        for (const std::string& path : {pipelines, translation_cache_path()}) {
+            const std::uintmax_t bytes = std::filesystem::file_size(path, ec);
+            if (ec) continue;
+            if (std::filesystem::remove(path, ec)) freed += bytes, ++removed;
+        }
+        if (removed)
+            host_log("gpu: shader caches made by %s, this is %s: cleared (%.1f MiB); the precompile builds them again", theirs.empty() ? "an earlier build" : theirs.c_str(),
+                     ours.c_str(), freed / 1048576.0);
+    }
+    std::filesystem::create_directories(dir, ec);
+    std::ofstream(stamp, std::ios::trunc) << ours << '\n';
 }
 
 // Rebuild the guest page tables when the mapping list changed.
@@ -2213,7 +2255,9 @@ bool init_locked() {
     occlusion_device_ready_locked();
     // The pipeline cache persists under the data root, so a later run creates
     // the pipelines this one compiled without the driver compiling them again.
-    // The driver ignores data from another device or driver version.
+    // The driver ignores data from another device or driver version; another
+    // build of bbhost throws it away itself (and its translations with it).
+    shader_caches_check_build();
     std::vector<char> cache_data;
     if (const std::string path = pipeline_cache_path(); !path.empty()) {
         std::ifstream in(path, std::ios::binary);
