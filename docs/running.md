@@ -163,7 +163,9 @@ The English is `plugins/debug_menu/strings_en.tsv`: each string's address in the
 `tools/debug_menu_strings.py list` shows the Japanese beside it from your own
 eboot, `missing` what has no English yet, and `check` tests every row (the
 hash, the printf conversions, the font). Corrections are welcome as pull
-requests.
+requests. A few strings keep the developers' text because the game looks them
+up by name - the names the character scripts call the game's functions by, for
+one - and `check` refuses a row for any of them.
 
 The menu draws with a debug font the game does not ship. The plugin makes one
 from the public-domain X11 fonts k14 and 7x14, so nothing has to be
