@@ -1498,6 +1498,15 @@ bool init_locked() {
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "bbhost";
     app.apiVersion = VK_API_VERSION_1_3;
+    // BBHOST_VK_APP_NAME / BBHOST_VK_ENGINE_NAME: the names the driver is
+    // told (bbhost, and no engine, otherwise). A driver may pick a profile of
+    // its own by them as well as by the executable's name; an A/B for what it
+    // does differently with a name it knows.
+    if (const char* e = std::getenv("BBHOST_VK_APP_NAME"); e && *e) app.pApplicationName = e;
+    if (const char* e = std::getenv("BBHOST_VK_ENGINE_NAME"); e && *e) app.pEngineName = e;
+    if (std::getenv("BBHOST_VK_APP_NAME") || std::getenv("BBHOST_VK_ENGINE_NAME"))
+        host_log("gpu: the Vulkan instance says application \"%s\", engine \"%s\" (BBHOST_VK_APP_NAME, BBHOST_VK_ENGINE_NAME)",
+                 app.pApplicationName, app.pEngineName ? app.pEngineName : "");
     std::vector<const char*> iext;
     for (const std::string& e : g_instance_exts) iext.push_back(e.c_str());
     std::vector<const char*> layers;
@@ -1706,11 +1715,20 @@ bool init_locked() {
     // A second queue, when the family has one, is the presenter's: a present
     // can block (in the window system's copy, or on a full FIFO), and on the
     // renderer's queue it would have to hold the renderer's lock while it did.
+    // BBHOST_VK_QUEUES=1: the one queue only, the presents on the renderer's
+    // queue under its lock - as shadPS4 and vkcube make their devices. An A/B
+    // for what Windows' per-process GPU counters see of a program that
+    // presents from a queue of its own; it costs the command processor the present's blocking.
     const float prio[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = g.family;
+    const char* one_queue = std::getenv("BBHOST_VK_QUEUES");
+    if (one_queue && one_queue[0] == '1') g.family_queues = 1;
     qci.queueCount = g.family_queues >= 2 ? 2 : 1;
     qci.pQueuePriorities = prio;
+    host_log("gpu: queue family %u (%u queues): %u queue%s, priority 1.0%s", g.family, usable[static_cast<std::size_t>(chosen)].queues,
+             qci.queueCount, qci.queueCount == 2 ? "s - the second the presenter's" : ", the presents on it too",
+             one_queue && one_queue[0] == '1' ? " (BBHOST_VK_QUEUES=1)" : "");
     std::vector<const char*> dext = {"VK_EXT_external_memory_host"};
     if (g.has_maint8) dext.push_back("VK_KHR_maintenance8");
     if (g.has_push_descriptor) dext.push_back("VK_KHR_push_descriptor");
@@ -2026,6 +2044,7 @@ bool init_locked() {
             }
         }
     }
+    busy_init_locked();
     g.cmd_ = g.slots[0].cmd;
     g.fence = g.slots[0].fence;
     // The pipeline cache persists under the data root, so a later run creates
@@ -2258,6 +2277,7 @@ void begin_recording_locked() {
         vkBeginCommandBuffer(g_cmd(), &bi);
         ++g.record_serial;  // dynamic state recorded so far is gone
         g.recording = true;
+        busy_begin_locked(g.slots[g.slot]);
         glitch_begin_recording_locked();
         if (g.profile) {
             Gpu::Slot& sl = g.slots[g.slot];
@@ -3260,6 +3280,7 @@ void retire_slot_locked(int k) {
         QueueGuard queue;
         vkDeviceWaitIdle(g.device);
         sl.in_flight = false;
+        busy_retired_locked(sl, false);
         return;
     }
     const auto t0 = std::chrono::steady_clock::now();
@@ -3315,6 +3336,7 @@ void retire_slot_locked(int k) {
         it = it->second.serial < g.completed_submits ? g.pending_writes.erase(it) : std::next(it);
     }
     collect_profile_locked(sl);
+    busy_retired_locked(sl, r == VK_SUCCESS);
     glitch_slot_done_locked(sl);
     textures_retired(k);
 }
@@ -4031,6 +4053,7 @@ void submit_locked() {
         vkCmdWriteTimestamp(g_cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.slots[g.slot].qpool, kQueriesPerSlot - 1);
         g_in_profiler = false;
     }
+    busy_end_locked(g.slots[g.slot]);
     vkEndCommandBuffer(g_cmd());
     g.recording = false;
     // The vertex and index copies this recording's draws read go first.
@@ -4065,15 +4088,18 @@ void submit_locked() {
         job.wait = bind_sem;
         job.fence = cur.fence;
         job.items = g.queued;
+        busy_submitted_locked(cur);  // before the thread can submit it
         enqueue_submit(job);
         cur.in_flight = true;
     } else {
+        busy_submitted_locked(cur);
         const VkResult r = vkQueueSubmit(g.queue, 1, &si, cur.fence);
         if (r != VK_SUCCESS) {
             host_log("gpu: submit of %u items failed (%d)%s", g.queued, r,
                      r == VK_ERROR_DEVICE_LOST ? "; device lost, GPU execution disabled" : "");
             g.failures.fetch_add(g.queued);
             if (r == VK_ERROR_DEVICE_LOST) device_lost_locked("a submit");
+            busy_retired_locked(cur, false);  // it never went in
         } else {
             cur.in_flight = true;
         }
@@ -5558,6 +5584,7 @@ void host_gpu_report() {
              static_cast<unsigned long long>(g.failures.load()), static_cast<unsigned long long>(g.translated.load()),
              static_cast<unsigned long long>(g.gfx_pipelines.load()), static_cast<unsigned long long>(g.dummy_images.load()),
              static_cast<unsigned long long>(g.gpu_us.load() / 1000));
+    if (const std::string busy = busy_exit_report(); !busy.empty()) host_log("%s", busy.c_str());
     if (g.draw_failures.load()) {
         static const char* const why[kFailCount] = {"tessellation off",  "tessellation plan",  "tessellation LS pass",
                                                     "primitive type",    "no vertex shader",   "vertex shader",

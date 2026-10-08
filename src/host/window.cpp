@@ -13,6 +13,7 @@
 #include "host/overlay.h"
 #include "host/ingame_menu.h"
 #include "host/audio.h"
+#include "host/foreign_hooks.h"
 #include "host/gpu.h"
 #include "log.h"
 #if !defined(_WIN32)
@@ -321,9 +322,21 @@ bool vk_create_swapchain() {
     vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.phys, g_vk.surface, &nfmt, nullptr);
     std::vector<VkSurfaceFormatKHR> fmts(nfmt);
     vkGetPhysicalDeviceSurfaceFormatsKHR(g_vk.phys, g_vk.surface, &nfmt, fmts.data());
+    // B8G8R8A8 where the surface lists it. BBHOST_SWAPCHAIN_FORMAT=rgba8:
+    // R8G8B8A8 instead, as shadPS4 makes its swapchain - with the other
+    // swapchain switches below, an A/B for the path the driver takes to the
+    // screen (host/gpu_busy.cpp). The blit converts,
+    // and the overlay's and FSR's targets follow the format.
+    static const VkFormat wanted = [] {
+        const char* e = std::getenv("BBHOST_SWAPCHAIN_FORMAT");
+        const std::string v = e ? e : "";
+        if (v == "rgba8") return VK_FORMAT_R8G8B8A8_UNORM;
+        if (!v.empty() && v != "bgra8") host_log("present: BBHOST_SWAPCHAIN_FORMAT=%s is not rgba8 or bgra8; ignored", v.c_str());
+        return VK_FORMAT_B8G8R8A8_UNORM;
+    }();
     g_vk.format = fmts.empty() ? VK_FORMAT_B8G8R8A8_UNORM : fmts[0].format;
     for (const auto& f : fmts) {
-        if (f.format == VK_FORMAT_B8G8R8A8_UNORM) {
+        if (f.format == wanted && f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             g_vk.format = f.format;
         }
     }
@@ -367,32 +380,88 @@ bool vk_create_swapchain() {
     // FIFO is the only mode a surface must support, so V-Sync off falls back
     // to it rather than failing to create the swapchain.
     sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    std::uint32_t nmodes = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, nullptr);
+    std::vector<VkPresentModeKHR> modes(nmodes);
+    if (nmodes) vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, modes.data());
+    const auto surface_has = [&](VkPresentModeKHR m) { return std::find(modes.begin(), modes.end(), m) != modes.end(); };
     if (!g_want_vsync.load()) {
-        std::uint32_t nmodes = 0;
-        vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, nullptr);
-        std::vector<VkPresentModeKHR> modes(nmodes);
-        vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, modes.data());
         for (VkPresentModeKHR want : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR}) {
-            for (VkPresentModeKHR have : modes) {
-                if (have == want) {
-                    sci.presentMode = want;
-                    break;
-                }
-            }
-            if (sci.presentMode != VK_PRESENT_MODE_FIFO_KHR) {
+            if (surface_has(want)) {
+                sci.presentMode = want;
                 break;
             }
         }
     }
+    // BBHOST_PRESENT_MODE=fifo|relaxed|mailbox|immediate: that mode, where the
+    // surface has it, whatever V-Sync says. With BBHOST_SWAPCHAIN_FORMAT=rgba8
+    // and BBHOST_FSR_DIRECT=0 (no storage usage) it makes the swapchain
+    // shadPS4 makes (immediate, R8G8B8A8, transfer and colour usage), for
+    // comparing the way the frames go to the screen: on AMD's Windows driver
+    // only the copy and video engines' time reaches Windows' per-process
+    // counters (host/gpu_busy.cpp), so the present's own path is what Task
+    // Manager can show of a Vulkan program there.
+    static const VkPresentModeKHR forced = [] {
+        const char* e = std::getenv("BBHOST_PRESENT_MODE");
+        const std::string v = e ? e : "";
+        if (v == "fifo") return VK_PRESENT_MODE_FIFO_KHR;
+        if (v == "relaxed") return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+        if (v == "mailbox") return VK_PRESENT_MODE_MAILBOX_KHR;
+        if (v == "immediate") return VK_PRESENT_MODE_IMMEDIATE_KHR;
+        if (!v.empty()) host_log("present: BBHOST_PRESENT_MODE=%s is not fifo, relaxed, mailbox or immediate; ignored", v.c_str());
+        return VK_PRESENT_MODE_MAX_ENUM_KHR;
+    }();
+    if (forced != VK_PRESENT_MODE_MAX_ENUM_KHR) {
+        if (surface_has(forced)) {
+            sci.presentMode = forced;
+        } else {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) host_log("present: BBHOST_PRESENT_MODE: the surface has no such mode; kept the usual one");
+        }
+    }
     sci.clipped = VK_TRUE;
     sci.oldSwapchain = old;
+    // Windows' graphics modules before and after: a driver that presents
+    // through DXGI (a D3D12 queue of its own copying our images into a DXGI
+    // swapchain) loads d3d12.dll inside vkCreateSwapchainKHR, as happened in
+    // shadPS4 on the Radeon 8060S (ReShade's log there, 2026-10-07).
+    [[maybe_unused]] const std::string modules_before = host_graphics_modules();
     if (vkCreateSwapchainKHR(g_vk.device, &sci, nullptr, &g_vk.swapchain) != VK_SUCCESS) {
         host_log("vulkan: swapchain creation failed");
         return false;
     }
+    [[maybe_unused]] const std::string modules_after = host_graphics_modules();
     if (old) {
         vkDestroySwapchainKHR(g_vk.device, old, nullptr);
         host_log("present: swapchain %ux%u", g_vk.extent.width, g_vk.extent.height);
+    }
+    {
+        // Which way the frames go to the screen, each time it is made.
+        const auto mode_name = [](VkPresentModeKHR m) -> const char* {
+            switch (m) {
+                case VK_PRESENT_MODE_IMMEDIATE_KHR: return "immediate";
+                case VK_PRESENT_MODE_MAILBOX_KHR: return "mailbox";
+                case VK_PRESENT_MODE_FIFO_KHR: return "fifo";
+                case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "fifo-relaxed";
+                default: return "other";
+            }
+        };
+        std::string have;
+        for (VkPresentModeKHR m : modes) have += std::string(have.empty() ? "" : " ") + mode_name(m);
+        host_log("present: mode %s%s (the surface has: %s), %s, %s, %u images, usage 0x%x%s", mode_name(sci.presentMode),
+                 sci.presentMode == forced ? " (BBHOST_PRESENT_MODE)" : "", have.c_str(),
+                 g_want_fullscreen.load() ? "fullscreen" : "windowed",
+                 sci.imageFormat == VK_FORMAT_R8G8B8A8_UNORM   ? "R8G8B8A8"
+                 : sci.imageFormat == VK_FORMAT_B8G8R8A8_UNORM ? "B8G8R8A8"
+                                                               : "another format",
+                 sci.minImageCount, static_cast<unsigned>(sci.imageUsage),
+                 g_vk.storage ? " (storage: FSR writes the images; BBHOST_FSR_DIRECT=0 not)" : "");
+#if defined(_WIN32)
+        const bool via_dxgi = modules_after.find("d3d12.dll") != std::string::npos && modules_before.find("d3d12.dll") == std::string::npos;
+        host_log("present: Windows' graphics modules: %s before the swapchain, %s after%s",
+                 modules_before.empty() ? "none" : modules_before.c_str(), modules_after.empty() ? "none" : modules_after.c_str(),
+                 via_dxgi ? " - the driver presents through DXGI" : "");
+#endif
     }
     g_swap_w.store(g_vk.extent.width, std::memory_order_relaxed);
     g_swap_h.store(g_vk.extent.height, std::memory_order_relaxed);
@@ -533,6 +602,7 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     // processor - the game's own thread - for most of a frame.
     present_step("waiting for the last present");
     vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, UINT64_MAX);
+    host_gpu_busy_present_done();  // the last blit's two timestamps, before this one rewrites them
     // A V-Sync change has no surface event behind it, so the options screen
     // asks for the rebuild the acquire would otherwise never be told to do.
     if (g_swap_dirty.exchange(false)) {
@@ -612,6 +682,7 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_vk.cmd, &bi);
+    host_gpu_busy_present_begin(g_vk.cmd);
     // The renderer's writes to what the blit reads - the frame taken at its
     // flip, or the display buffer - are in earlier submissions on this queue;
     // submission order alone does not make them visible to this read.
@@ -719,6 +790,7 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     vkCmdPipelineBarrier(g_vk.cmd,
                          as_colour ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_present);
+    host_gpu_busy_present_end(g_vk.cmd);  // counted as on its way from here: it is always submitted below
     vkEndCommandBuffer(g_vk.cmd);
     const auto t_recorded = std::chrono::steady_clock::now();
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -1510,18 +1582,42 @@ bool host_window_pump() {
     if (host_settings().fps_counter) {
         static int shown = 0;
         static std::chrono::steady_clock::time_point shown_at;
+        // Beside it, how busy our work kept the GPU (host/gpu_busy.cpp) over
+        // the last two refreshes - about the same second the count covers.
+        // Task Manager's GPU column cannot say it on AMD's driver.
+        static int gpu_pct = -1;
+        static GpuBusy busy_was[2];
+        static std::chrono::steady_clock::time_point busy_at[2];
         const auto now = std::chrono::steady_clock::now();
         if (now - shown_at >= std::chrono::milliseconds(500)) {
             shown = presents_in_last_second(now);
             shown_at = now;
+            const GpuBusy b = host_gpu_busy();
+            if (b.on && busy_was[0].on) {
+                const double secs = std::chrono::duration<double>(now - busy_at[0]).count();
+                const double pct = secs > 0.0 ? static_cast<double>(b.busy_ns - busy_was[0].busy_ns) / 1e7 / secs : 0.0;
+                gpu_pct = static_cast<int>(std::lround(std::clamp(pct, 0.0, 100.0)));
+            }
+            busy_was[0] = busy_was[1];
+            busy_at[0] = busy_at[1];
+            busy_was[1] = b;
+            busy_at[1] = now;
+            if (!busy_was[0].on) {  // the first refresh: the window starts here
+                busy_was[0] = b;
+                busy_at[0] = now;
+            }
         }
         float dw = 0.0f;
         {
             std::lock_guard<std::mutex> ml(g_mouse_mu);
             dw = g_display_w ? static_cast<float>(g_display_w) : 1920.0f;
         }
-        char text[32];
-        std::snprintf(text, sizeof(text), "%d FPS", shown);
+        char text[48];
+        if (gpu_pct >= 0) {
+            std::snprintf(text, sizeof(text), "%d FPS  GPU %d%%", shown, gpu_pct);
+        } else {
+            std::snprintf(text, sizeof(text), "%d FPS", shown);
+        }
         const float scale = 0.8f, w = host_overlay_text_width(scale, text);
         const float x = dw - w - 20.0f, y = 14.0f;
         host_overlay_rect(x - 8.0f, y - 4.0f, w + 16.0f, 24.0f * scale + 8.0f, 0x000000a0u);

@@ -408,6 +408,31 @@ void host_gpu_queue_unlock();
 std::uint64_t host_gpu_submit_presenter(void* cmd, void* wait, std::uint32_t wait_stage, void* signal, void* fence);
 void host_gpu_queue_lock_only();  // the queue's mutex without waiting for the thread (after host_gpu_wait_submitted)
 void host_gpu_wait_submitted(std::uint64_t ticket);
+// How busy the GPU is with our work (gpu_busy.cpp): the union of the time
+// our command buffers - the game's and the presenter's - spent on the GPU,
+// from a timestamp at each one's start and end. Windows' per-process GPU
+// engine counters (Task Manager's GPU column) see none of it on AMD's driver
+// with hardware scheduling, for any program; this is the number to read
+// instead. Cumulative since the start; callers difference two readings over
+// their own wall-clock window. `on` false: off (BBHOST_GPU_BUSY=0) or the
+// device has no timestamps on its queue.
+struct GpuBusy {
+    bool on = false;
+    std::uint64_t busy_ns = 0;     // the union over both
+    std::uint64_t game_ns = 0;     // the game's command buffers alone (their own union)
+    std::uint64_t present_ns = 0;  // the presenter's alone
+    std::uint64_t cmdbufs = 0, presents = 0;
+};
+GpuBusy host_gpu_busy();
+// The presenter's command buffer (a VkCommandBuffer): its first command and
+// its last (before vkEndCommandBuffer), and once its fence has signalled - or
+// before the next one is recorded, which waits for it. Caller holds the lock
+// for the first two.
+void host_gpu_busy_present_begin(void* cmd);
+void host_gpu_busy_present_end(void* cmd);
+void host_gpu_busy_present_done();
+// The 300-flip report's line: busy over the window since the last call.
+std::string host_gpu_busy_report();
 // Records a blit of the render target the game displays (its VA from
 // sceVideoOutRegisterBuffers) - src_width x src_height of it from (src_x,
 // src_y) - into the rectangle (dst_x, dst_y, dst_w x dst_h) of `dst_image`
