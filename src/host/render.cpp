@@ -5967,11 +5967,11 @@ void clear_depth(RtImage& r, bool depth, bool stencil, float dval, std::uint32_t
     if (depth) range.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (stencil && r.format != VK_FORMAT_D32_SFLOAT && r.format != VK_FORMAT_D16_UNORM) range.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
     if (!range.aspectMask) return;
-    vkCmdClearDepthStencilImage(g_cmd(), r.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+    rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     g_clears.fetch_add(1);
 }
 
@@ -6496,16 +6496,16 @@ void copy_layers_locked(const RtImage& from, RtImage& to) {
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     const std::uint32_t layers = std::min(from.layers, to.layers);
     VkImageCopy region{};
     region.srcSubresource = {aspect_of(from), 0, 0, layers};
     region.dstSubresource = {aspect_of(to), 0, 0, layers};
     region.extent = {std::min(from.width, to.width), std::min(from.height, to.height), 1};
-    vkCmdCopyImage(g_cmd(), from.image, VK_IMAGE_LAYOUT_GENERAL, to.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    rec().copy_image(from.image, VK_IMAGE_LAYOUT_GENERAL, to.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
 }
 
 }  // namespace
@@ -6557,7 +6557,7 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
         if (logs.fetch_add(1) < 12) {
             host_log("render: fill clear of depth target 0x%llx to %g", static_cast<unsigned long long>(r.base), v.depth);
         }
-        vkCmdClearDepthStencilImage(g_cmd(), r.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+        rec().clear_depth_stencil_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     } else {
         VkClearColorValue v{};
         const bool bgra = r.format == VK_FORMAT_B8G8R8A8_UNORM || r.format == VK_FORMAT_B8G8R8A8_SRGB;
@@ -6565,12 +6565,12 @@ void clear_image_locked(RtImage& r, const float rgba[4], std::uint32_t first_lay
         v.float32[1] = rgba[1];
         v.float32[2] = bgra ? rgba[0] : rgba[2];
         v.float32[3] = rgba[3];
-        vkCmdClearColorImage(g_cmd(), r.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &range);
+        rec().clear_color_image(r.image, VK_IMAGE_LAYOUT_GENERAL, v, 1, &range);
     }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     g_clears.fetch_add(1);
 }
 
@@ -7331,7 +7331,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
     const bool by_compute = from_depth && dst.storage && depth_copy_available_locked();
     mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
     mb.dstAccessMask = by_compute ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                          by_compute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     // BBHOST_GPU_PROFILE: the copy as an entry of its own, by kind and size.
     static std::map<std::string, std::string> copy_names;
@@ -7345,7 +7345,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         if (g.profile) profile_end_locked();
         mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
                              nullptr);
         if (g_pending_clears.erase(dst_base)) ++g_pending_gen;
         dst.fill_last = false;
@@ -7355,7 +7355,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
     if (by_compute) {
         // The pass could not be recorded: the buffer copies, behind the transfer barrier they expect.
         mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     }
     if (from_depth) {
         // Depth and colour formats cannot be copied image-to-image: go through a
@@ -7377,24 +7377,24 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         VkBufferImageCopy bic{};
         bic.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
         bic.imageExtent = {src.width, src.height, 1};
-        vkCmdCopyImageToBuffer(g_cmd(), src.image, VK_IMAGE_LAYOUT_GENERAL, scratch.buffer, 1, &bic);
+        rec().copy_image_to_buffer(src.image, VK_IMAGE_LAYOUT_GENERAL, scratch.buffer, 1, &bic);
         VkMemoryBarrier tb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         tb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         tb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &tb, 0, nullptr, 0, nullptr);
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &tb, 0, nullptr, 0, nullptr);
         bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        vkCmdCopyBufferToImage(g_cmd(), scratch.buffer, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &bic);
+        rec().copy_buffer_to_image(scratch.buffer, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &bic);
     } else {
         VkImageCopy region{};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.extent = {src.width, src.height, 1};
-        vkCmdCopyImage(g_cmd(), src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        rec().copy_image(src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     }
     if (g.profile) profile_end_locked();
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
     if (g_pending_clears.erase(dst_base)) ++g_pending_gen;
     dst.fill_last = false;
     g_rt_copies.fetch_add(1);
