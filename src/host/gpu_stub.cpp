@@ -62,3 +62,4 @@ std::string host_gpu_ps_wave_report() { return {}; }
 std::string host_gpu_memory_budget_report() { return {}; }
 void host_gpu_set_loading(bool) {}
 void host_gpu_world_reached() {}
+int host_gpu_stream_selftest(int) { return 2; }  // no Vulkan: nothing to test
