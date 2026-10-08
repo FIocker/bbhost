@@ -16,11 +16,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 10 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 11 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 117 |
-| **Taken over in all** | **131** |
-| With any code byte changed (including byte patches and redirected calls) | 154; 236 at 60 fps |
+| **Taken over in all** | **132** |
+| With any code byte changed (including byte patches and redirected calls) | 155; 237 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -43,6 +43,7 @@ when there is a reason to change them, not for their own sake.
 | parallel resource copy (`sub_23bde30`) | `0x23bde30` | the copy of streamed resource data across the engine's worker pool | copies on the calling thread; removes a ~1 s wait per area tour |
 | effect ribbon tail, facing the eye (`sub_2cce7b0`) | `0x2cce7b0` | the last one to three points of an effect ribbon as vertices, the strip turned to the camera | 400,000 random strips against the game's own code (`tests/sfx_ribbon_test.cpp`), 21 calls compared in a world session: 0 differences |
 | effect ribbon tail, along normals (`sub_2cceec0`) | `0x2cceec0` | the same for a ribbon laid along its points' normals | 400,000 random strips, 426 calls compared in a world session: 0 differences |
+| the EzState evaluator (`sub_2b73910`) | `0x2b73910` | evaluates every condition and command argument of the engine's state machines: the NPCs' talk scripts and the menus | every expression of the 271 talk scripts (42,016, each on six states) and 60,000 random expressions against the game's own code (`tests/talk_script_test.cpp`): 0 differences; in three world sessions by an NPC near the seed's lamp, 222,468 talk-script expressions compared with the game's, the environment's answers replayed: 0 differences |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -54,6 +55,17 @@ its own pointers back as zero and crashed at `0x2cce9b5` (the crash the
 community's "Intel 12th Gen+ SFX workaround" patch avoids by not drawing
 those effects). The rewrites keep nothing below the stack pointer. Linux
 skips the red zone when it delivers a signal, so only Windows crashed.
+
+The EzState evaluator is the interpreter under the talk scripts: an
+expression is bytecode - literals, arithmetic in double precision, calls to
+the game's talk functions, registers, strings - run on a stack of typed
+values. Ours keeps the game's rules to the bit (an int when a result converts
+back exactly, else a float; the operand order NaN payloads follow; how the
+strings' reference counts move) and gives the game's own handlers the opcodes
+no script uses. The same interpreter runs the menus' state machines, so
+besides every talk-script expression the game ships, the test runs random
+ones over every opcode a script can use. It is the base for talk functions
+and commands of a mod's own: the calls an expression makes pass through it.
 
 The four event-flag functions are every read and write the game makes through
 its flag store - event scripts, Lua, talk scripts, the online session. With
@@ -165,5 +177,6 @@ argument bits the original tests.
   source - checked against the original over many seeds without the game.
 - **Item lots and shop lineups**: what enemies and chests drop and what shops
   sell, for drop-rate and shop mods beyond the params.
-- **The talk-script runtime**: the interpreter behind the NPCs' conversations
-  (its expressions, commands and functions), so mods can add talk commands.
+- **The talk-script runtime**: the expression evaluator is ours (above); next,
+  the talk functions and commands routed through ours, so mods can add their
+  own.

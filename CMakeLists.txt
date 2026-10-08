@@ -84,6 +84,7 @@ add_executable(bbhost
   src/decomp/game_memcpy.cpp
   src/decomp/ez_copy.cpp
   src/decomp/sfx_ribbon.cpp
+  src/decomp/talk_script.cpp
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
@@ -310,7 +311,7 @@ endif()
 set_source_files_properties(src/decomp/sprj_event_flag_man.cpp src/decomp/game_memcpy.cpp src/decomp/ez_copy.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
 # The effect ribbons' writers reproduce the game's floating point bit for bit:
 # no multiply-add fused into one rounding.
-set_source_files_properties(src/decomp/sfx_ribbon.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
+set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/talk_script.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
 
 if(MSVC)
   target_compile_options(bbhost PRIVATE /W4)
@@ -386,6 +387,14 @@ if(UNIX)
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)
+  # The talk scripts' evaluator against the game's (skips without the eboot;
+  # the dump's scripts, BBHOST_APP0, join the random expressions when named).
+  add_executable(talk_script_test tests/talk_script_test.cpp src/engine/esd.cpp)
+  target_compile_options(talk_script_test PRIVATE -fno-stack-protector -ffp-contract=off)
+  target_compile_features(talk_script_test PRIVATE cxx_std_17)
+  target_link_libraries(talk_script_test PRIVATE eboot_kit gcn)
+  add_test(NAME talk_script_test COMMAND talk_script_test)
+  set_tests_properties(talk_script_test PROPERTIES SKIP_RETURN_CODE 77)
   # The effect ribbons' writers against the game's code (skips without the eboot).
   add_executable(sfx_ribbon_test tests/sfx_ribbon_test.cpp src/core/write_watch.cpp)
   target_compile_options(sfx_ribbon_test PRIVATE -ffp-contract=off)
