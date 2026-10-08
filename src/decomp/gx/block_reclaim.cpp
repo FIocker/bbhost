@@ -138,7 +138,7 @@ void report() {
 }  // namespace
 
 void decomp_gx_block_reclaim_add() {
-    DecompFunction fn{"sub_2aaa860", "GX resource tables", 0x2aaa860, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&reclaim),
+    DecompFunction fn{"sub_2aaa860", "gx", 0x2aaa860, kEntry, sizeof(kEntry), reinterpret_cast<void*>(&reclaim),
                       DecompKind::HostedFrame};
     fn.original = &g_game;
     fn.report = &report;

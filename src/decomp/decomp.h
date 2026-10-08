@@ -6,8 +6,9 @@
 // function is registered here: one list, switched off by name, reported at
 // exit.
 //
-// Each engine area keeps its functions in decomp/<area>.cpp and adds them
-// with decomp_add() before decomp_install() runs (hle/runtime.cpp).
+// Each area of the engine keeps its functions in a folder, decomp/<area>/,
+// and adds them with decomp_add() from its decomp_<name>_add(), which
+// decomp/areas.cpp calls before decomp_install() runs (hle/runtime.cpp).
 #pragma once
 
 #include "guest_abi.h"
@@ -42,7 +43,7 @@ struct DecompCompare {
 
 struct DecompFunction {
     const char* name;           // the game's name where the binary gives one, else sub_<address>
-    const char* area;           // its engine-map.md category
+    const char* area;           // its folder: events, player, items, talk, chalice, camera, ...
     std::uint64_t bn;           // the entry, as Binary Ninja addresses it
     const std::uint8_t* entry;  // the whole instructions expected there: at least 5 bytes, none a
     std::size_t entry_len;      //   branch target (rip-relative ones and relative branches are re-aimed)
