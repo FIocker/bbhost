@@ -54,6 +54,7 @@
 
 #include "core/tls_rewrite.h"
 #include "decomp/decomp.h"
+#include "decomp/guest.h"
 #include "log.h"
 
 #include <atomic>
@@ -64,10 +65,10 @@
 
 #include <emmintrin.h>
 
+using namespace decomp;
+
 namespace talk_script {
 namespace {
-
-using ull = unsigned long long;
 
 // The game's code and data this calls on (Binary Ninja addresses).
 constexpr std::uint64_t kHandlers = 0x56c8880;      // the opcode table
@@ -96,11 +97,6 @@ using StringText = GUEST_ABI std::uint8_t* (*)(String*);
 using Assign = GUEST_ABI void (*)(std::uint8_t*, const std::uint16_t*, std::uint64_t);
 using Wcslen = GUEST_ABI std::uint64_t (*)(const std::uint16_t*);
 
-template <class F>
-F game(std::uint64_t bn) {
-    return reinterpret_cast<F>(static_cast<std::uintptr_t>(decomp_guest(bn)));
-}
-
 constexpr std::uint64_t kTalkEnvVtable = 0x575aab0;  // the talk scripts' environment (sub_243ad60 answers)
 
 std::atomic<std::uint64_t> g_evaluations{0}, g_talk_evaluations{0};
@@ -119,7 +115,7 @@ inline void release(String* s) {
     if (was == 1) {
         reinterpret_cast<Destroy>(s->vtable[0])(s);
     } else if (was <= 0) {
-        game<Panic>(kDlPanic)(0, kRefLine, reinterpret_cast<const char*>(static_cast<std::uintptr_t>(decomp_guest(kRefMessage))));
+        game_function<Panic>(kDlPanic)(0, kRefLine, reinterpret_cast<const char*>(static_cast<std::uintptr_t>(game_address(kRefMessage))));
     }
 }
 
@@ -253,7 +249,7 @@ inline void binary(Context* ctx, Op op) {
 // environment, push its answer.
 void call(std::uint8_t* machine, Context* ctx, int args) {
     Call c;
-    c.vtable = reinterpret_cast<void**>(static_cast<std::uintptr_t>(decomp_guest(kCallVtable)));
+    c.vtable = reinterpret_cast<void**>(static_cast<std::uintptr_t>(game_address(kCallVtable)));
     c.count = args + 1;
     for (Value& v : c.v) {
         v.payload = 0;
@@ -290,11 +286,11 @@ void string_literal(Context* ctx, const std::uint8_t*& ip) {
     const auto* lit = reinterpret_cast<const std::uint16_t*>(ip);
     void* alloc = ctx->allocator;
     if (!alloc) {
-        void** slot = reinterpret_cast<void**>(static_cast<std::uintptr_t>(decomp_guest(kDefaultAllocator)));
+        void** slot = reinterpret_cast<void**>(static_cast<std::uintptr_t>(game_address(kDefaultAllocator)));
         alloc = *slot;
-        if (!alloc) *slot = alloc = game<MakeAllocator>(kMakeDefaultAllocator)();
+        if (!alloc) *slot = alloc = game_function<MakeAllocator>(kMakeDefaultAllocator)();
     }
-    auto* s = static_cast<String*>(game<Allocate>(kAllocate)(0x48, 8, alloc));
+    auto* s = static_cast<String*>(game_function<Allocate>(kAllocate)(0x48, 8, alloc));
     if (!s) {
         // The game's goes on to count a null string and faults: ours pushes
         // int 0 and skips the literal.
@@ -304,17 +300,17 @@ void string_literal(Context* ctx, const std::uint8_t*& ip) {
         put_int(push(ctx), 0);
         return;
     }
-    game<StringCtor>(kStringCtor)(s, alloc);
+    game_function<StringCtor>(kStringCtor)(s, alloc);
     addref(s);
-    const std::uint64_t len = *lit ? game<Wcslen>(kWcslen)(lit) : 0;
-    game<Assign>(kAssign)(game<StringText>(kStringText)(s), lit, len);
-    const std::uint8_t* text = game<StringText>(kStringText)(s);
+    const std::uint64_t len = *lit ? game_function<Wcslen>(kWcslen)(lit) : 0;
+    game_function<Assign>(kAssign)(game_function<StringText>(kStringText)(s), lit, len);
+    const std::uint8_t* text = game_function<StringText>(kStringText)(s);
     std::uint64_t capacity;
     std::memcpy(&capacity, text + 0x20, 8);
     const std::uint16_t* chars;
     if (capacity >= 8) std::memcpy(&chars, text + 8, 8);
     else chars = reinterpret_cast<const std::uint16_t*>(text + 8);
-    ip += 2 * game<Wcslen>(kWcslen)(chars) + 2;
+    ip += 2 * game_function<Wcslen>(kWcslen)(chars) + 2;
     Value* slot = push(ctx);
     addref(s);
     addref(s);
@@ -359,7 +355,7 @@ DECOMP_LEAF Value* evaluate(Value* out, std::uint8_t* machine, Context* ctx, con
     g_evaluations.fetch_add(1, std::memory_order_relaxed);
     if (void* env = *reinterpret_cast<void**>(machine + kMachineEnv)) {
         std::uint64_t talk = g_talk_vtable.load(std::memory_order_relaxed);
-        if (!talk) g_talk_vtable.store(talk = decomp_guest(kTalkEnvVtable), std::memory_order_relaxed);
+        if (!talk) g_talk_vtable.store(talk = game_address(kTalkEnvVtable), std::memory_order_relaxed);
         if (reinterpret_cast<std::uint64_t>(*static_cast<void**>(env)) == talk)
             g_talk_evaluations.fetch_add(1, std::memory_order_relaxed);
     }
@@ -461,7 +457,7 @@ DECOMP_LEAF Value* evaluate(Value* out, std::uint8_t* machine, Context* ctx, con
         case 0xa3:
         case 0xa4: {
             Value local{0, 0, 0};
-            game<Format>(kFormat)(&local, ctx, op == 0xa3 ? 2 : 3);
+            game_function<Format>(kFormat)(&local, ctx, op == 0xa3 ? 2 : 3);
             assign(push(ctx), &local, 2);
             release_old(&local);
             break;
@@ -492,7 +488,7 @@ DECOMP_LEAF Value* evaluate(Value* out, std::uint8_t* machine, Context* ctx, con
         case 0xba: put_int(push(ctx), 0x7fffffff); break;
         default: {
             // 0xbc-0xff: the game's own handler.
-            const auto* table = reinterpret_cast<const Handler*>(static_cast<std::uintptr_t>(decomp_guest(kHandlers)));
+            const auto* table = reinterpret_cast<const Handler*>(static_cast<std::uintptr_t>(game_address(kHandlers)));
             table[op](machine, ctx, &ip);
             break;
         }
@@ -706,7 +702,7 @@ void report() {
     }
     host_log("decomp: sub_2b73910: %llu environment calls replayed, %llu expressions left uncompared (nested or over %zu calls)",
              static_cast<ull>(g_calls_replayed.load()), static_cast<ull>(g_uncompared.load()), kMaxRecorded);
-    const std::uint64_t slide = decomp_guest(kTalkEnvVtable) - kTalkEnvVtable;
+    const std::uint64_t slide = game_address(kTalkEnvVtable) - kTalkEnvVtable;
     for (const EnvCount& e : g_envs) {
         const std::uint64_t vt = e.vtable.load();
         if (!vt) break;

@@ -36,9 +36,6 @@
 #include <sys/mman.h>
 
 // What decomp.cpp provides in the game.
-std::uint64_t decomp_guest(std::uint64_t bn) { return bn; }
-void decomp_add(const DecompFunction&) {}
-bool decomp_comparing() { return false; }
 
 namespace {
 

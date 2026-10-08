@@ -24,6 +24,7 @@
 // The wait is bounded: a few milliseconds where there was a draw with its
 // textures and constants missing.
 #include "decomp/decomp.h"
+#include "decomp/guest.h"
 
 #include "core/portable.h"
 #include "core/thunk.h"
@@ -37,9 +38,9 @@
 #include <cstdlib>
 #include <thread>
 
-namespace {
+using namespace decomp;
 
-using ull = unsigned long long;
+namespace {
 
 // push rbp; mov rbp, rsp; push r15, r14, r13, r12, rbx; and rsp, -32
 // (20 bytes; the rip-relative stack-guard load follows).
@@ -81,7 +82,7 @@ GUEST_ABI void reclaim(std::uint64_t pool, std::uint64_t cb, std::uint64_t, std:
     // rsp comes from the frame-capturing thunk; were that skipped (its page
     // full), it would be whatever the caller left in rcx - read nothing then.
     const std::uint64_t from = rsp && hle_kernel_va_mapped(rsp, 8) ? *reinterpret_cast<const std::uint64_t*>(static_cast<std::uintptr_t>(rsp)) : 0;
-    const bool empty_pool = from == decomp_guest(kFromAllocator) || from == decomp_guest(kFromAllocator2);
+    const bool empty_pool = from == game_address(kFromAllocator) || from == game_address(kFromAllocator2);
     const std::uint64_t before = empty_pool ? in_use(pool) : 0;
     hle_call_guest<std::int64_t>(g_game, pool, cb);
     if (!empty_pool) return;

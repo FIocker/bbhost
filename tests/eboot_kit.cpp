@@ -4,6 +4,7 @@
 #include "core/imports.h"
 #include "core/sha256.h"
 #include "core/tls_rewrite.h"
+#include "decomp/decomp.h"
 #include "engine/addr.h"
 #include "hle/guest_fs.h"
 
@@ -245,6 +246,15 @@ float Rng::value(float lo, float hi) {
 }
 
 }  // namespace eboot_kit
+
+// What a decomp source reaches of the list's own code (decomp/decomp.h), for
+// a test that builds the source alone: the image at its preferred slide,
+// nothing placed, no compare run. Weak, so decomp.cpp's win where a test
+// links it.
+__attribute__((weak)) std::uint64_t g_decomp_slide = eboot_kit::kBase;
+__attribute__((weak)) std::uint64_t decomp_guest(std::uint64_t bn) { return bn; }
+__attribute__((weak)) void decomp_add(const DecompFunction&) {}
+__attribute__((weak)) bool decomp_comparing() { return false; }
 
 // What the loader binds imports with (core/imports.h), for a test: traps.
 std::string lookup_nid_name(std::string_view nid) { return std::string(nid); }

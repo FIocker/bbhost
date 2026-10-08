@@ -26,6 +26,7 @@
 // 4-wide writers (which keep nothing below rsp) are among the busiest
 // writers in its census, and these finish the same strips.
 #include "decomp/decomp.h"
+#include "decomp/guest.h"
 
 #include "core/write_watch.h"
 
@@ -39,22 +40,16 @@
 
 #include "log.h"
 
+using namespace decomp;
+
 // Bit for bit: every operation in the game's order, and none fused into
 // another - the file is built with -ffp-contract=off (CMakeLists.txt).
 
 namespace {
 
-using ull = unsigned long long;
-using u32 = std::uint32_t;
-
 constexpr std::size_t kVertex = 0x38;
 
 // Reads of the game's arrays at a byte offset, as its code indexes them.
-inline float at(const void* base, u32 offset) {
-    float f;
-    std::memcpy(&f, static_cast<const std::uint8_t*>(base) + offset, sizeof f);
-    return f;
-}
 inline u32 at_u32(const void* base, u32 offset) {
     u32 v;
     std::memcpy(&v, static_cast<const std::uint8_t*>(base) + offset, sizeof v);
@@ -173,13 +168,13 @@ DECOMP_LEAF void sfx_ribbon_facing(std::uint8_t* out, u32 n, const float* born, 
     do {
         const u32 point_packed = at_u32(packed, i4);
         const float offset = std::bit_cast<float>(at_u32(offsets, o4));
-        const float age = now - at(born, i4);
-        const float x = at(px, i4), y = at(py, i4), z = at(pz, i4);
+        const float age = now - load<float>(born, i4);
+        const float x = load<float>(px, i4), y = load<float>(py, i4), z = load<float>(pz, i4);
         const float ex = eye_x - x, ey = eye_y - y, ez = eye_z - z;
         const float inv_e = inverse(sqrt_ss(length2(ex, ey, ez)));
         const float enx = ex * inv_e, eny = ey * inv_e, enz = ez * inv_e;
         const u32 j4 = i4 + 4;
-        const float dx = at(px, j4) - x, dy = at(py, j4) - y, dz = at(pz, j4) - z;
+        const float dx = load<float>(px, j4) - x, dy = load<float>(py, j4) - y, dz = load<float>(pz, j4) - z;
         const float inv_d = inverse(sqrt_ss(length2(dx, dy, dz)));
         t = t + -1.0f;
         const float dnx = dx * inv_d, dny = dy * inv_d, dnz = dz * inv_d;
@@ -235,13 +230,13 @@ DECOMP_LEAF void sfx_ribbon_along(std::uint8_t* out, u32 n, const float* born, c
     do {
         const u32 point_packed = at_u32(packed, i4);
         const float offset = std::bit_cast<float>(at_u32(offsets, o4));
-        const float age = now - at(born, i4);
-        const float x = at(px, i4), y = at(py, i4), z = at(pz, i4);
-        const float dx = at(px, target4) - x, dy = at(py, target4) - y, dz = at(pz, target4) - z;
+        const float age = now - load<float>(born, i4);
+        const float x = load<float>(px, i4), y = load<float>(py, i4), z = load<float>(pz, i4);
+        const float dx = load<float>(px, target4) - x, dy = load<float>(py, target4) - y, dz = load<float>(pz, target4) - z;
         const float inv_d = inverse(sqrt_ss(length2(dx, dy, dz)));
         t = t + -1.0f;
         const float dnx = dx * inv_d, dny = dy * inv_d, dnz = dz * inv_d;
-        const float mz = at(nz, k4), mx = at(nx, k4), my = at(ny, k4);
+        const float mz = load<float>(nz, k4), mx = load<float>(nx, k4), my = load<float>(ny, k4);
         const float cx = my * dnz - mz * dny;
         const float cy = mz * dnx - mx * dnz;
         const float cz = mx * dny - my * dnx;
