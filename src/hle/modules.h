@@ -149,6 +149,10 @@ void hle_video_set_picture(unsigned w, unsigned h);
 // `delay_ms` on, held `hold_ms`. Any thread.
 void hle_pad_tap(std::uint32_t button, int delay_ms, int hold_ms);
 void hle_video_set_fps_cap(int fps);  // video.fps_cap (upper bound on presented fps)
+// The game's pace once engine/frame_rate.cpp chose it (30, 60, 90, 0 uncapped):
+// 30 and 60 cap the flips at that rate; 90 and uncapped complete them at once.
+// A frame rate set after that applies on the next run.
+void hle_video_set_game_pace(int fps);
 void hle_video_set_loading_uncapped(bool on);  // flips complete at once while a loading screen is up (engine/loading.cpp)
 void hle_dialog_set_default_name(const char* name, bool type_in_window);  // IME text (player.name) and whether to type it
 void hle_np_set_online_id(const char* id);          // sceNpGetOnlineId (online.online_id)
