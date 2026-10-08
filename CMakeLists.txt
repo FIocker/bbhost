@@ -84,6 +84,7 @@ add_executable(bbhost
   src/decomp/game_memcpy.cpp
   src/decomp/ez_copy.cpp
   src/decomp/sfx_ribbon.cpp
+  src/decomp/sprj_emk.cpp
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
@@ -307,7 +308,8 @@ endif()
 # The game's functions as ours (src/decomp, docs/decomp.md): a leaf runs on the
 # game's thread state, where FS is the game's, so nothing in its file may read
 # the stack protector's canary through it.
-set_source_files_properties(src/decomp/sprj_event_flag_man.cpp src/decomp/game_memcpy.cpp src/decomp/ez_copy.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
+set_source_files_properties(src/decomp/sprj_event_flag_man.cpp src/decomp/game_memcpy.cpp src/decomp/ez_copy.cpp
+                            src/decomp/sprj_emk.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector")
 # The effect ribbons' writers reproduce the game's floating point bit for bit:
 # no multiply-add fused into one rounding.
 set_source_files_properties(src/decomp/sfx_ribbon.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
@@ -396,6 +398,13 @@ if(UNIX)
   add_executable(decomp_insn_test tests/decomp_insn_test.cpp src/decomp/insn.cpp)
   target_include_directories(decomp_insn_test PRIVATE src)
   add_test(NAME decomp_insn_test COMMAND decomp_insn_test)
+  # The event-script interpreter against the game's code (skips without the eboot).
+  add_executable(sprj_emk_test tests/sprj_emk_test.cpp src/decomp/sprj_event_flag_man.cpp)
+  target_include_directories(sprj_emk_test PRIVATE include)
+  target_compile_options(sprj_emk_test PRIVATE -fno-stack-protector)
+  target_link_libraries(sprj_emk_test PRIVATE eboot_kit pthread)
+  add_test(NAME sprj_emk_test COMMAND sprj_emk_test)
+  set_tests_properties(sprj_emk_test PROPERTIES SKIP_RETURN_CODE 77)
   add_executable(sync_test tests/sync_test.cpp src/hle/sync.cpp src/host/main_wait.cpp)
   target_include_directories(sync_test PRIVATE src)
   target_link_libraries(sync_test PRIVATE pthread)

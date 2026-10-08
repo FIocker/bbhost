@@ -16,11 +16,11 @@ The 1.09 executable has about 169,000 functions. In a default run today:
 
 | | Functions |
 |---|---|
-| Rewritten as source, on the decomp list (`src/decomp/`) | 10 |
+| Rewritten as source, on the decomp list (`src/decomp/`) | 18 |
 | Replaced by bbhost code outside the list (written before the list existed) | 4, and the YEBIS resource builder bypassed |
 | Hooked at the entry or at call sites (GX methods, the resource registry, live resolution, settings, key prompts, menus) | 117 |
-| **Taken over in all** | **131** |
-| With any code byte changed (including byte patches and redirected calls) | 154; 236 at 60 fps |
+| **Taken over in all** | **139** |
+| With any code byte changed (including byte patches and redirected calls) | 162; 244 at 60 fps |
 | The game's own code | everything else |
 
 The TLS rewrite also changes one instruction at each of 17,127 sites in about
@@ -43,6 +43,14 @@ when there is a reason to change them, not for their own sake.
 | parallel resource copy (`sub_23bde30`) | `0x23bde30` | the copy of streamed resource data across the engine's worker pool | copies on the calling thread; removes a ~1 s wait per area tour |
 | effect ribbon tail, facing the eye (`sub_2cce7b0`) | `0x2cce7b0` | the last one to three points of an effect ribbon as vertices, the strip turned to the camera | 400,000 random strips against the game's own code (`tests/sfx_ribbon_test.cpp`), 21 calls compared in a world session: 0 differences |
 | effect ribbon tail, along normals (`sub_2cceec0`) | `0x2cceec0` | the same for a ribbon laid along its points' normals | 400,000 random strips, 426 calls compared in a world session: 0 differences |
+| `SprjEmkEventIns::Update` | `0x16ecdc0` | the event-script interpreter's loop: an event's conditions updated, then its instructions run while its main condition group holds | 20,237 ticks of 1,500 random scripts against the game's own code (`tests/sprj_emk_test.cpp`): 0 differences; in a world session, 202 events ended and 165 restarted with ours in place |
+| `emevd_dispatch_instruction` | `0x1bb93a0` | an instruction to its bank's function | every bank from -2 to 2100 and the extremes, 14,777 instructions: 0 differences; 14,052 dispatched in a world session, none the game has no function for |
+| `SprjEmkEventIns::EndOrRestart` | `0x16ed100` | an event's end (and its restart record) or restart, and its completion flag | the loop's test above; 367 calls checked in a world session (its effects predicted, then the game's compared): 0 differences |
+| `SprjEmkConditionHolder::Update` | `0x16ec380` | every condition group's update, then the latch of satisfied groups into the event's state word | 3,000 random holders; 8,357,660 calls compared in a world session: 0 differences |
+| `SprjEmkConditionHolder::LatchGroupBits` | `0x16ec4a0` | the latch alone | 3,000 random holders; 413 calls compared in a world session: 0 differences |
+| `SprjEmkConditionHolder::QueryGroup` | `0x16ec5a0` | one group's state | 210,000 queries over random holders; 12,885,945 calls compared in a world session: 0 differences |
+| `SprjEmkConditionHolder::QueryMain` | `0x16ec660` | the main group's state | 3,000 random holders: 0 differences (no calls in a world session) |
+| `SprjEmkConditionGroup::Query` | `0x16ebcf0` | a group's AND / OR | every group of 3,000 random holders: 0 differences (no calls in a world session) |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -59,6 +67,16 @@ The four event-flag functions are every read and write the game makes through
 its flag store - event scripts, Lua, talk scripts, the online session. With
 them as source, every flag change is visible: `BBHOST_EVENT_FLAG_LOG=1` logs
 each one, and plugins get a callback for each.
+
+The eight `SprjEmk` functions are the event-script (EMEVD) interpreter: the
+loop every map's event scripts run in, the dispatcher that sends each
+instruction to its bank's function, and the condition groups the scripts wait
+on. An instruction no bank function takes is skipped, as the game skips it,
+and counted at exit (vanilla scripts have none). The game ends an event by
+writing its completion flag (event id plus slot) straight into the flag store
+rather than through `SetEventFlag` - which does nothing more than that write -
+so the flag log and plugins never saw an event end; ours writes it the same way
+and passes the change on (31 flags in a world session).
 
 ### Replaced outside the list
 
@@ -159,8 +177,9 @@ argument bits the original tests.
   reach.
 - **Damage and stamina**: the functions that apply attack params and attribute
   scaling, for balance changes params cannot express.
-- **The event system's condition checks**: event-script logic as source, and
-  new conditions for mods.
+- **The event system's instructions and conditions**: the interpreter is source
+  now; next, letting a plugin add instructions (a bank and id the game has no
+  function for) and conditions of its own, and the conditions' own updates.
 - **Chalice dungeon generation**: how a glyph's seed becomes a dungeon, as
   source - checked against the original over many seeds without the game.
 - **Item lots and shop lineups**: what enemies and chests drop and what shops
