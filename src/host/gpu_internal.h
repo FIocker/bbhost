@@ -1052,8 +1052,13 @@ extern std::atomic<std::uint64_t> g_fill_surfaces, g_fill_surfaces_skipped;
 void invalidate_rt_views(std::uint64_t base);
 // Marks where the GPU is: on a device loss the driver reports the last
 // checkpoint each queue stage reached, which names the draw that faulted.
-// kind 1 = draw, 2 = dispatch.
+// kind 1 = draw, 2 = dispatch. AMD's markers go through the stream (an op,
+// or a draw's packet: DrawCmds::marker), NVIDIA's checkpoints in place.
 void gpu_checkpoint(unsigned kind, std::uint64_t index);
+// AMD's buffer markers: the 32-bit value for a kind and index, and the two
+// writes (the top of the pipe, then the bottom) into g.marker_buf.
+std::uint32_t gpu_marker_value(unsigned kind, std::uint64_t index);
+void gpu_write_markers(VkCommandBuffer cmd, std::uint32_t value);
 // Logs one recorded draw by index, if it is still in the ring.
 void describe_draw_record(std::uint64_t index);
 // A device fault's address against the tessellation LDS ring (render.cpp):
@@ -1276,6 +1281,7 @@ public:
     void update_sets(std::uint32_t n, const VkWriteDescriptorSet* writes);
     void dispatch(std::uint32_t x, std::uint32_t y, std::uint32_t z);
     void dispatch_indirect(VkBuffer buffer, VkDeviceSize offset);
+    void marker(std::uint32_t value);  // gpu_write_markers
     void clear_depth_stencil_image(VkImage image, VkImageLayout layout, const VkClearDepthStencilValue& value, std::uint32_t n,
                                    const VkImageSubresourceRange* ranges);
     void copy_image(VkImage src, VkImageLayout src_layout, VkImage dst, VkImageLayout dst_layout, std::uint32_t n, const VkImageCopy* regions);
@@ -1353,6 +1359,7 @@ public:
     void blend_constants(const float c[4]);
     void index_buffer(VkBuffer buffer, VkDeviceSize offset, VkIndexType type);
     void vertex_buffers(std::uint32_t n, const VkBuffer* buffers, const VkDeviceSize* offsets);
+    void marker(std::uint32_t value);  // AMD's buffer markers before the draw (gpu_write_markers)
     void draw(const DrawCall& call);
     // Ending the current pass (vkCmdEndRendering and, unless `barrier` is
     // false, the barrier after it) and beginning one; a pass end's barrier
