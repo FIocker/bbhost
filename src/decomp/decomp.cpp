@@ -30,7 +30,6 @@ struct Placed {
 };
 std::vector<Placed> g_placed;
 bool g_comparing = false;
-std::uint64_t g_slide = kPreferredGuestSlide;
 
 // Trampolines are carved from executable pages within a rel32 of the whole
 // image: the displaced instructions run there re-aimed (decomp/insn.h), then
@@ -162,15 +161,17 @@ bool place(ElfImage* image, const DecompFunction& fn, bool compare) {
 
 }  // namespace
 
+std::uint64_t g_decomp_slide = kPreferredGuestSlide;
+
 void decomp_add(const DecompFunction& fn) { g_added.push_back(fn); }
 
 bool decomp_comparing() { return g_comparing; }
 
-std::uint64_t decomp_guest(std::uint64_t bn) { return g_slide + (bn - kPreferredGuestSlide); }
+std::uint64_t decomp_guest(std::uint64_t bn) { return g_decomp_slide + (bn - kPreferredGuestSlide); }
 
 void decomp_install(ElfImage* image) {
     if (!image || image->sha256 != kEboot109Sha256 || g_added.empty()) return;
-    g_slide = image->mem.slide;
+    g_decomp_slide = image->mem.slide;
     if (const char* e = std::getenv("BBHOST_DECOMP"); e && e[0] == '0') {
         host_log("decomp: off (BBHOST_DECOMP=0): the game's own code for all %zu functions", g_added.size());
         return;

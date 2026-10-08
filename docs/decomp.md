@@ -52,6 +52,11 @@ when there is a reason to change them, not for their own sake.
 | `SprjEmkConditionHolder::QueryMain` | `0x16ec660` | the main group's state | 3,000 random holders: 0 differences (no calls in a world session) |
 | `SprjEmkConditionGroup::Query` | `0x16ebcf0` | a group's AND / OR | every group of 3,000 random holders: 0 differences (no calls in a world session) |
 | item-lot roll (`sub_1bceaf0`) | `0x1bceaf0` | what an enemy, a corpse, a chest or a scripted award gives from `ItemLotParam`: each slot's weight (drop rate, item discovery, the cumulative counters that make a missed drop likelier), one draw from the game's random generator a row, the picks merged by their flags | 200,000 random lots against the game's own code (`tests/item_lot_test.cpp`) - results, generator and every flag after: 0 differences; 317 rolls compared in a world session (the frozen seed), the game's results, generator and counters: 0 differences |
+| item discovery (`sub_1981830`) | `0x1981830` | the drop chance a kill rolls with: arcane through its curve (1 below 8, 1.7 at 30, 2.1 from 50), plus the effects' `itemDropRate` while an item-discovery effect is on | 200,000 generated cases against the game's own code (`tests/player_data_test.cpp`), 185 calls compared in a world session: 0 differences |
+| echoes gained (`PlayerIns::vf122`) | `0x1cfc600` | every echo gain: the player's `soulRate` effects, the 999,999,999 cap, the echoes ever gained, the HUD's counters | 200,000 generated cases, 1 call compared in a world session: 0 differences |
+| echoes for a kill (`sub_1cfc860`) | `0x1cfc860` | the victim's `haveSoulRate` effects (scaled by the clear count for `bGameClearBonus` effects: 1, 1.1, 1.25, 1.5, 2, 2.5), halved or x1.2 for a cooperator, rounded up past 5e-6 | 200,000 generated cases: 0 differences; no kill in the test sessions |
+| scripts' penalty (`lua_cli_ExcutePenalty`) | `0x1734e40` | the Lua binding that takes a share of the echoes and some insight (not what a death costs) | 200,000 generated cases: 0 differences; not called in the test sessions |
+| level-up price check (`sub_1f2f5e0`) | `0x1f2f5e0` | whether an attribute may rise: the planned level's price (`CalcCorrectGraph` row 200) against the echoes not yet committed | 200,000 generated cases, 41,942 of them at the price itself: 0 differences; not reached in a world session (the level-up screen) |
 
 The two ribbon writers are rewritten for Windows. The game's versions keep
 their arguments in the 128 bytes below the stack pointer - the red zone, which
@@ -69,6 +74,10 @@ how the cumulative counters raise a missed drop's weight and reset when it
 drops, which flags pass a slot over. The rows themselves stay `ItemLotParam`'s,
 editable by field name as before. Its debug-menu variant and preview stay the
 game's.
+The player-data functions are where every echo the player gains, the price
+of every level and the drop chance of every kill are decided: a mod that changes those rules changes one function each, not the
+sites that call them. They read their constants where the game does, so a
+patch to one of those still applies.
 
 The four event-flag functions are every read and write the game makes through
 its flag store - event scripts, Lua, talk scripts, the online session. With
