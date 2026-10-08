@@ -86,6 +86,7 @@ add_executable(bbhost
   src/decomp/sfx_ribbon.cpp
   src/decomp/sprj_emk.cpp
   src/decomp/item_lot.cpp
+  src/decomp/player_data.cpp
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
@@ -316,6 +317,7 @@ set_source_files_properties(src/decomp/sprj_event_flag_man.cpp src/decomp/game_m
 set_source_files_properties(src/decomp/sfx_ribbon.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
 # The item-lot roll weighs its slots in floats as the game does.
 set_source_files_properties(src/decomp/item_lot.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+set_source_files_properties(src/decomp/sfx_ribbon.cpp src/decomp/player_data.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
 
 if(MSVC)
   target_compile_options(bbhost PRIVATE /W4)
@@ -398,6 +400,12 @@ if(UNIX)
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)
+  # The player-data decomps against the game's code (skips without the eboot).
+  add_executable(player_data_test tests/player_data_test.cpp)
+  target_compile_options(player_data_test PRIVATE -ffp-contract=off -fno-stack-protector)
+  target_link_libraries(player_data_test PRIVATE eboot_kit)
+  add_test(NAME player_data_test COMMAND player_data_test)
+  set_tests_properties(player_data_test PROPERTIES SKIP_RETURN_CODE 77)
   # The effect ribbons' writers against the game's code (skips without the eboot).
   add_executable(sfx_ribbon_test tests/sfx_ribbon_test.cpp src/core/write_watch.cpp)
   target_compile_options(sfx_ribbon_test PRIVATE -ffp-contract=off)
