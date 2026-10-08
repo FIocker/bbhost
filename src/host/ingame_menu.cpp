@@ -1,6 +1,7 @@
 #include "host/ingame_menu.h"
 
 #if defined(BBHOST_HAVE_SDL3)
+#include "host/gpu.h"
 #include "host/plugin_ui.h"
 #include "host/settings.h"
 #include "log.h"
@@ -210,10 +211,15 @@ void ingame_menu_shutdown() {
     g_vk_ready = false;
 }
 
-void ingame_menu_record(VkCommandBuffer cmd, VkImageView view, VkExtent2D extent) {
+namespace {
+
+// ImGui's frame for the menu, built and rendered to draw data; false when it
+// is closed (no ImGui frame at all, so a closed menu costs the presenter
+// nothing but this check).
+bool build_frame(VkExtent2D extent) {
     if (!g_vk_ready || !ingame_menu_open()) {
         g_ui.scanned = false;  // read the files again when it next opens
-        return;
+        return false;
     }
     ImGui::SetCurrentContext(g_ctx);
     ImGuiIO& io = ImGui::GetIO();
@@ -262,7 +268,39 @@ void ingame_menu_record(VkCommandBuffer cmd, VkImageView view, VkExtent2D extent
     ImGui::End();
     if (!keep) g_open.store(false);
     ImGui::Render();
+    // ImGui's own texture uploads - the font atlas when the menu first opens,
+    // and again whenever 1.92 adds glyphs to it - submit on the renderer's
+    // queue and then wait for that queue to go idle. Left to RenderDrawData
+    // they ran on this thread with no lock, beside the submission thread's
+    // vkQueueSubmit on the same queue, which Vulkan requires the caller to
+    // keep apart. Done here under the queue's lock (as the overlay's atlas
+    // is, host/overlay.cpp), RenderDrawData then finds nothing to upload. A
+    // frame with no texture to change - nearly all of them - takes no lock.
+    ImDrawData* dd = ImGui::GetDrawData();
+    bool uploads = false;
+    if (dd && dd->Textures) {
+        for (ImTextureData* tex : *dd->Textures) uploads = uploads || tex->Status != ImTextureStatus_OK;
+    }
+    if (uploads) {
+        host_gpu_queue_lock();
+        for (ImTextureData* tex : *dd->Textures) {
+            if (tex->Status != ImTextureStatus_OK) ImGui_ImplVulkan_UpdateTexture(tex);
+        }
+        host_gpu_queue_unlock();
+    }
+    return true;
+}
 
+}  // namespace
+
+bool ingame_menu_record_in_pass(VkCommandBuffer cmd, VkExtent2D extent) {
+    if (!build_frame(extent)) return false;
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cmd);
+    return true;
+}
+
+void ingame_menu_record(VkCommandBuffer cmd, VkImageView view, VkExtent2D extent) {
+    if (!build_frame(extent)) return;
     VkRenderingAttachmentInfo colour{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     colour.imageView = view;
     colour.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -285,5 +323,6 @@ bool ingame_menu_event(const SDL_Event&, float) { return false; }
 bool ingame_menu_init(VkInstance, VkPhysicalDevice, VkDevice, std::uint32_t, VkQueue, VkFormat, std::uint32_t) { return false; }
 void ingame_menu_shutdown() {}
 void ingame_menu_record(VkCommandBuffer, VkImageView, VkExtent2D) {}
+bool ingame_menu_record_in_pass(VkCommandBuffer, VkExtent2D) { return false; }
 
 #endif

@@ -158,7 +158,14 @@ float host_window_refresh_hz();
 // clock steers towards. `serial` is 0 until the first present.
 std::uint64_t host_present_last_ns(std::uint64_t* serial);
 
-// Present one frame: blits the render target the game displays (`display_va`
+// What the presenter is told of a flip besides its buffer (hle/video.cpp).
+struct PresentFlip {
+    std::uint64_t submit_need = ~0ull;  // host_gpu_work_needs() when the flip arrived; ~0: not known, submit
+    std::uint64_t arrived_ns = 0;       // steady clock when the flip was queued (for the flip-to-present time); 0: not known
+    bool on_arrival = false;            // shown when it arrived, before its vblank completes it (BBHOST_PRESENT_ON_ARRIVAL)
+};
+// Present one frame: copies the render target the game displays (`display_va`
 // from sceVideoOutRegisterBuffers) into the swapchain, or clears when there
-// is none yet. Safe to call from any thread.
-void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h);
+// is none yet. Safe to call from any thread: it hands the frame to the
+// presenting thread, which keeps only the newest.
+void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h, const PresentFlip& flip = {});

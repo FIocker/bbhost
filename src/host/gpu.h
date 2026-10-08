@@ -380,6 +380,7 @@ struct GpuHandles {
     void* queue = nullptr;           // VkQueue
     void* present_queue = nullptr;   // VkQueue for presents only (the same family), or null
     std::uint32_t family = 0;
+    bool fifo_latest_ready = false;  // the device may present in VK_PRESENT_MODE_FIFO_LATEST_READY_KHR
 };
 GpuHandles host_gpu_handles();
 // The command processor wrote guest memory on the CPU (DMA, WRITE_DATA):
@@ -453,6 +454,18 @@ void host_gpu_busy_present_end(void* cmd);
 void host_gpu_busy_present_done();
 // The 300-flip report's line: busy over the window since the last call.
 std::string host_gpu_busy_report();
+// The presenter's, before its blit: submits the renderer's recording only when
+// the flip's own work is still in it - `need` is host_gpu_work_needs() taken
+// when the flip arrived; ~0ull (not known) always submits. True when it did.
+// Submitting whatever the command processor had recorded of the *next* frame
+// broke its render pass and cost a submission on every presented frame.
+bool host_gpu_submit_for_flip(std::uint64_t need);
+// The render target the game displays (its VA from sceVideoOutRegisterBuffers)
+// as an image to sample: VkImage, VkFormat, its size; false when the VA is not
+// a drawn render target. Caller holds the renderer's lock (host_gpu_lock) and
+// records the read on the presenter's command buffer before letting it go.
+bool host_gpu_display_image(std::uint64_t display_va, void** image, std::uint32_t* format, std::uint32_t* width,
+                            std::uint32_t* height);
 // Records a blit of the render target the game displays (its VA from
 // sceVideoOutRegisterBuffers) - src_width x src_height of it from (src_x,
 // src_y) - into the rectangle (dst_x, dst_y, dst_w x dst_h) of `dst_image`

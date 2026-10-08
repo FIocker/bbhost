@@ -368,7 +368,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                                  int handle, int buffer, unsigned, std::int64_t arg) {
     hle_gnm_submit_async(0, collect_submit(count, dcb, dcb_bytes),
                          [handle, buffer, arg] {
-                             hle_video_finish_flip(handle, buffer, arg);
+                             hle_video_finish_flip(handle, buffer, arg, true);  // the job's commands are recorded
                              post_gnm_eop();
                          },
                          collect_ce(count, ccb, ccb_bytes));

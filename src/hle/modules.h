@@ -138,7 +138,10 @@ void hle_gnm_warn_if_command_buffer(const char* what, std::uint64_t va, std::siz
 void hle_gnm_dump_recent_writes(std::uint64_t near, unsigned count);
 // Crash diagnostics: the recorded CP writes over [va, va + bytes) or of `value`.
 void hle_gnm_find_writes(std::uint64_t va, std::uint64_t bytes, std::uint64_t value);
-void hle_video_finish_flip(int handle, int buffer, std::int64_t arg);
+// `recorded`: called by the command processor once the frame's commands are
+// recorded and submitted (the frame may then be shown at once); false from a
+// game thread's flip request, which may be ahead of them.
+void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool recorded = false);
 std::uint64_t hle_video_flip_count();
 // Since the last call, for the 300-flip report: how late the vblank clock's
 // ticks woke, and how long flips took from queued to shown and to completed.

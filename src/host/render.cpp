@@ -13401,6 +13401,19 @@ bool host_gpu_blit_display(void* cmd, std::uint64_t display_va, void* dst_image,
                                       static_cast<VkImageView>(dst_storage_view));
 }
 
+bool host_gpu_display_image(std::uint64_t display_va, void** image, std::uint32_t* format, std::uint32_t* width,
+                            std::uint32_t* height) {
+    // What render_blit_display_locked reads, for the presenter's own pass
+    // (host/present_pass.cpp): the target is in GENERAL, as the blit takes it.
+    auto it = g_rts.find(display_va);
+    if (it == g_rts.end() || !it->second.initialised || !it->second.image || it->second.depth) return false;
+    *image = it->second.image;
+    *format = static_cast<std::uint32_t>(it->second.format);
+    *width = it->second.width;
+    *height = it->second.height;
+    return true;
+}
+
 namespace gpu {
 bool dump_rt_locked(RtImage& r, const char* path);
 }

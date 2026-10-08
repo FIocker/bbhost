@@ -15,6 +15,10 @@ bool host_mkdir(const char* path);
 bool host_list_dir(const char* path, std::vector<std::string>* names);
 // This process's CPU time, user plus system, every thread, in milliseconds.
 std::uint64_t host_process_cpu_ms();
+// The calling thread's CPU time, user plus system, in nanoseconds
+// (CLOCK_THREAD_CPUTIME_ID; on Windows GetThreadTimes, which moves in the
+// scheduler's ticks - sum it over many frames, not one).
+std::uint64_t host_thread_cpu_ns();
 // Copies len bytes from addr, failing (false) instead of faulting when the
 // page is not mapped: on Linux a plain copy whose fault the SIGSEGV handler
 // hands back (host_read_safe_recover), on Windows ReadProcessMemory. Not from
