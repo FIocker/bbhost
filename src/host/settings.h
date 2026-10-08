@@ -32,7 +32,7 @@ struct HostSettings {
     // Controls
     bool mouse_menu = true;     // the pointer drives the menus through the pad
     bool mouse_camera = true;   // the mouse turns the camera outside menus
-    float mouse_gain = 1.1f;    // stick deflection per pixel of motion
+    int mouse_sens = 5;         // 0..10, DS3's: 0.2 * (s * 0.15 + 0.5) degrees a count (engine/mouse_camera.h)
     bool mouse_invert_x = false, mouse_invert_y = false;
     bool draw_cursor = true;    // the host draws its own pointer
     // What the game's own button prompts show: 0 follows whether a pad is

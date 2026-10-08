@@ -14,7 +14,7 @@
 // [keys] section of `bbhost-options.toml`, which is what the in-game screen
 // writes. A value names the whole binding: "E", "Mouse2", "X, Mouse2", or
 // "none". Mouse1..Mouse5 are the left, right and middle buttons and the two
-// side buttons.
+// side buttons; WheelUp and WheelDown the wheel, each notch a short press.
 
 #include <cstddef>
 #include <cstdint>
@@ -62,7 +62,7 @@ void host_bindings_save(std::FILE* f);
 std::uint64_t host_bindings_serial();
 
 int host_binding_key(int action);    // an SDL scancode, 0 when unbound
-int host_binding_mouse(int action);  // 1..5, 0 when unbound
+int host_binding_mouse(int action);  // 1..5 the buttons, 6 and 7 the wheel up and down; 0 when unbound
 // What the screen shows: "E", "X  /  Right Button", "Unbound". UTF-8.
 void host_binding_describe(int action, char* out, std::size_t n);
 // What a button prompt in the game's own text shows, which has to be short
@@ -77,7 +77,8 @@ void host_binding_prompt(int action, char* out, std::size_t n);
 void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p);
 // Actions held on the keyboard, from SDL's key state.
 void host_bindings_keys_held(const bool* keys, int nkeys, bool held[kBindCount]);
-// Actions held on the mouse, from MouseState::buttons (bit n-1 is button n).
+// Actions held on the mouse, from MouseState::buttons (bit n-1 is button n;
+// bits 5 and 6 the wheel's notches, as the pad read holds them).
 void host_bindings_mouse_held(std::uint32_t buttons, bool held[kBindCount]);
 
 // Rebinding, DS3's way: the screen starts a capture for an action, the next
@@ -88,7 +89,7 @@ void host_bind_capture_begin(int action);
 int host_bind_capturing();  // the action being captured, or -1
 // From the event pump. True when the event was the capture's.
 bool host_bind_capture_key(int scancode);
-bool host_bind_capture_mouse(int button);  // 1..5
+bool host_bind_capture_mouse(int button);  // 1..5, or 6 and 7 for the wheel up and down
 // The action whose capture ended since the last call, or -1. Its binding, and
 // any it took a key or button from, changed.
 int host_bind_capture_take_done();

@@ -131,9 +131,15 @@ const char* scancode_name(int sc) {
 #endif
 }
 
-const char* const kMouseNames[6] = {nullptr, "Left Button", "Right Button", "Middle Button", "Button 4", "Button 5"};
-// The same five where the name has to fit in a sentence.
-const char* const kMouseShort[6] = {nullptr, "L Mouse", "R Mouse", "M Mouse", "Mouse 4", "Mouse 5"};
+// Mouse 1..5 are the buttons; 6 and 7 the wheel turned up and down, which the
+// pad read makes a short press of each notch (hle/system.cpp).
+constexpr int kMouseInputs = 7;
+const char* const kMouseNames[kMouseInputs + 1] = {nullptr,  "Left Button", "Right Button", "Middle Button",
+                                                   "Button 4", "Button 5", "Wheel Up", "Wheel Down"};
+// The same where the name has to fit in a sentence.
+const char* const kMouseShort[kMouseInputs + 1] = {nullptr, "L Mouse", "R Mouse", "M Mouse", "Mouse 4", "Mouse 5", "Wheel Up", "Wheel Down"};
+// Their names in [keys]: Mouse1..Mouse5, WheelUp, WheelDown.
+std::string mouse_token(int m) { return m == 6 ? "WheelUp" : m == 7 ? "WheelDown" : "Mouse" + std::to_string(m); }
 
 std::string trim(std::string v) {
     while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '"')) v.pop_back();
@@ -168,6 +174,10 @@ void set_from_text(int a, const std::string& text, const char* where) {
         if (tok.empty() || tok == "none") continue;
         if (tok.size() == 6 && tok.rfind("Mouse", 0) == 0 && tok[5] >= '1' && tok[5] <= '5') {
             mouse = tok[5] - '0';
+            continue;
+        }
+        if (tok == "WheelUp" || tok == "WheelDown") {
+            mouse = tok == "WheelUp" ? 6 : 7;
             continue;
         }
         const int sc = scancode_from_name(tok);
@@ -218,7 +228,7 @@ void host_bindings_save(std::FILE* f) {
         if (const char* n = scancode_name(g_key[a].load(std::memory_order_relaxed))) v = n;
         if (const int m = g_mouse[a].load(std::memory_order_relaxed)) {
             v += v.empty() ? "" : ", ";
-            v += "Mouse" + std::to_string(m);
+            v += mouse_token(m);
         }
         std::fprintf(f, "%s = \"%s\"\n", kInfo[a].key, v.empty() ? "none" : v.c_str());
     }
@@ -233,7 +243,7 @@ void host_binding_describe(int action, char* out, std::size_t n) {
     // A lone ` is a speck in the menu's font.
     if (k && std::strcmp(k, "`") == 0) k = "` (backtick)";
     const int m = host_binding_mouse(action);
-    const char* ms = m >= 1 && m <= 5 ? kMouseNames[m] : nullptr;
+    const char* ms = m >= 1 && m <= kMouseInputs ? kMouseNames[m] : nullptr;
     if (k && ms) {
         std::snprintf(out, n, "%s  /  %s", k, ms);
     } else {
@@ -248,7 +258,7 @@ void host_binding_prompt(int action, char* out, std::size_t n) {
     const int m = host_binding_mouse(action);
     // The key first: a player who bound both reads the key in a sentence more
     // easily than "Left Button", and the prompt has room for one.
-    const char* what = k ? k : m >= 1 && m <= 5 ? kMouseShort[m] : nullptr;
+    const char* what = k ? k : m >= 1 && m <= kMouseInputs ? kMouseShort[m] : nullptr;
     if (what) std::snprintf(out, n, "%s", what);
 }
 
@@ -263,7 +273,7 @@ void host_bindings_keys_held(const bool* keys, int nkeys, bool held[kBindCount])
 void host_bindings_mouse_held(std::uint32_t buttons, bool held[kBindCount]) {
     for (int a = 0; a < kBindCount; ++a) {
         const int m = g_mouse[a].load(std::memory_order_relaxed);
-        held[a] = m >= 1 && m <= 5 && (buttons & (1u << (m - 1)));
+        held[a] = m >= 1 && m <= kMouseInputs && (buttons & (1u << (m - 1)));
     }
     note_debug_key(1, held[kBindDebugMenu]);
 }
@@ -317,7 +327,7 @@ void host_bind_capture_begin(int action) {
     if (action < 0 || action >= kBindCount) return;
     g_capture_ms.store(now_ms(), std::memory_order_relaxed);
     g_capture.store(action, std::memory_order_relaxed);
-    host_log("keys: rebinding %s - press a key or mouse button (Escape cancels, Delete unbinds)",
+    host_log("keys: rebinding %s - press a key or a mouse button, or turn the wheel (Escape cancels, Delete unbinds)",
              kInfo[action].key);
 }
 
@@ -366,7 +376,7 @@ bool host_bind_capture_key(int scancode) {
 
 bool host_bind_capture_mouse(int button) {
     const int a = g_capture.load(std::memory_order_relaxed);
-    if (a < 0 || button < 1 || button > 5) return false;
+    if (a < 0 || button < 1 || button > kMouseInputs) return false;
     // A click that starts a capture is often a double click, and its second
     // press is not a choice: it bound the left button to whatever row was
     // clicked, taking it from Attack. For the first 300 ms a button press is
