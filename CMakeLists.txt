@@ -25,7 +25,7 @@ set_target_properties(monocypher PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_C
 
 # Sea Islands shader decoder and the offline tools built on it.
 find_package(ZLIB REQUIRED)
-add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp)
+add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp)
 target_include_directories(gcn PUBLIC src)
 target_link_libraries(gcn PUBLIC ZLIB::ZLIB)
 add_executable(gcndis tools/gcndis.cpp)
@@ -450,6 +450,9 @@ if(UNIX)
   add_dependencies(translation_cache_test bbhost_translator_fingerprint)
   add_test(NAME translation_cache_test COMMAND translation_cache_test)
   set_tests_properties(translation_cache_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
+  target_link_libraries(gcn_wave_test PRIVATE gcn)
+  add_test(NAME gcn_wave_test COMMAND gcn_wave_test)
   if(SPIRV_TOOLS_LIB)
     add_executable(gcn_translate_test tests/gcn_translate_test.cpp)
     target_link_libraries(gcn_translate_test PRIVATE gcn ${SPIRV_TOOLS_LIB})

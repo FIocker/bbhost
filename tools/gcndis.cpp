@@ -4,8 +4,11 @@
 //   gcndis --list <bundle.dcx>          list entries
 //   gcndis <bundle.dcx> <name-substr>   disassemble matching entries
 //   gcndis --raw <file>                 disassemble a raw code blob or .vpo container
+//   gcndis --wave [-v] <bundle.dcx>...  which pixel shaders may run in a 32-lane subgroup
+//                                       (gcn/wave.h; -v names each one kept at 64)
 #include "gcn/container.h"
 #include "gcn/isa.h"
+#include "gcn/wave.h"
 
 #include <cstdio>
 #include <cstring>
@@ -55,7 +58,7 @@ bool load_bundle(const std::string& path, std::vector<gcn::BundleEntry>& entries
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: gcndis --check <bundle.dcx>... | --list <bundle> | <bundle> <name> | --raw <file>\n");
+        std::fprintf(stderr, "usage: gcndis --check <bundle.dcx>... | --wave [-v] <bundle.dcx>... | --list <bundle> | <bundle> <name> | --raw <file>\n");
         return 2;
     }
     const std::string mode = argv[1];
@@ -70,6 +73,76 @@ int main(int argc, char** argv) {
             std::memcpy(code.words.data(), raw.data(), code.words.size() * 4);
         }
         disassemble(code);
+        return 0;
+    }
+    if (mode == "--wave") {
+        // The renderer's wave32 census of the pixel shaders in the bundles
+        // (gcn/wave.h): distinct programs by
+        // their code, and why those that keep 64 lanes do.
+        bool verbose = false;
+        std::size_t pixel = 0, wave32 = 0, entries_seen = 0, spill_programs = 0;
+        std::size_t by_reason[gcn::kWave64NeedBits] = {};
+        std::map<std::vector<std::uint32_t>, std::uint32_t> seen;
+        std::map<int, std::string> first;  // reason bit -> the first program kept at 64 for it
+        for (int a = 2; a < argc; ++a) {
+            if (std::strcmp(argv[a], "-v") == 0) {
+                verbose = true;
+                continue;
+            }
+            std::vector<gcn::BundleEntry> entries;
+            if (!load_bundle(argv[a], entries)) {
+                return 1;
+            }
+            for (const gcn::BundleEntry& e : entries) {
+                gcn::ShaderCode code;
+                if (!gcn::shader_code(e.data, code) || code.type != 2) {  // ShaderFileHeader type 2: a pixel shader
+                    continue;
+                }
+                ++entries_seen;
+                if (seen.count(code.words)) {
+                    continue;
+                }
+                const gcn::Program p = gcn::decode(code.words.data(), code.words.size());
+                // The translator's spill cells, as it reads them (BBHOST_SPILL_CELLS).
+                const gcn::SpillCells cells = gcn::spill_cells_on() ? gcn::spill_cells(p) : gcn::SpillCells{};
+                const std::uint32_t needs = gcn::pixel_wave64_needs(p, cells.reads);
+                spill_programs += !cells.reads.empty();
+                if (verbose) {
+                    // Each program's readlanes and how many of them read a cell.
+                    std::size_t readlanes = 0;
+                    for (const gcn::Inst& in : p.insts) {
+                        readlanes += (in.enc == gcn::Enc::VOP2 && in.op == 1) || (in.enc == gcn::Enc::VOP3 && in.op == 0x101);
+                    }
+                    if (readlanes) {
+                        std::printf("spills: %s: %zu of %zu v_readlane_b32 read a cell (%zu cells)\n", e.name.c_str(), cells.reads.size(),
+                                    readlanes, cells.cells.size());
+                    }
+                }
+                seen[code.words] = needs;
+                ++pixel;
+                if (!needs) {
+                    ++wave32;
+                    continue;
+                }
+                for (int b = 0; b < gcn::kWave64NeedBits; ++b) {
+                    if (!(needs & (1u << b))) {
+                        continue;
+                    }
+                    ++by_reason[b];
+                    first.emplace(b, e.name);
+                }
+                if (verbose) {
+                    std::printf("keeps 64: %s (%s)\n", e.name.c_str(), gcn::wave64_needs_str(needs).c_str());
+                }
+            }
+        }
+        std::printf("pixel shaders=%zu (entries %zu) wave32=%zu keep-64=%zu; reading spill cells %zu\n", pixel, entries_seen, wave32,
+                    pixel - wave32, spill_programs);
+        for (int b = 0; b < gcn::kWave64NeedBits; ++b) {
+            if (by_reason[b]) {
+                std::printf("  %-24s x%zu (first: %s)\n", gcn::wave64_need_name(b), by_reason[b], first[b].c_str());
+            }
+        }
         return 0;
     }
     if (mode == "--check") {

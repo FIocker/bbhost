@@ -390,6 +390,9 @@ std::string host_gpu_shadow_report();
 std::string host_gpu_recorder_report();
 // The texture image heap's blocks and use (gpu.cpp).
 std::string host_gpu_image_heap_report();
+// Pixel shaders at wave32 (render.cpp): programs by subgroup size, when any
+// were added since the last call; empty otherwise or with the feature off.
+std::string host_gpu_ps_wave_report();
 // A loading screen is up (engine/loading.cpp): the memory keeper makes the
 // coming area's image-heap blocks and upload staging ready, and holds less
 // once play resumes (gpu.cpp, start_memory_reserve).
