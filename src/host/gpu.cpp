@@ -3537,13 +3537,21 @@ void compute_precompile_report() {
 
 void collect_profile_locked(Gpu::Slot& sl);
 
+// 32 bits a marker: the kind in the top two, the index below.
+std::uint32_t gpu_marker_value(unsigned kind, std::uint64_t index) {
+    return (static_cast<std::uint32_t>(kind & 3) << 30) | static_cast<std::uint32_t>(index & 0x3fffffff);
+}
+
+void gpu_write_markers(VkCommandBuffer cmd, std::uint32_t value) {
+    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.marker_buf.buffer, 0, value);
+    g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.marker_buf.buffer, 4, value);
+}
+
 void gpu_checkpoint(unsigned kind, std::uint64_t index) {
     if (g.cmd_buffer_marker) {
-        // 32 bits a marker: the kind in the top two, the index below.
-        const std::uint32_t v = (static_cast<std::uint32_t>(kind & 3) << 30) | static_cast<std::uint32_t>(index & 0x3fffffff);
-        const VkCommandBuffer cmd = g_cmd();
-        g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.marker_buf.buffer, 0, v);
-        g.cmd_buffer_marker(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.marker_buf.buffer, 4, v);
+        // An op of the stream: recording it in place would drain the
+        // recorder at every dispatch of a start after a lost device.
+        rec().marker(gpu_marker_value(kind, index));
         return;
     }
     if (!g.cmd_checkpoint) return;
