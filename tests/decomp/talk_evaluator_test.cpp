@@ -1,5 +1,5 @@
 // The talk scripts' evaluator (decomp/talk/evaluator.cpp) against the game's
-// own, sub_2b73910, in the loaded eboot (tests/eboot_kit.h): the same
+// own, sub_2b73910, in the loaded eboot (tests/decomp/eboot_kit.h): the same
 // expression run by both on two states built alike - a machine (variables,
 // call arguments, a child's return value, an environment), a context (a
 // stack and registers holding ints, floats and the game's own strings), an
@@ -17,7 +17,7 @@
 // Stubbed in the image: the heap lookup a string's destruction asks
 // (sub_247b720: our allocator) and the wide-string imports. Skips without the
 // 1.09 eboot.
-#include "../src/decomp/talk/evaluator.cpp"
+#include "decomp/talk/evaluator.cpp"
 
 #include "eboot_kit.h"
 #include "engine/esd.h"
@@ -51,7 +51,7 @@ using u16 = std::uint16_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 
-const char* const kTest = "talk_script_test";
+const char* const kTest = "decomp_talk_evaluator";
 
 // ---- The allocator the strings come from, and its record ----
 
@@ -85,7 +85,7 @@ GUEST_ABI void alloc_free(Allocator*, void* p) {
 }
 template <int N>
 GUEST_ABI void alloc_trap() {
-    std::printf("talk_script_test: the allocator's slot %d (+0x%x) was called\n", N, N * 8);
+    std::printf("decomp_talk_evaluator: the allocator's slot %d (+0x%x) was called\n", N, N * 8);
     std::abort();
 }
 template <int... I>
@@ -624,7 +624,7 @@ std::vector<std::vector<u8>> corpus(int* scripts) {
         const std::vector<u8> dcx((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
         std::string why;
         if (dcx.empty()) continue;
-        if (!add_script(gcn::dcx_decompress(dcx, &why))) std::printf("talk_script_test: %s is not a long-format script (%s)\n", chr, why.c_str());
+        if (!add_script(gcn::dcx_decompress(dcx, &why))) std::printf("decomp_talk_evaluator: %s is not a long-format script (%s)\n", chr, why.c_str());
     }
     return out;
 }
@@ -653,7 +653,7 @@ int main() {
 
     // The entry the decomp list places ours at.
     if (std::memcmp(eboot_kit::at(0x2b73910), talk_script::kEntry, sizeof talk_script::kEntry) != 0) {
-        std::printf("talk_script_test: sub_2b73910 is not where the decomp expects it\n");
+        std::printf("decomp_talk_evaluator: sub_2b73910 is not where the decomp expects it\n");
         return 1;
     }
 
@@ -674,9 +674,9 @@ int main() {
         for (u64 k = 0; k < 3; ++k) check(exprs[i], 0x1000 * i + k);
     }
     const int corpus_cases = g_cases, corpus_bad = g_bad;
-    std::printf("talk_script_test: %zu expressions of %d scripts (%d left out), %d cases, %d differ\n", exprs.size(), scripts, skipped,
+    std::printf("decomp_talk_evaluator: %zu expressions of %d scripts (%d left out), %d cases, %d differ\n", exprs.size(), scripts, skipped,
                 corpus_cases, corpus_bad);
-    std::printf("talk_script_test: the opcodes the scripts use:");
+    std::printf("decomp_talk_evaluator: the opcodes the scripts use:");
     for (int op = 0x80; op < 0x100; ++op)
         if (used[op]) std::printf(" %02x", op);
     int ints = 0;
@@ -689,7 +689,7 @@ int main() {
         const std::vector<u8> code = random_expression(r);
         check(code, r.next());
     }
-    std::printf("talk_script_test: %d random expressions, %d cases, %d differ\n", kFuzz, g_cases - corpus_cases, g_bad - corpus_bad);
+    std::printf("decomp_talk_evaluator: %d random expressions, %d cases, %d differ\n", kFuzz, g_cases - corpus_cases, g_bad - corpus_bad);
 
     // The same under the host's floating-point mode (denormals kept).
     eboot_kit::host_fp();
@@ -699,6 +699,6 @@ int main() {
         check(code, r.next());
     }
     eboot_kit::guest_fp();
-    std::printf("talk_script_test: %d cases under the host's floating-point mode, %d differ\n", g_cases - before, g_bad - bad_before);
+    std::printf("decomp_talk_evaluator: %d cases under the host's floating-point mode, %d differ\n", g_cases - before, g_bad - bad_before);
     return g_bad ? 1 : 0;
 }
