@@ -85,6 +85,7 @@ add_executable(bbhost
   src/decomp/ez_copy.cpp
   src/decomp/sfx_ribbon.cpp
   src/decomp/sprj_emk.cpp
+  src/decomp/item_lot.cpp
   src/engine/option_menu.cpp
   src/engine/menu_assets.cpp
   src/engine/menu_pointer.cpp
@@ -313,6 +314,8 @@ set_source_files_properties(src/decomp/sprj_event_flag_man.cpp src/decomp/game_m
 # The effect ribbons' writers reproduce the game's floating point bit for bit:
 # no multiply-add fused into one rounding.
 set_source_files_properties(src/decomp/sfx_ribbon.cpp PROPERTIES COMPILE_OPTIONS "-fno-stack-protector;-ffp-contract=off")
+# The item-lot roll weighs its slots in floats as the game does.
+set_source_files_properties(src/decomp/item_lot.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 if(MSVC)
   target_compile_options(bbhost PRIVATE /W4)
@@ -385,6 +388,13 @@ if(UNIX)
   target_link_libraries(decomp_insn_eboot_test PRIVATE eboot_kit)
   add_test(NAME decomp_insn_eboot_test COMMAND decomp_insn_eboot_test)
   set_tests_properties(decomp_insn_eboot_test PROPERTIES SKIP_RETURN_CODE 77)
+  # The item-lot roll against the game's code (skips without the eboot).
+  add_executable(item_lot_test tests/item_lot_test.cpp src/core/thunk.cpp src/core/portable.cpp src/hle/sysv_va.cpp
+                 src/host/main_wait.cpp)
+  target_compile_options(item_lot_test PRIVATE -ffp-contract=off)
+  target_link_libraries(item_lot_test PRIVATE eboot_kit pthread)
+  add_test(NAME item_lot_test COMMAND item_lot_test)
+  set_tests_properties(item_lot_test PROPERTIES SKIP_RETURN_CODE 77)
   # The engine's classes by the names they register (tools/class_catalog.cpp).
   add_executable(class_catalog tools/class_catalog.cpp src/decomp/insn.cpp)
   target_link_libraries(class_catalog PRIVATE eboot_kit)
