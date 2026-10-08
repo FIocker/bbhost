@@ -66,6 +66,13 @@ game writes a save (at most every five minutes) a copy goes to
 `<data>/save-backups/`, and the newest eight are kept. To restore one, quit and
 copy its files over `<data>/saves/SPRJ0005`.
 
+The shader caches in `<data>/bbhost` (`translation-cache.bin`,
+`vulkan-pipeline-cache.bin`) belong to the build that made them: a new or
+updated bbhost finds another build's name in `shader-cache-build.txt`, throws
+both away (`gpu: shader caches made by ..., this is ...: cleared`) and builds
+them again while the title loads, from `stage-manifest.bin`, the list of the
+game's shaders, which is kept. `BBHOST_KEEP_SHADER_CACHE=1` keeps them.
+
 ## Controls
 
 A controller works as on the console. Without one, the keyboard and mouse
