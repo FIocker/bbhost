@@ -74,6 +74,7 @@ T read(std::uint64_t va) {
 // to the trap.
 struct Import {
     std::string name, nid;
+    std::uint64_t got = 0;  // where the game's code finds it
 };
 std::vector<Import> g_imports;
 std::uint8_t* g_stubs = nullptr;
@@ -222,6 +223,16 @@ const std::vector<Relocated>& relocated() {
     return out;
 }
 
+bool bind(const char* name, const void* fn) {
+    bool found = false;
+    for (const Import& imp : g_imports)
+        if (imp.got && imp.name == name) {
+            *reinterpret_cast<const void**>(static_cast<std::uintptr_t>(imp.got)) = fn;
+            found = true;
+        }
+    return found;
+}
+
 float Rng::value(float lo, float hi) {
     if (specials && chance(0.15)) {
         static const float kSpecial[] = {0.0f,     -0.0f,   1.0f,   -1.0f,   0.5f,   1e-40f, -1e-40f, FLT_MAX,
@@ -238,7 +249,7 @@ float Rng::value(float lo, float hi) {
 // What the loader binds imports with (core/imports.h), for a test: traps.
 std::string lookup_nid_name(std::string_view nid) { return std::string(nid); }
 
-std::uint64_t bind_import(const std::string& nid_name, const std::string& nid, std::uint64_t, int plt_index) {
+std::uint64_t bind_import(const std::string& nid_name, const std::string& nid, std::uint64_t got, int plt_index) {
     using namespace eboot_kit;
     // The PLT's order names the slot the game calls (core/imports.cpp).
     const std::string name =
@@ -256,7 +267,7 @@ std::uint64_t bind_import(const std::string& nid_name, const std::string& nid, s
         if (name == h.name) return reinterpret_cast<std::uint64_t>(h.fn);
     const std::uint32_t i = static_cast<std::uint32_t>(g_imports.size());
     if ((i + 1) * kStub > kStubSpace) return 0;
-    g_imports.push_back({name, nid});
+    g_imports.push_back({name, nid, got});
     std::uint8_t* s = g_stubs + i * kStub;
     s[0] = 0xbf;  // mov edi, i
     std::memcpy(s + 1, &i, 4);
