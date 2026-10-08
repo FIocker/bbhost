@@ -79,12 +79,6 @@ struct MouseState {
 };
 // Reads and clears the latched edges, the wheel and `moved`. One consumer.
 MouseState host_mouse_state();
-// The relative motion since the last call while the mouse turned the camera
-// (camera mode), in the device's own counts - SDL's relative motion, raw and
-// unaccelerated like the DirectInput counts DS3 reads. The camera's one
-// consumer is engine/mouse_camera.h; motion from before camera mode began is
-// not included.
-void host_mouse_take_camera(float& dx, float& dy);
 // The position alone, without consuming anything - for drawing the pointer,
 // which must not eat the edges its real consumer needs. False when the pointer
 // is outside the window or nothing has been presented yet.

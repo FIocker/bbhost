@@ -70,6 +70,9 @@ void decomp_add(const DecompFunction& fn);
 //   BBHOST_DECOMP_COMPARE=1      those with a compare run it instead of ours
 void decomp_install(ElfImage* image);
 bool decomp_comparing();
+// Whether a function on the list took the game's place, by its name: 0 not,
+// 1 ours, 2 its compare stand-in. After decomp_install.
+int decomp_placed(const char* name);
 // The exit report: what is ours, and what a compare run found.
 void decomp_report();
 

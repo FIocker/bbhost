@@ -8,7 +8,19 @@
 // the sine, arctangent and tangent the step calls through the game's import
 // stubs are bound to the host's, for both. Run under the console's
 // floating-point mode.
+//
+// Two of ours' additions run against the game's code too. The mouse: on half
+// the cameras the mouse camera's own stubs (engine/mouse_camera_stubs.cpp) go
+// into the game's code - its free camera's store and the fast turn's exits,
+// as the hooks place them - and both versions turn by the same counts. The
+// hold of auto-rotation: the community patch's nops go into the game's code
+// at all four of its stores or at one, and ours, reading them, must hold the
+// same; with the three the mouse holds, ours also runs on the game's own
+// bytes holding them by its flag alone.
 #include "decomp/decomp.h"
+#include "engine/mouse_camera.h"
+#include "engine/mouse_camera_step.h"
+#include "engine/mouse_camera_stubs.h"
 
 #include "eboot_kit.h"
 
@@ -25,6 +37,9 @@
 
 void follow_cam_update(std::uint8_t* cam, std::uint8_t* chr, void* world, float dt);
 bool follow_camera_body_ok(const std::uint8_t* entry);
+
+// The compare stand-in's, which the test does not run (engine/mouse_camera.cpp in the game).
+void mouse_camera_compare_begin() { mouse_camera::begin_update(); }
 
 namespace {
 
@@ -287,6 +302,55 @@ void vary_frame(u8* a, u8* b) {
     eboot_kit::at(0x5527a94)[0] = g_rng.chance(0.5);
 }
 
+// ---- the mouse, and the hold ---------------------------------------------------
+
+// What the store stub calls in the game's code: the hook's step.
+void free_camera_host(u8* cam, u8* input, float stick_pitch, float stick_yaw) {
+    mouse_camera::turn_camera(cam, input, stick_pitch, stick_yaw);
+}
+
+constexpr u64 kTurnStore = 0x183ce54;
+constexpr u64 kRampExits[2] = {0x183f9bc, 0x183fabf};
+u8 g_store_game[19], g_ramp_game[2][14];
+
+void jump_to(u64 bn, std::size_t n, const void* dest) {
+    u8* code = eboot_kit::at(bn);
+    const u64 to = reinterpret_cast<u64>(dest);
+    code[0] = 0xff;
+    code[1] = 0x25;
+    std::memset(code + 2, 0, 4);
+    std::memcpy(code + 6, &to, 8);
+    std::memset(code + 14, 0xcc, n - 14);
+}
+
+// The mouse camera's stubs in the game's code, or its own bytes back.
+void place_mouse_stubs(bool on) {
+    if (on) {
+        jump_to(kTurnStore, sizeof g_store_game, reinterpret_cast<const void*>(&bb_mouse_camera_stub));
+        for (const u64 at : kRampExits) jump_to(at, 14, reinterpret_cast<const void*>(&bb_mouse_camera_ramp_stub));
+    } else {
+        std::memcpy(eboot_kit::at(kTurnStore), g_store_game, sizeof g_store_game);
+        for (int i = 0; i < 2; ++i) std::memcpy(eboot_kit::at(kRampExits[i]), g_ramp_game[i], 14);
+    }
+}
+
+// The community patch's nops at the hold sites in `mask`, the game's bytes at the rest.
+void place_hold_nops(unsigned mask) {
+    for (int i = 0; i < 4; ++i) {
+        const auto& site = mouse_camera::kHoldSites[i];
+        std::memcpy(eboot_kit::at(site.bn), (mask >> i & 1) ? mouse_camera::kNop9 : site.game, sizeof site.game);
+    }
+}
+
+// A frame's mouse: still, a few counts, a sweep, or a fraction (SDL's
+// relative motion is a float).
+float counts() {
+    if (g_rng.chance(0.4)) return 0.0f;
+    if (g_rng.chance(0.1)) return static_cast<float>(g_rng.range(-900, 900));
+    if (g_rng.chance(0.2)) return g_rng.uniform(-3.0f, 3.0f);
+    return static_cast<float>(g_rng.range(-20, 20));
+}
+
 bool same(const u8* a, const u8* b, std::size_t n, std::size_t* where) {
     for (std::size_t k = 0; k < n; k += 4) {
         float x, y;
@@ -321,6 +385,12 @@ int main(int argc, char** argv) {
         body[0x183dc98 - kUpdate] = 0x05;
         body[0x183dcfe - kUpdate] = 0x00;
         ok = ok && follow_camera_body_ok(body.data());
+        // The community patch's nops at the hold sites pass; anything else there does not.
+        for (const auto& site : mouse_camera::kHoldSites) std::memcpy(&body[site.bn - kUpdate], mouse_camera::kNop9, 9);
+        ok = ok && follow_camera_body_ok(body.data());
+        body[mouse_camera::kHoldSites[2].bn - kUpdate] = 0xcc;
+        ok = ok && !follow_camera_body_ok(body.data());
+        for (const auto& site : mouse_camera::kHoldSites) std::memcpy(&body[site.bn - kUpdate], site.game, 9);
         body[0x183ce54 - kUpdate] ^= 0xff;
         ok = ok && !follow_camera_body_ok(body.data());
         body[0x183ce54 - kUpdate] ^= 0xff;
@@ -373,6 +443,11 @@ int main(int argc, char** argv) {
 
     const auto game = eboot_kit::fn<void(GUEST_ABI*)(u8*, u8*, void*, float)>(kUpdate);
     const int cameras = argc > 1 ? std::atoi(argv[1]) : 2000, frames = 60;
+    g_mouse_camera_host = reinterpret_cast<void*>(&free_camera_host);
+    g_mouse_camera_resume = 0x183ce67;
+    std::memcpy(g_store_game, eboot_kit::at(kTurnStore), sizeof g_store_game);
+    for (int i = 0; i < 2; ++i) std::memcpy(g_ramp_game[i], eboot_kit::at(kRampExits[i]), 14);
+    int mouse_frames = 0, held_frames = 0;
     u8* a = block(kCam);
     u8* b = block(kCam);
     u8 gsm_a[0x20], gsm_b[0x20];
@@ -393,6 +468,24 @@ int main(int argc, char** argv) {
         const u32 ease = sixty ? 0x3ccccccdu : 0x3dcccccdu, rate = sixty ? 0x3c89b0c3u : 0x3d088889u;  // engine/frame_rate.cpp
         std::memcpy(eboot_kit::at(0x4d25e68), &ease, 4);
         std::memcpy(eboot_kit::at(0x4d25e94), &rate, 4);
+        // The mouse on odd cameras, at a sensitivity and with axes of its own.
+        const bool mouse = c % 2 == 1;
+        place_mouse_stubs(mouse);
+        const float per_count = mouse_camera::degrees_per_count(g_rng.range(0, 10));
+        u32 per_count_bits;
+        std::memcpy(&per_count_bits, &per_count, 4);
+        mouse_camera::g_degrees_per_count.store(per_count_bits);
+        const u32 axes = (g_rng.chance(0.3) ? mouse_camera::kInvertX : 0u) | (g_rng.chance(0.3) ? mouse_camera::kInvertY : 0u);
+        // The hold: none on most cameras, all four sites, or one of them; on
+        // every other all-four camera the three the mouse holds instead, and
+        // ours holds them by its flag alone.
+        const int hold_mode = c % 7;
+        const bool by_flag = hold_mode == 2 && (c / 7) % 2 == 1;
+        const unsigned nops = by_flag ? mouse_camera::kHeldWithMouse
+                              : hold_mode == 2 ? 0xfu
+                              : hold_mode >= 3 ? 1u << (hold_mode - 3)
+                                               : 0u;
+        place_hold_nops(nops);
         Chr chr = make_chr();
         make_camera(a);
         std::memcpy(b, a, kCam);
@@ -410,7 +503,17 @@ int main(int argc, char** argv) {
             g_drawn.clear();
             g_draw_begins = 0;
             g_casts.clear();
+            // This frame's counts, for the game's update (taken first, as the
+            // hook on its prologue takes them) and then for ours.
+            const float dx = mouse ? counts() : 0.0f, dy = mouse ? counts() : 0.0f;
+            const u8 free_before = bb_mouse_camera_free_now;
+            mouse_camera::g_flags.store(axes);
+            mouse_camera::g_counts.store(mouse_camera::pack(dx, dy));
+            mouse_camera::begin_update();
+            const u64 turns_before = mouse_camera::g_turns.load();
             game(a, followed, world, dt);
+            const u8 free_a = bb_mouse_camera_free_now;
+            if (mouse_camera::g_turns.load() != turns_before) ++mouse_frames;
             const std::vector<Cast> casts_a = g_casts;
             g_casts.clear();
             std::memcpy(gsm_a, g_gsm, sizeof gsm_a);
@@ -421,7 +524,18 @@ int main(int argc, char** argv) {
             std::memcpy(shape, shape_before, sizeof shape_before);
             g_drawn.clear();
             g_draw_begins = 0;
+            bb_mouse_camera_free_now = free_before;
+            mouse_camera::g_flags.store(axes | (by_flag ? mouse_camera::kHoldAutoRotation : 0u));
+            mouse_camera::g_counts.store(mouse_camera::pack(dx, dy));
+            if (by_flag) place_hold_nops(0);
             follow_cam_update(b, followed, world, dt);
+            if (by_flag) place_hold_nops(nops);
+            if (nops) ++held_frames;
+            // Whether the free camera ran: noted by the stubs in the game's code, by ours itself.
+            const bool free_same =
+                !mouse || (mouse_camera::g_frame.free_before == (free_before != 0) && bb_mouse_camera_free_now == free_a);
+            mouse_camera::g_flick_counts.store(0);
+            mouse_camera::g_flick_updates.store(0);
             std::memcpy(gsm_b, g_gsm, sizeof gsm_b);
             ++steps;
             std::size_t at = 0;
@@ -432,9 +546,10 @@ int main(int argc, char** argv) {
                                     same(shape_a, shape, sizeof shape_a, &where);
             const bool casts_same = casts_a == g_casts;
             const bool camera_same = same(a, b, kCam, &at) && std::memcmp(gsm_a, gsm_b, sizeof gsm_a) == 0;
-            if (!draws_same || !casts_same || !camera_same) {
+            if (!draws_same || !casts_same || !camera_same || !free_same) {
                 if (++bad <= 12) {
                     if (!draws_same) std::printf("camera %d frame %d: the debug draw differs\n", c, f);
+                    if (!free_same) std::printf("camera %d frame %d: whether the free camera ran differs\n", c, f);
                     for (std::size_t k = 0; !casts_same && k < std::max(casts_a.size(), g_casts.size()); ++k) {
                         if (k < casts_a.size() && k < g_casts.size() && casts_a[k] == g_casts[k]) continue;
                         const auto show = [](const char* who, const std::vector<Cast>& v, std::size_t k) {
@@ -461,6 +576,9 @@ int main(int argc, char** argv) {
             }
         }
     }
-    std::printf("%s: %d cameras, %d frames, %d differ\n", test, cameras, steps, bad);
-    return bad ? 1 : 0;
+    place_mouse_stubs(false);
+    place_hold_nops(0);
+    std::printf("%s: %d cameras, %d frames, %d differ; %d frames turned by the mouse, %d with auto-rotation held\n", test,
+                cameras, steps, bad, mouse_frames, held_frames);
+    return bad || !mouse_frames || !held_frames ? 1 : 0;
 }
