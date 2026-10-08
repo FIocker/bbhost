@@ -3,6 +3,7 @@
 
 #include <pthread.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
@@ -257,6 +258,37 @@ void host_thread_set_name(const char* name) {
     for (; i < 63 && name[i]; ++i) w[i] = static_cast<wchar_t>(static_cast<unsigned char>(name[i]));
     w[i] = 0;
     set_desc(GetCurrentThread(), w);
+#endif
+}
+
+bool host_desktop_max_size(int* w, int* h) {
+#if defined(_WIN32)
+    // EnumDisplaySettings gives each display's mode in physical pixels,
+    // whatever the process's DPI awareness (the monitor rectangles would be
+    // scaled for a process that is not aware).
+    int bw = 0, bh = 0;
+    DISPLAY_DEVICEW dd{};
+    dd.cb = sizeof(dd);
+    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &dd, 0); ++i) {
+        if (dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) {
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm)) {
+                bw = std::max(bw, static_cast<int>(dm.dmPelsWidth));
+                bh = std::max(bh, static_cast<int>(dm.dmPelsHeight));
+            }
+        }
+        dd = DISPLAY_DEVICEW{};
+        dd.cb = sizeof(dd);
+    }
+    if (bw <= 0 || bh <= 0) return false;
+    *w = bw;
+    *h = bh;
+    return true;
+#else
+    (void)w;
+    (void)h;
+    return false;
 #endif
 }
 

@@ -36,6 +36,10 @@ std::uint32_t host_thread_id();
 // (comm, 15 characters) on Linux; on Windows winpthreads' copy and
 // SetThreadDescription, which the sampler and debuggers read.
 void host_thread_set_name(const char* name);
+// The largest width and height among the desktop's displays, in physical
+// pixels (each display's current mode). False when the platform does not say
+// (only Windows answers today).
+bool host_desktop_max_size(int* w, int* h);
 // The name Linux can hold (15 characters): leading dotted parts dropped
 // first ("Core.Res.PostProcessor_0" -> "PostProcessor_0"), then the tail.
 void host_thread_fit_name(const char* name, char (&out)[16]);

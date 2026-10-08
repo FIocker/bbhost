@@ -1034,7 +1034,38 @@ bool live_resolution_install(ElfImage* image) {
     }();
     const std::uint64_t start_px = static_cast<std::uint64_t>(w) * static_cast<std::uint32_t>(h);
     const bool tight = live && host_gpu_memory_tight();
-    grow_gfx_heap(image, !live ? start_px : std::max(tight ? kPx1080 : kPxLiveDefault, start_px));
+    // How large a live change may go: the largest display's size (a picture
+    // larger than every screen only scales down), or the starting size when
+    // that is larger. The display buffers and the render-target heap are made
+    // for it at the start and cost memory pinned for the GPU for the whole
+    // run whether a change ever comes or not - made at 5120x2160 they were
+    // 4 x 42.5 MiB of display buffers, a 5120x2160 depth target, whole-image
+    // clears of them every frame and +1,088 MiB of heap on a 1080p screen.
+    // A larger entry applies at the next start (live_resolution_can).
+    // BBHOST_LIVE_MAX=<w>x<h> sets the size, =max the Resolution setting's
+    // largest entries (5120x2160), as before.
+    std::uint32_t max_w = kMaxW, max_h = kMaxH;
+    const char* max_why = "the Resolution setting's largest entries";
+    int desk_w = 0, desk_h = 0;
+    if (const char* e = std::getenv("BBHOST_LIVE_MAX"); e && *e) {
+        unsigned ew = 0, eh = 0;
+        if (std::strcmp(e, "max") != 0 && std::sscanf(e, "%ux%u", &ew, &eh) == 2 && ew && eh) {
+            max_w = std::min<std::uint32_t>(ew, kMaxW);
+            max_h = std::min<std::uint32_t>(eh, kMaxH);
+            max_why = "BBHOST_LIVE_MAX";
+        }
+    } else if (host_desktop_max_size(&desk_w, &desk_h)) {
+        max_w = std::min<std::uint32_t>(static_cast<std::uint32_t>(desk_w), kMaxW);
+        max_h = std::min<std::uint32_t>(static_cast<std::uint32_t>(desk_h), kMaxH);
+        max_why = "the largest display";
+    }
+    if (tight) {
+        // Only sizes within 1080p's pixels: the heap is imported whole.
+        max_w = std::min<std::uint32_t>(max_w, 1920);
+        max_h = std::min<std::uint32_t>(max_h, 1080);
+    }
+    const std::uint64_t live_px = std::max(start_px, std::min(static_cast<std::uint64_t>(max_w) * max_h, kPxLiveDefault));
+    grow_gfx_heap(image, !live ? start_px : live_px);
     if (tight)
         host_log("resolution: live changes up to %.1f million pixels, the GPU's memory is tight (larger sizes apply at the next start)",
                  static_cast<double>(g_live_max_px) / 1e6);
@@ -1045,10 +1076,11 @@ bool live_resolution_install(ElfImage* image) {
     g_device_slot = static_cast<const std::uint64_t*>(guest_ptr(image->mem, guest(kGxDeviceSlot)));
     g_manager_slot = static_cast<const std::uint64_t*>(guest_ptr(image->mem, guest(kGraphicsManagerSlot)));
     g_res_words = static_cast<const std::uint32_t*>(guest_ptr(image->mem, guest(kResWidth)));
-    // The widest and tallest entry a live change can reach: with tight memory
-    // only those within 1080p's pixels, whose display buffers are 1920x1080.
-    g_display[0] = std::max<std::uint32_t>(tight ? 1920 : kMaxW, static_cast<std::uint32_t>(w));
-    g_display[1] = std::max<std::uint32_t>(tight ? 1080 : kMaxH, static_cast<std::uint32_t>(h));
+    // The widest and tallest entry a live change can reach (above), or the
+    // starting size when larger.
+    g_display[0] = std::max<std::uint32_t>(max_w, static_cast<std::uint32_t>(w));
+    g_display[1] = std::max<std::uint32_t>(max_h, static_cast<std::uint32_t>(h));
+    host_log("resolution: live changes up to %ux%u (%s); larger sizes apply at the next start", g_display[0], g_display[1], max_why);
 
     // Every edit is checked before any is made, so a mismatch leaves the
     // image as it was. The call sites and prologues are checked by the hooks
