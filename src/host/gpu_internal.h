@@ -130,6 +130,11 @@ struct ComputePipeline {
     // Its pipeline is still in the driver's compiler on a worker, and was not
     // waited for (gpu.cpp, take_precompiled_compute): failed until it is done.
     bool pending = false;
+    // The unoptimized pipeline, standing in while the optimized one is built
+    // in the background (BBHOST_CS_OPTIMIZE, gpu.cpp): the dispatch takes the
+    // optimized one once it is there (adopt_optimized_compute).
+    bool standin = false;
+    std::uint64_t opt_seen = 0;
     // A "fill" shader: stores one constant (loaded from a constant buffer)
     // to every element of a V# in the user SGPRs. When that V# is a render
     // target the dispatch becomes an image clear (the image is the target's
@@ -321,8 +326,16 @@ struct Gpu {
     VkDescriptorPool desc_pool = VK_NULL_HANDLE;
     VkPipelineCache cache = VK_NULL_HANDLE;
     VkPipelineCache side_cache = VK_NULL_HANDLE;  // PipelineCacheUse: creations while a save serializes `cache`
+    // The bb-cs-optimize threads' builds (BBHOST_CS_OPTIMIZE): a cache of their
+    // own, merged into `cache` where the side cache is, so that a build taking
+    // minutes never holds a save waiting for `cache`'s users (gpu.cpp).
+    VkPipelineCache opt_cache = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
     bool has_maint8 = false;
+    // Vulkan 1.3's pipelineCreationCacheControl: a pipeline can be asked for
+    // only if the pipeline cache already has it (VK_PIPELINE_CREATE_FAIL_ON_
+    // PIPELINE_COMPILE_REQUIRED_BIT), which answers without compiling.
+    bool cache_control = false;
     std::uint32_t vendor_id = 0;  // VkPhysicalDeviceProperties::vendorID (0x10de NVIDIA, 0x1002 AMD)
     bool integrated = false;      // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: its device-local memory is system RAM
     bool tight = false;           // little memory in all its heaps (gpu.cpp, memory_tight)
@@ -497,6 +510,11 @@ void stage_manifest_load(const std::string& path);
 void stage_manifest_save(const std::string& path);
 void stage_manifest_save_async(const std::string& path);
 std::string stage_manifest_path();
+// render.cpp: the precompile workers run on half the hardware threads until
+// the first in-game frame and while a loading screen is up, a quarter of them
+// otherwise.
+void precompile_set_loading(bool loading);
+void precompile_set_world_reached();
 
 // gpu.cpp
 bool init_locked();
@@ -786,17 +804,30 @@ constexpr std::size_t kDrawRecs = 16384;
 extern DrawRec g_draw_recs[kDrawRecs];
 extern std::uint64_t g_draw_rec_next;
 
+// A compute shader's pipeline at its first use, with or without the driver's
+// optimizer as BBHOST_CS_OPTIMIZE says (gpu.cpp). `standin`: it is the
+// unoptimized one, and the optimized one is being built on a bb-cs-optimize
+// thread under `opt_key`; adopt_optimized_compute swaps it in. `watch`: the
+// name the watchdog lists it under while it compiles.
+VkPipeline first_compute_pipeline(VkShaderModule module, std::uint64_t opt_key, const std::string& name,
+                                  const std::vector<std::uint32_t>& spirv, bool& standin, const std::string& watch);
+// A stand-in's optimized pipeline, when it is built: true when `pipeline` now
+// is it (and `standin` false). Cheap when nothing new was built since `seen`.
+bool adopt_optimized_compute(std::uint64_t opt_key, VkPipeline& pipeline, bool& standin, std::uint64_t& seen);
+// The exit report's lines on it, and the shaders whose optimized build was
+// still running at exit after a minute (kept unoptimized at the next start).
+void compute_optimize_report();
+std::string compute_optimize_window();    // the 300-flip report's piece; empty when nothing happened
+std::uint64_t compute_optimized_built();  // optimized builds so far: the periodic cache save looks for new ones
+// The watchdog's line on compute pipelines still compiling (gpu.cpp), their
+// SPIR-V written to the data directory's tmp.
+void compute_compiling_report();
+
 // ---- the glitch hunt (glitch.cpp, BBHOST_GLITCH=1) ----
 // Finds the frames that flash or stretch and names the draws behind them:
 // every presented frame is box-filtered on the GPU and compared with both
 // its neighbours, and every draw's covered samples come from an occlusion
 // query and are compared with the same draw's in the frames either side.
-// Compute pipelines' create flags: without driver optimization on AMD
-// (BBHOST_CS_OPTIMIZE, gpu.cpp).
-VkPipelineCreateFlags compute_create_flags();
-// The watchdog's line on compute pipelines still compiling (gpu.cpp), their
-// SPIR-V written to the data directory's tmp.
-void compute_compiling_report();
 // The GPU busy meter (gpu_busy.cpp): the union of the time our command
 // buffers spent on the GPU, a timestamp at each one's start and end.
 void busy_init_locked();                           // after the slots exist: the query pools, or off

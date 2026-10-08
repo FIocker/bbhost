@@ -157,6 +157,13 @@ add_custom_target(bbhost_version
           -P ${CMAKE_SOURCE_DIR}/cmake/version.cmake
   BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/bbhost_version.h)
 add_dependencies(bbhost bbhost_version)
+# The translator's fingerprint (build/gen/translator_fingerprint.h): the
+# translation cache's key for "the same translator".
+add_custom_target(bbhost_translator_fingerprint
+  COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/gen/translator_fingerprint.h
+          -P ${CMAKE_SOURCE_DIR}/cmake/translator_fingerprint.cmake
+  BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/translator_fingerprint.h)
+add_dependencies(bbhost bbhost_translator_fingerprint)
 
 # The Windows exe's icon and version details.
 if(WIN32)
@@ -255,7 +262,7 @@ if(Vulkan_FOUND)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
   target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/draw_capture.cpp
-                                src/host/shader_patch.cpp)
+                                src/host/shader_patch.cpp src/host/translation_cache.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
   # optimizer; without it every table is built.
@@ -435,6 +442,14 @@ if(UNIX)
   target_link_libraries(gcn_decode_test PRIVATE gcn)
   add_test(NAME gcn_decode_test COMMAND gcn_decode_test)
   set_tests_properties(gcn_decode_test PROPERTIES SKIP_RETURN_CODE 77)
+  # The translation cache (src/host/translation_cache.cpp, which it includes)
+  # against the shipped shader bundles.
+  add_executable(translation_cache_test tests/translation_cache_test.cpp)
+  target_include_directories(translation_cache_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
+  target_link_libraries(translation_cache_test PRIVATE gcn ZLIB::ZLIB)
+  add_dependencies(translation_cache_test bbhost_translator_fingerprint)
+  add_test(NAME translation_cache_test COMMAND translation_cache_test)
+  set_tests_properties(translation_cache_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   if(SPIRV_TOOLS_LIB)
     add_executable(gcn_translate_test tests/gcn_translate_test.cpp)
     target_link_libraries(gcn_translate_test PRIVATE gcn ${SPIRV_TOOLS_LIB})

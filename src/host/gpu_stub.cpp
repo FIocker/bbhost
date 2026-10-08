@@ -21,6 +21,7 @@ void host_gpu_report() {}
 void host_gpu_submit() {}
 void host_gpu_save_pipeline_cache() {}
 void host_gpu_save_pipeline_cache_at_exit() {}
+std::string host_gpu_compile_report() { return {}; }
 std::string host_gpu_profile_report() { return ""; }
 bool host_gpu_mem_write(std::uint64_t, const void*, std::size_t) { return false; }
 bool host_gpu_mem_fill(std::uint64_t, std::uint32_t, std::size_t) { return false; }
@@ -54,3 +55,4 @@ std::string host_gpu_recorder_report() { return {}; }
 std::string host_gpu_image_heap_report() { return {}; }
 std::string host_gpu_memory_budget_report() { return {}; }
 void host_gpu_set_loading(bool) {}
+void host_gpu_world_reached() {}

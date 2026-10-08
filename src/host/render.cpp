@@ -10,6 +10,7 @@
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
 #include "host/tess_lds.h"
+#include "host/translation_cache.h"
 
 #include "host/draw_capture.h"
 #include "gcn/container.h"
@@ -2012,7 +2013,7 @@ const gcn::TranslateResult& paths_for(std::uint64_t hash, const std::vector<std:
     o.stage = stage;
     o.rsrc1 = rsrc1;
     o.rsrc2 = rsrc2;
-    return g_paths_cache[hash] = gcn::translate(prog, o);
+    return g_paths_cache[hash] = translate_cached(prog, o, TranslationUse::kPaths);
 }
 
 namespace {
@@ -3322,7 +3323,7 @@ VkShaderModule tess_hull_module(const DrawState& s, const std::string& dump_name
     o.exec_known = g.exec_known;
     o.descriptor_set = 0;
     const gcn::Program prog = gcn::decode(hs->words.data(), hs->words.size());
-    const gcn::TranslateResult r = gcn::translate(prog, o);
+    const gcn::TranslateResult r = translate_cached(prog, o);
     VkShaderModule m = VK_NULL_HANDLE;
     if (!prog.errors.empty() || !r.ok()) {
         host_log("render: hull shader %s as a control stage: %s", hs->name.c_str(),
@@ -3644,7 +3645,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             const gcn::Program ps_prog = gcn::decode(ps_words.data(), ps_words.size());
             if (!ps_prog.errors.empty()) return fail("PS decode: " + ps_prog.errors[0].what);
             const gcn::TranslateOptions po = ps_translate_options(ps_in);
-            pl.ps.fresh() = gcn::translate(ps_prog, po);
+            pl.ps.fresh() = translate_cached(ps_prog, po);
             note_stage_translation(1, ps_words, ps_key, stage_lean);
             note_ps_early_tests(ps_words, pl.ps.meta().spirv);
             note_precompile_miss(ps_name, ps_in);
@@ -3674,7 +3675,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             // its typed lift. The lift declares the translation's bindings, so the
             // descriptor sets are unchanged; a rejection keeps the translation.
             if (ps_lift) {
-                gcn::LiftResult lifted = gcn::lift_pixel_shader(ps_prog, po, pl.ps.meta());
+                gcn::LiftResult lifted = lift_cached(false, ps_prog, po, pl.ps.meta());
                 static std::mutex logged_mu;  // no-fallback variants build on the pipeline workers
                 static std::set<std::string> logged;
                 bool first;
@@ -3755,7 +3756,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             if (!fetch_prog.errors.empty()) return fail("fetch decode: " + fetch_prog.errors[0].what);
         }
         const gcn::TranslateOptions vo = vs_translate_options(vs_in, fetch_words.empty() ? nullptr : &fetch_prog);
-        pl.vs.fresh() = gcn::translate(vs_prog, vo);
+        pl.vs.fresh() = translate_cached(vs_prog, vo);
         note_stage_translation(0, vs_words, vs_key, stage_lean);
         note_vs_precompile_miss(vs_name, vs_in);
         note_image_dims(0, vs_name, vs_prog, pl.vs.meta(), vs_dims);
@@ -3777,7 +3778,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // checks the outputs), so layouts and linkage are unchanged; a rejection
         // keeps the translation.
         if (vs_decomp) {
-            gcn::LiftResult lifted = gcn::lift_vertex_shader(vs_prog, vo, pl.vs.meta());
+            gcn::LiftResult lifted = lift_cached(true, vs_prog, vo, pl.vs.meta());
             static std::mutex logged_mu;  // no-fallback variants build on the pipeline workers
             static std::set<std::string> logged;
             bool first;
@@ -3828,7 +3829,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             prog = gcn::decode(ls->words.data(), ls->words.size());
             gcn::Program fprog;
             if (fetch) fprog = gcn::decode(fetch->words.data(), fetch->words.size());
-            pl.tess_ls.fresh() = gcn::translate(prog, tess_ls_options(s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s, fetch ? &fprog : nullptr));
+            pl.tess_ls.fresh() = translate_cached(prog, tess_ls_options(s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s, fetch ? &fprog : nullptr));
         }
         if (!prog.errors.empty() || !pl.tess_ls.meta().ok()) {
             host_log("render: tessellation LS %s as a vertex stage: %s", ls->name.c_str(),
@@ -4295,32 +4296,84 @@ struct Precompiler {
     std::atomic<std::uint64_t> queued{0}, done{0}, failed{0}, translate_us{0}, library_us{0}, stage_hits{0};
     std::uint64_t miss_not_ready = 0, miss_queued = 0, miss_compiling = 0, miss_failed = 0, miss_flat = 0, miss_input_map = 0, miss_eft_on = 0, miss_eft_off = 0, miss_dims = 0, miss_modes = 0, miss_ena = 0,
                   miss_rsrc = 0, miss_other = 0, miss_lifted = 0;  // under mu
+    // The workers (precompiler()): `boot` of them until the first in-game
+    // frame and while a loading screen is up, `steady` otherwise; those past
+    // `limit` wait on park_cv.
+    std::condition_variable park_cv;
+    int limit = 0, boot = 0, steady = 0;  // under mu
+    // A run of jobs from the queue's first one to the workers' next idle
+    // moment, for the "idle" line: how long the start's compiles took.
+    bool busy = false;                                       // under mu
+    std::chrono::steady_clock::time_point busy_since{};     // under mu
+    std::uint64_t burst_jobs = 0, burst_type[8] = {};        // under mu
+    int idle_logs = 0;                                       // under mu
 };
 void precompile_ps(Precompiler& w, const PrecompileJob& job);
 void precompile_vs(Precompiler& w, const PrecompileJob& job);
 void precompile_manifest(const ManifestStage& m);
 void relink_pipeline(Precompiler& w, const PrecompileJob& job);
+// Parallel compiles at the start (Kyo's parallel preload, done natively): GX
+// creates its ~3,000 vertex and pixel shaders, and the manifest brings a few
+// hundred more, before the first in-game frame - while the game mostly loads -
+// so until then, and while a loading screen is up, half the hardware threads
+// compile (up to 16, as his preload builds); in game a quarter of them do, as
+// before. Set by precompile_boost_update (host_gpu_set_loading,
+// host_gpu_world_reached).
+std::atomic<bool> g_precompile_boost{true};
+std::atomic<Precompiler*> g_precompiler{nullptr};
+const auto g_process_start = std::chrono::steady_clock::now();
 Precompiler& precompiler() {
     static Precompiler* const p = [] {
         auto* w = new Precompiler;  // never destroyed: its threads run until exit
-        // A quarter of the hardware threads, 2 to 16. With compute shaders
-        // compiled at creation a cold world load is short enough that four
-        // workers left 583 pixel shaders queued at its end; eight drained them.
-        // With vertex shaders as well (about 330 s of compiles at boot), eight
-        // left 966 pixel shaders queued and sixteen drained both queues.
-        int threads = std::clamp(static_cast<int>(std::thread::hardware_concurrency()) / 4, 2, 16);
-        if (const char* e = std::getenv("BBHOST_PRECOMPILE_THREADS")) threads = std::max(1, std::atoi(e));
-        for (int i = 0; i < threads; ++i) {
-            std::thread([w] {
+        // In game a quarter of the hardware threads, 2 to 16. With compute
+        // shaders compiled at creation a cold world load is short enough that
+        // four workers left 583 pixel shaders queued at its end; eight drained
+        // them. With vertex shaders as well (about 330 s of compiles at boot),
+        // eight left 966 pixel shaders queued and sixteen drained both queues.
+        const int hw = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+        w->steady = std::clamp(hw / 4, 2, 16);
+        w->boot = std::clamp(hw / 2, w->steady, std::max(w->steady, 16));
+        // BBHOST_PRECOMPILE_THREADS=<n>: n workers at all times;
+        // BBHOST_PRECOMPILE_BOOT_THREADS=<n>: n of them while starting and loading.
+        if (const char* e = std::getenv("BBHOST_PRECOMPILE_THREADS")) w->steady = w->boot = std::clamp(std::atoi(e), 1, 64);
+        if (const char* e = std::getenv("BBHOST_PRECOMPILE_BOOT_THREADS")) w->boot = std::clamp(std::atoi(e), w->steady, 64);
+        {
+            // Published before the flag is read: a change that finds no pool
+            // has set the flag already, and one that finds it sets the limit.
+            std::lock_guard<std::mutex> lk(w->mu);
+            g_precompiler.store(w);
+            w->limit = g_precompile_boost.load() ? w->boot : w->steady;
+        }
+        host_log("render: precompile workers: %d until the first in-game frame and while loading, %d in game "
+                 "(BBHOST_PRECOMPILE_BOOT_THREADS, BBHOST_PRECOMPILE_THREADS)", w->boot, w->steady);
+        for (int i = 0; i < w->boot; ++i) {
+            std::thread([w, i] {
                 t_pipeline_worker = true;
+                host_thread_set_name("bb-compile");
                 for (;;) {
                     PrecompileJob job;
                     {
                         std::unique_lock<std::mutex> lk(w->mu);
-                        w->cv.wait(lk, [w] { return !w->jobs.empty(); });
+                        for (;;) {
+                            if (i >= w->limit) {
+                                // A wake-up meant for a worker under the limit
+                                // goes on to one.
+                                if (!w->jobs.empty()) w->cv.notify_one();
+                                w->park_cv.wait(lk, [w, i] { return i < w->limit; });
+                                continue;
+                            }
+                            if (!w->jobs.empty()) break;
+                            w->cv.wait(lk);
+                        }
                         job = std::move(w->jobs.front());
                         w->jobs.pop_front();
                         ++w->running[job.name];
+                        if (!w->busy) {
+                            w->busy = true;
+                            w->busy_since = std::chrono::steady_clock::now();
+                            w->burst_jobs = 0;
+                            std::fill(std::begin(w->burst_type), std::end(w->burst_type), 0);
+                        }
                     }
                     while (!g.ok) std::this_thread::sleep_for(std::chrono::milliseconds(50));
                     if (job.type == 4) {
@@ -4336,6 +4389,26 @@ Precompiler& precompiler() {
                     }
                     std::lock_guard<std::mutex> lk(w->mu);
                     if (--w->running[job.name] == 0) w->running.erase(job.name);
+                    ++w->burst_jobs;
+                    ++w->burst_type[job.type & 7];
+                    if (w->busy && w->jobs.empty() && w->running.empty()) {
+                        w->busy = false;
+                        // How long a run of compiles took the workers, wall
+                        // time: the start's is what parallel compiles and the
+                        // translation cache shorten.
+                        if (w->burst_jobs >= 32 && w->idle_logs < 16) {
+                            ++w->idle_logs;
+                            const auto now = std::chrono::steady_clock::now();
+                            host_log("render: precompile workers idle: %llu jobs (manifest %llu, pixel %llu, vertex %llu, compute %llu, relinks %llu) "
+                                     "in %.2f s on %d workers; %.1f s after start, flip %llu",
+                                     static_cast<unsigned long long>(w->burst_jobs), static_cast<unsigned long long>(w->burst_type[7]),
+                                     static_cast<unsigned long long>(w->burst_type[2]), static_cast<unsigned long long>(w->burst_type[1]),
+                                     static_cast<unsigned long long>(w->burst_type[4]), static_cast<unsigned long long>(w->burst_type[0]),
+                                     std::chrono::duration<double>(now - w->busy_since).count(), w->limit,
+                                     std::chrono::duration<double>(now - g_process_start).count(),
+                                     static_cast<unsigned long long>(hle_video_flip_count()));
+                        }
+                    }
                 }
             }).detach();
         }
@@ -4370,6 +4443,26 @@ void queue_vs_precompile(std::string name, std::vector<std::uint8_t> container) 
     }
     w.vs_queued.fetch_add(1, std::memory_order_relaxed);
     w.cv.notify_one();
+}
+
+// The start's and the loading screens' extra workers (g_precompile_boost).
+std::atomic<bool> g_world_seen{false}, g_loading_now{false};
+void precompile_boost_update(const char* why) {
+    const bool on = !g_world_seen.load() || g_loading_now.load();
+    if (g_precompile_boost.exchange(on) == on) return;
+    Precompiler* w = g_precompiler.load();
+    if (!w) return;  // made later, with the limit this says
+    int from, to;
+    std::size_t waiting;
+    {
+        std::lock_guard<std::mutex> lk(w->mu);
+        from = w->limit;
+        w->limit = g_precompile_boost.load() ? w->boot : w->steady;
+        to = w->limit;
+        waiting = w->jobs.size();
+    }
+    if (to > from) w->park_cv.notify_all();
+    if (from != to) host_log("render: precompile workers %d -> %d (%s); %zu jobs waiting", from, to, why, waiting);
 }
 
 // BBHOST_LIBRARY_RELINK: after a fast link, a worker links the same libraries
@@ -4587,7 +4680,8 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
     paths_options.stage = gcn::Stage::Pixel;
     paths_options.rsrc1 = regs[4];
     paths_options.rsrc2 = regs[5];
-    const gcn::TranslateResult paths = gcn::translate(prog, paths_options);  // resource paths and the inputs read
+    // Its SPIR-V is read too: whether the program can discard (note_ps_early_tests).
+    const gcn::TranslateResult paths = translate_cached(prog, paths_options);  // resource paths and the inputs read
     offer_paths(code.words, paths);
     PrecompileRecord rec;
     rec.rsrc1 = regs[4];
@@ -4624,11 +4718,11 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         stage.module = hit->module;
     } else {
         const gcn::TranslateOptions options = ps_translate_options(in);
-        stage.fresh() = gcn::translate(prog, options);
+        stage.fresh() = translate_cached(prog, options);
         if (!stage.meta().ok()) return give_up(translation_error_kind(stage.meta().errors[0]));
         note_ps_early_tests(code.words, stage.meta().spirv);
         if (lift) {
-            gcn::LiftResult lifted = gcn::lift_pixel_shader(prog, options, stage.meta());
+            gcn::LiftResult lifted = lift_cached(false, prog, options, stage.meta());
             if (lifted.ok()) stage.fresh().spirv = std::move(lifted.spirv);
         }
         if (!make_module(stage.meta().spirv, stage.module)) return give_up("shader module");
@@ -4697,7 +4791,7 @@ void precompile_manifest(const ManifestStage& m) {
         ShaderStage ls;
         bool ok = prog.errors.empty() && fprog.errors.empty();
         if (ok && !(g_stage_cache_on && cached_stage(key))) {
-            ls.fresh() = gcn::translate(prog, tess_ls_options(m.rsrc1, m.rsrc2, m.tess_attr_vec4s, m.fetch_words.empty() ? nullptr : &fprog));
+            ls.fresh() = translate_cached(prog, tess_ls_options(m.rsrc1, m.rsrc2, m.tess_attr_vec4s, m.fetch_words.empty() ? nullptr : &fprog));
             ok = ls.meta().ok() && make_module(ls.meta().spirv, ls.module);
             if (ok && g_stage_cache_on) cache_stage(key, ls.meta(), ls.module);
         }
@@ -4720,7 +4814,7 @@ void precompile_manifest(const ManifestStage& m) {
             o.stage = static_cast<gcn::Stage>(m.domain_level);
             o.rsrc1 = m.rsrc1;
             o.rsrc2 = m.rsrc2;
-            offer_paths(m.words, gcn::translate(prog, o));
+            offer_paths(m.words, translate_cached(prog, o, TranslationUse::kPaths));
         }
         g_manifest.compile_us.fetch_add(pl_us_since(t0), std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(g_manifest.mu);
@@ -4744,16 +4838,16 @@ void precompile_manifest(const ManifestStage& m) {
     } else if (ok) {
         if (m.stage) {
             const gcn::TranslateOptions options = ps_translate_options(m.ps_inputs());
-            stage.fresh() = gcn::translate(prog, options);
+            stage.fresh() = translate_cached(prog, options);
             if (stage.meta().ok() && m.lift) {
-                gcn::LiftResult lifted = gcn::lift_pixel_shader(prog, options, stage.meta());
+                gcn::LiftResult lifted = lift_cached(false, prog, options, stage.meta());
                 if (lifted.ok()) stage.fresh().spirv = std::move(lifted.spirv);
             }
         } else {
             const gcn::TranslateOptions options = vs_translate_options(m.vs_inputs(), m.fetch_words.empty() ? nullptr : &fetch_prog);
-            stage.fresh() = gcn::translate(prog, options);
+            stage.fresh() = translate_cached(prog, options);
             if (stage.meta().ok() && m.lift) {
-                gcn::LiftResult lifted = gcn::lift_vertex_shader(prog, options, stage.meta());
+                gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
                 if (lifted.ok()) stage.fresh().spirv = std::move(lifted.spirv);
             }
         }
@@ -4830,7 +4924,7 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
     paths_options.stage = gcn::Stage::Vertex;
     paths_options.rsrc1 = rec.rsrc1;
     paths_options.rsrc2 = rec.rsrc2;
-    const gcn::TranslateResult paths = gcn::translate(prog, paths_options);
+    const gcn::TranslateResult paths = translate_cached(prog, paths_options, TranslationUse::kPaths);
     offer_paths(code.words, paths);
     for (const gcn::PredictedImage& p : gcn::predict_image_dims(prog, paths)) rec.dims.emplace_back(p.dim, p.arrayed);
     rec.modes.assign(paths.samplers.size(), false);
@@ -4845,12 +4939,12 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
         stage.module = hit->module;
     } else {
         const gcn::TranslateOptions options = vs_translate_options(in, nullptr);
-        stage.fresh() = gcn::translate(prog, options);
+        stage.fresh() = translate_cached(prog, options);
         if (!stage.meta().ok()) return give_up(translation_error_kind(stage.meta().errors[0]));
         // The lift runs here as well, so a shader compiled at creation is the
         // same stage the draw wants and is not thrown away for it.
         if (lift) {
-            gcn::LiftResult lifted = gcn::lift_vertex_shader(prog, options, stage.meta());
+            gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
             if (lifted.ok()) stage.fresh().spirv = std::move(lifted.spirv);
         }
         dump_spirv("precompile-" + job.name + "-vs", stage.meta().spirv);
@@ -5082,7 +5176,9 @@ bool read(Reader& r, ManifestStage& m) {
 }  // namespace manifest_file
 
 void precompile_report() {
+    compute_optimize_report();
     compute_precompile_report();
+    translation_cache_report();
     if (!precompile_enabled()) return;
     Precompiler& w = precompiler();
     std::lock_guard<std::mutex> lk(w.mu);
@@ -9963,6 +10059,8 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     struct LsPipe {
         bool failed = false;
         VkPipeline pipeline = VK_NULL_HANDLE;
+        bool standin = false;  // unoptimized until bb-cs-optimize has built it (first_compute_pipeline)
+        std::uint64_t opt_seen = 0;
         gcn::TranslateResult meta;
         std::string name;
     };
@@ -9971,6 +10069,8 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     const std::uint32_t rs[4] = {rsrc1, rsrc2, t.hull ? t.window : 0u, t.hull ? t.control_points : 0u};
     const std::uint64_t key = fnv1a(rs, sizeof(rs), fnv1a(&fetch_hash, 8, ls->hash ^ 0x15c0ull));
     LsPipe& pl = pipes[key];
+    constexpr std::uint64_t kLsOptimizeTag = 0x15c0000000000000ull;  // its optimized build's key, apart from the dispatches'
+    if (pl.standin) adopt_optimized_compute(key ^ kLsOptimizeTag, pl.pipeline, pl.standin, pl.opt_seen);
     if (!pl.pipeline && !pl.failed) {
         pl.name = ls->name + "-ls";
         const gcn::Program prog = gcn::decode(ls->words.data(), ls->words.size());
@@ -9988,7 +10088,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
             o.tess_window = t.window;
             o.tess_patch_control_points = t.control_points;
         }
-        pl.meta = gcn::translate(prog, o);
+        pl.meta = translate_cached(prog, o);
         VkShaderModule module = VK_NULL_HANDLE;
         if (!prog.errors.empty() || !pl.meta.ok()) {
             host_log("render: tessellation LS %s: %s", pl.name.c_str(),
@@ -9998,14 +10098,8 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
             pl.failed = true;
         } else {
             dump_spirv(pl.name, pl.meta.spirv);
-            VkComputePipelineCreateInfo cpci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-            cpci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-            cpci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-            cpci.stage.module = module;
-            cpci.stage.pName = "main";
-            cpci.layout = g.pipe_layout;
-            cpci.flags = compute_create_flags();
-            if (vkCreateComputePipelines(g.device, PipelineCacheUse().cache, 1, &cpci, nullptr, &pl.pipeline) != VK_SUCCESS) pl.failed = true;
+            pl.pipeline = first_compute_pipeline(module, key ^ kLsOptimizeTag, pl.name, pl.meta.spirv, pl.standin, pl.name);
+            if (!pl.pipeline) pl.failed = true;
             vkDestroyShaderModule(g.device, module, nullptr);
             host_log("render: tessellation LS %s%s (%zu images)", pl.name.c_str(), pl.failed ? " failed" : " ready", pl.meta.images.size());
         }
@@ -14297,6 +14391,17 @@ bool gpu::dump_rt_locked(RtImage& r, const char* path) {
 }
 
 namespace gpu {
+
+// A loading screen up or down, and the first in-game frame (engine/loading.cpp
+// through gpu.cpp): the precompile workers' number (g_precompile_boost).
+void precompile_set_loading(bool loading) {
+    g_loading_now.store(loading);
+    precompile_boost_update(loading ? "a loading screen" : "the loading screen gone");
+}
+void precompile_set_world_reached() {
+    g_world_seen.store(true);
+    precompile_boost_update("the first in-game frame");
+}
 
 // At the end of device init: the manifest's stages go to the precompile
 // workers, ahead of anything GX creates.
