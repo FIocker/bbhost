@@ -1,4 +1,4 @@
-#include "decomp/sprj_event_flag_man.h"
+#include "decomp/events/flag_store.h"
 
 #include "core/thunk.h"
 #include "decomp/decomp.h"
@@ -236,7 +236,7 @@ std::atomic<bool> g_watch{false};
 
 }  // namespace
 
-void decomp_sprj_event_flag_man_add() {
+void decomp_flag_store_add() {
     const char* area = "event flags";
     decomp_add({"IsEventFlag", area, 0x17cfc00, kIsEntry, sizeof(kIsEntry), reinterpret_cast<void*>(&IsEventFlag),
                 DecompKind::Leaf, &g_game_is, reinterpret_cast<void*>(&compare_is), &g_cmp_is});

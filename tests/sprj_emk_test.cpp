@@ -1,4 +1,4 @@
-// The event-script interpreter (decomp/sprj_emk.cpp) against the game's own
+// The event-script interpreter (decomp/events/interpreter.cpp) against the game's own
 // code (tests/eboot_kit.h). Its eight functions take the game's place at their
 // entries for "ours" and give it back for "the game's", so every caller -
 // the game's own code included - reaches the version under test, as in the
@@ -21,7 +21,7 @@
 // behaviour digit run as they are; the heap, the event-sync broadcast, the
 // restart queue and DL_PANIC are fakes that record. Skips without the 1.09
 // eboot (BBHOST_EBOOT, or eboot-109-decrypted.bin in the checkout).
-#include "../src/decomp/sprj_emk.cpp"
+#include "../src/decomp/events/interpreter.cpp"
 
 #include "eboot_kit.h"
 

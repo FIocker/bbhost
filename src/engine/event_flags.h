@@ -3,7 +3,7 @@
 // event scripts read (2000-2022, written from the session each frame) - kept
 // by SprjEventFlagMan (the singleton slot at Binary Ninja 0x593b100). The
 // host's reader and writer for plugins, over the store's layout as
-// decomp/sprj_event_flag_man.h writes it down (the game's own four flag
+// decomp/events/flag_store.h writes it down (the game's own four flag
 // functions are ours there), read without trusting the game's memory: a
 // plugin may ask before the store exists. The first read on the main thread
 // is checked against the game's own getter (a line either way).

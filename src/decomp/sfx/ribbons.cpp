@@ -347,7 +347,7 @@ void report() {
 
 }  // namespace
 
-void decomp_sfx_ribbon_add() {
+void decomp_sfx_ribbons_add() {
     const char* area = "SFX (ribbons)";
     DecompFunction facing{"sub_2cce7b0", area, 0x2cce7b0, kFacingEntry, sizeof(kFacingEntry),
                           reinterpret_cast<void*>(&sfx_ribbon_facing), DecompKind::Leaf, &g_game_facing,
