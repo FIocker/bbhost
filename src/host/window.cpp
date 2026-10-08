@@ -12,6 +12,7 @@
 #include "host/options.h"
 #include "host/settings.h"
 #include "host/overlay.h"
+#include "host/present_pass.h"
 #include "host/ingame_menu.h"
 #include "host/audio.h"
 #include "host/foreign_hooks.h"
@@ -290,11 +291,135 @@ struct Presenter {
     // might still hold it (the validation layer said so every frame).
     std::vector<VkSemaphore> render_sems;
     VkFence fence = VK_NULL_HANDLE;
+    // Signalled by the acquire instead of acquire_sem (BBHOST_PRESENT_ACQUIRE_FENCE).
+    VkFence acquire_fence = VK_NULL_HANDLE;
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    bool latest_ready = false;  // the device has FIFO_LATEST_READY enabled (gpu.cpp)
+    bool gpu_wait = false;      // sleep on the frame's fence before presenting (present_gpu_wait_default)
     std::mutex mu;
     bool ok = false;
     std::uint64_t frames = 0;
 };
 Presenter g_vk;
+
+// ---- How a frame reaches the display, and the switches back ----------------
+// BBHOST_PRESENT_LEGACY=1 puts every one of these back as it was before them,
+// for an A/B run with one variable - showing frames on arrival too
+// (BBHOST_PRESENT_ON_ARRIVAL, hle/video.cpp). A switch set on its own wins.
+bool present_legacy() {
+    static const bool legacy = [] {
+        const char* e = std::getenv("BBHOST_PRESENT_LEGACY");
+        return e && e[0] == '1';
+    }();
+    return legacy;
+}
+// A switch that is on unless set to 0 (or BBHOST_PRESENT_LEGACY=1).
+bool present_env_off(const char* name) {
+    const char* e = std::getenv(name);
+    return e ? e[0] == '0' : present_legacy();
+}
+// BBHOST_PRESENT_PASS=0: the frame is blitted (vkCmdBlitImage, after a clear
+// of the whole image when it has bars) and anything over it - the FPS counter,
+// the pointer, F10's screen, the F9 menu - goes in a second rendering that
+// loads the image back. By default it is one rendering: the picture drawn by a
+// sampling triangle, the overlay and the menu in the same pass, the bars the
+// pass's clear (host/present_pass.h). A magnified picture keeps FSR's passes.
+const bool g_present_pass = !present_env_off("BBHOST_PRESENT_PASS");
+// BBHOST_PRESENT_ACQUIRE_FENCE=0: the acquire signals a semaphore that the
+// blit's submission waits on, on the renderer's queue. A wait on a queue holds
+// everything queued behind it - the game's next submissions included - until
+// the display gives the image back, which on a FIFO swapchain with frames
+// queued is the next vblank. By default the acquire signals a fence the
+// presenting thread waits for, so only this thread waits for the display.
+const bool g_acquire_fence = !present_env_off("BBHOST_PRESENT_ACQUIRE_FENCE");
+// BBHOST_PRESENT_SUBMIT=1: before its blit the presenter submits whatever the
+// renderer is recording, as it did on every frame. The frame it shows is
+// normally submitted already (the command processor submits each job before
+// it queues the flip), and what it cut short was the next frame's recording:
+// its render pass closed, and one more submission a frame. By default it
+// submits only when the flip's frame is still in the recording.
+const bool g_present_submit_always = [] {
+    const char* e = std::getenv("BBHOST_PRESENT_SUBMIT");
+    return e ? e[0] == '1' : present_legacy();
+}();
+// BBHOST_PRESENT_GPU_WAIT=1 or 0: whether the presenting thread sleeps on the
+// blit's fence before vkQueuePresentKHR. AMD's Windows driver polls inside the
+// present until the frame's GPU work is done (Kyo's trace of his fork: the
+// present thread at 97% of a core, mostly that poll - on an APU, power the GPU
+// could have had), and showing frames as they arrive (video.cpp) makes that
+// the whole of the frame's GPU time; asleep first, the driver's wait finds the
+// frame done, and the present waits on the same frame either way. So it is on
+// for AMD's own driver (vk_start). Elsewhere the present does not poll, and a
+// wait there would only queue the next frame's copy later.
+bool present_gpu_wait_default(VkDriverId driver) {
+    const char* e = std::getenv("BBHOST_PRESENT_GPU_WAIT");
+    if (e) return e[0] == '1';
+    return !present_legacy() && driver == VK_DRIVER_ID_AMD_PROPRIETARY;
+}
+
+const char* present_mode_name(VkPresentModeKHR m) {
+    switch (m) {
+        case VK_PRESENT_MODE_IMMEDIATE_KHR: return "IMMEDIATE";
+        case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX";
+        case VK_PRESENT_MODE_FIFO_KHR: return "FIFO";
+        case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+        case VK_PRESENT_MODE_FIFO_LATEST_READY_KHR: return "FIFO_LATEST_READY";
+#endif
+        default: return "other";
+    }
+}
+
+// The present mode for the V-Sync setting, from what the surface offers.
+// V-Sync on: MAILBOX (the newest finished frame goes up at the next refresh, no
+// tearing, no queue of frames behind the display), else FIFO_LATEST_READY (the
+// same thing as a FIFO mode: AMD's Windows driver has it and no MAILBOX), else
+// FIFO - where every frame waits its turn, up to two refreshes behind with
+// three images. V-Sync off: IMMEDIATE (shown at once, tearing), else MAILBOX.
+// FIFO is the only mode a surface must support, so it is what is left.
+// BBHOST_PRESENT_MODE=fifo|mailbox|latest|immediate|relaxed asks for one
+// (FIFO when the surface lacks it); =old is the choice before this one (FIFO
+// with V-Sync; MAILBOX, else IMMEDIATE, without).
+VkPresentModeKHR choose_present_mode(bool vsync, std::string& why) {
+    std::uint32_t nmodes = 0;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, nullptr);
+    std::vector<VkPresentModeKHR> modes(nmodes);
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, modes.data());
+    const auto offered = [&](VkPresentModeKHR m) {
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+        if (m == VK_PRESENT_MODE_FIFO_LATEST_READY_KHR && !g_vk.latest_ready) return false;  // the device's extension is off
+#endif
+        return std::find(modes.begin(), modes.end(), m) != modes.end();
+    };
+    why = "the surface offers";
+    for (VkPresentModeKHR m : modes) why += std::string(" ") + present_mode_name(m);
+    std::vector<VkPresentModeKHR> want;
+    const char* forced = std::getenv("BBHOST_PRESENT_MODE");
+    const std::string f = forced ? forced : present_legacy() ? "old" : "";
+    if (f == "old") {
+        if (!vsync) want = {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR};
+        why += "; the old choice";
+    } else if (!f.empty()) {
+        if (f == "mailbox") want = {VK_PRESENT_MODE_MAILBOX_KHR};
+        if (f == "immediate") want = {VK_PRESENT_MODE_IMMEDIATE_KHR};
+        if (f == "relaxed") want = {VK_PRESENT_MODE_FIFO_RELAXED_KHR};
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+        if (f == "latest") want = {VK_PRESENT_MODE_FIFO_LATEST_READY_KHR};
+#endif
+        why += "; BBHOST_PRESENT_MODE=" + f;
+    } else if (vsync) {
+        want = {VK_PRESENT_MODE_MAILBOX_KHR};
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+        want.push_back(VK_PRESENT_MODE_FIFO_LATEST_READY_KHR);
+#endif
+    } else {
+        want = {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR};
+    }
+    for (VkPresentModeKHR m : want) {
+        if (offered(m)) return m;
+    }
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
 
 // Whether the surface's size differs from the swapchain's: what makes a
 // SUBOPTIMAL result worth a rebuild.
@@ -354,8 +479,16 @@ bool vk_create_swapchain() {
     VkSwapchainKHR old = g_vk.swapchain;
     VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     sci.surface = g_vk.surface;
-    sci.minImageCount = caps.minImageCount + 1 > caps.maxImageCount && caps.maxImageCount ? caps.maxImageCount
-                                                                                          : caps.minImageCount + 1;
+    // One more than the least the surface takes: with FIFO that lets one frame
+    // wait for the display while the next is drawn, and MAILBOX and
+    // FIFO_LATEST_READY need a third - one shown, one waiting, one drawn - to
+    // replace the waiting one rather than block. More only adds frames the
+    // display can fall behind by. BBHOST_SWAPCHAIN_IMAGES=<n> asks for n.
+    std::uint32_t images = caps.minImageCount + 1;
+    if (const char* e = std::getenv("BBHOST_SWAPCHAIN_IMAGES"); e && std::atoi(e) > 0) images = static_cast<std::uint32_t>(std::atoi(e));
+    images = std::max(images, caps.minImageCount);
+    if (caps.maxImageCount) images = std::min(images, caps.maxImageCount);
+    sci.minImageCount = images;
     sci.imageFormat = g_vk.format;
     sci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     sci.imageExtent = g_vk.extent;
@@ -378,48 +511,9 @@ bool vk_create_swapchain() {
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     sci.preTransform = caps.currentTransform;
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    // FIFO is the only mode a surface must support, so V-Sync off falls back
-    // to it rather than failing to create the swapchain.
-    sci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    std::uint32_t nmodes = 0;
-    vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, nullptr);
-    std::vector<VkPresentModeKHR> modes(nmodes);
-    if (nmodes) vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, modes.data());
-    const auto surface_has = [&](VkPresentModeKHR m) { return std::find(modes.begin(), modes.end(), m) != modes.end(); };
-    if (!g_want_vsync.load()) {
-        for (VkPresentModeKHR want : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR}) {
-            if (surface_has(want)) {
-                sci.presentMode = want;
-                break;
-            }
-        }
-    }
-    // BBHOST_PRESENT_MODE=fifo|relaxed|mailbox|immediate: that mode, where the
-    // surface has it, whatever V-Sync says. With BBHOST_SWAPCHAIN_FORMAT=rgba8
-    // and BBHOST_FSR_DIRECT=0 (no storage usage) it makes the swapchain
-    // shadPS4 makes (immediate, R8G8B8A8, transfer and colour usage), for
-    // comparing the way the frames go to the screen: on AMD's Windows driver
-    // only the copy and video engines' time reaches Windows' per-process
-    // counters (host/gpu_busy.cpp), so the present's own path is what Task
-    // Manager can show of a Vulkan program there.
-    static const VkPresentModeKHR forced = [] {
-        const char* e = std::getenv("BBHOST_PRESENT_MODE");
-        const std::string v = e ? e : "";
-        if (v == "fifo") return VK_PRESENT_MODE_FIFO_KHR;
-        if (v == "relaxed") return VK_PRESENT_MODE_FIFO_RELAXED_KHR;
-        if (v == "mailbox") return VK_PRESENT_MODE_MAILBOX_KHR;
-        if (v == "immediate") return VK_PRESENT_MODE_IMMEDIATE_KHR;
-        if (!v.empty()) host_log("present: BBHOST_PRESENT_MODE=%s is not fifo, relaxed, mailbox or immediate; ignored", v.c_str());
-        return VK_PRESENT_MODE_MAX_ENUM_KHR;
-    }();
-    if (forced != VK_PRESENT_MODE_MAX_ENUM_KHR) {
-        if (surface_has(forced)) {
-            sci.presentMode = forced;
-        } else {
-            static std::atomic<bool> said{false};
-            if (!said.exchange(true)) host_log("present: BBHOST_PRESENT_MODE: the surface has no such mode; kept the usual one");
-        }
-    }
+    std::string why;
+    const bool vsync = g_want_vsync.load();
+    sci.presentMode = choose_present_mode(vsync, why);
     sci.clipped = VK_TRUE;
     sci.oldSwapchain = old;
     // Windows' graphics modules before and after: a driver that presents
@@ -432,6 +526,7 @@ bool vk_create_swapchain() {
         return false;
     }
     [[maybe_unused]] const std::string modules_after = host_graphics_modules();
+    g_vk.mode = sci.presentMode;
     if (old) {
         vkDestroySwapchainKHR(g_vk.device, old, nullptr);
         host_log("present: swapchain %ux%u", g_vk.extent.width, g_vk.extent.height);
@@ -444,13 +539,21 @@ bool vk_create_swapchain() {
                 case VK_PRESENT_MODE_MAILBOX_KHR: return "mailbox";
                 case VK_PRESENT_MODE_FIFO_KHR: return "fifo";
                 case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "fifo-relaxed";
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+                case VK_PRESENT_MODE_FIFO_LATEST_READY_KHR: return "fifo-latest-ready";
+#endif
                 default: return "other";
             }
         };
+        std::uint32_t nmodes = 0;
+        vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, nullptr);
+        std::vector<VkPresentModeKHR> modes(nmodes);
+        if (nmodes) vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &nmodes, modes.data());
         std::string have;
         for (VkPresentModeKHR m : modes) have += std::string(have.empty() ? "" : " ") + mode_name(m);
+        const std::string chosen = why.empty() ? std::string() : " (" + why + ")";
         host_log("present: mode %s%s (the surface has: %s), %s, %s, %u images, usage 0x%x%s", mode_name(sci.presentMode),
-                 sci.presentMode == forced ? " (BBHOST_PRESENT_MODE)" : "", have.c_str(),
+                 chosen.c_str(), have.c_str(),
                  g_want_fullscreen.load() ? "fullscreen" : "windowed",
                  sci.imageFormat == VK_FORMAT_R8G8B8A8_UNORM   ? "R8G8B8A8"
                  : sci.imageFormat == VK_FORMAT_B8G8R8A8_UNORM ? "B8G8R8A8"
@@ -493,6 +596,10 @@ bool vk_create_swapchain() {
     }
     host_overlay_init(g_vk.device, g_vk.phys, g_vk.format, g_vk.queue, g_vk.family);
     ingame_menu_init(g_vk.instance, g_vk.phys, g_vk.device, g_vk.family, g_vk.queue, g_vk.format, n);
+    const bool pass = g_present_pass && present_pass_init(g_vk.device, g_vk.phys, g_vk.format);
+    host_log("present: %s, V-Sync %s (%s); %u images (%u asked, the surface's least %u); %s", present_mode_name(g_vk.mode), vsync ? "on" : "off",
+             why.c_str(), n, images, caps.minImageCount,
+             pass ? "the picture, the overlay and the menu in one pass" : "the picture blitted, the overlay in a pass of its own");
     return true;
 }
 
@@ -514,6 +621,7 @@ bool vk_start() {
     g_vk.queue = static_cast<VkQueue>(h.queue);
     g_vk.present_queue = static_cast<VkQueue>(h.present_queue);
     g_vk.family = h.family;
+    g_vk.latest_ready = h.fifo_latest_ready;
     if (!SDL_Vulkan_CreateSurface(g_window, g_vk.instance, nullptr, &g_vk.surface)) {
         host_log("vulkan: surface creation failed: %s", SDL_GetError());
         return false;
@@ -524,8 +632,12 @@ bool vk_start() {
         host_log("vulkan: the GPU queue family cannot present to this surface");
         return false;
     }
-    VkPhysicalDeviceProperties props{};
-    vkGetPhysicalDeviceProperties(g_vk.phys, &props);
+    VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 props2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    props2.pNext = &drv;
+    vkGetPhysicalDeviceProperties2(g_vk.phys, &props2);
+    const VkPhysicalDeviceProperties& props = props2.properties;
+    g_vk.gpu_wait = present_gpu_wait_default(drv.driverID);
     if (!vk_create_swapchain()) {
         return false;
     }
@@ -544,9 +656,15 @@ bool vk_start() {
     VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     vkCreateFence(g_vk.device, &fci, nullptr, &g_vk.fence);
+    VkFenceCreateInfo afci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(g_vk.device, &afci, nullptr, &g_vk.acquire_fence) != VK_SUCCESS) g_vk.acquire_fence = VK_NULL_HANDLE;
     g_vk.ok = true;
     host_log("vulkan: %s, swapchain %ux%u, %zu images", props.deviceName, g_vk.extent.width, g_vk.extent.height,
              g_vk.images.size());
+    host_log("present: the acquire %s; the renderer's recording submitted %s; the present %s",
+             g_acquire_fence && g_vk.acquire_fence ? "waited for on this thread (a fence)" : "waited for on the GPU queue (a semaphore)",
+             g_present_submit_always ? "before every blit" : "only when the flip's frame is still in it",
+             g_vk.gpu_wait ? "after the frame is done on the GPU (a sleeping wait)" : "at once (the driver waits for the frame)");
     return true;
 }
 
@@ -582,8 +700,25 @@ void present_step(const char* what) {
     g_present_step.store(what, std::memory_order_relaxed);
 }
 
-void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h) {
+// What the presenting thread did over the last 300 presents, for the second
+// `present:` line. Only that thread touches it.
+struct PresentStats {
+    std::uint64_t cpu_ns = 0;  // bb-present's own CPU time in vk_present
+    std::uint64_t latency_ns = 0, latency_max_ns = 0, latency_n = 0;  // flip queued -> its present returned
+    std::uint64_t on_arrival = 0;                                     // frames shown before their vblank (video.cpp)
+    std::uint64_t submits_forced = 0, submits_left = 0;               // the renderer's recording, submitted here or not
+    std::uint64_t one_pass = 0, blits = 0, clears = 0, overlay_passes = 0;
+    std::uint64_t overlay_frames = 0, menu_frames = 0;
+    std::uint64_t gpu_wait_us = 0, acquire_wait_us = 0;
+};
+PresentStats g_pstats;
+
+void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h, const PresentFlip& flip) {
     const auto t_enter = std::chrono::steady_clock::now();
+    const std::uint64_t cpu_enter = host_thread_cpu_ns();
+    const auto us = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+    };
     present_step("taking the present lock");
     std::lock_guard<std::mutex> lock(g_vk.mu);
     if (!g_vk.ok) {
@@ -615,6 +750,12 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         host_gpu_unlock();
     }
     present_step("acquiring an image");
+    // The image is ours once the acquire's fence signals (or, the old way, once
+    // the GPU has waited on its semaphore: BBHOST_PRESENT_ACQUIRE_FENCE=0).
+    const bool by_fence = g_acquire_fence && g_vk.acquire_fence;
+    const VkSemaphore acquire_sem = by_fence ? VK_NULL_HANDLE : g_vk.acquire_sem;
+    const VkFence acquire_fence = by_fence ? g_vk.acquire_fence : VK_NULL_HANDLE;
+    if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
     std::uint32_t idx = 0;
     // A bounded wait: a window nobody sees gets no frame callbacks on Wayland
     // (a Steam Deck's blanked screen, a minimized window), and an acquire
@@ -622,7 +763,7 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     // waiting on its flips (two runs frozen 20 s into the title, "acquiring an
     // image (43.4 s)"). Past 100 ms this frame is not presented; the game goes
     // on and the next frame tries again.
-    VkResult r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, 100000000ull, g_vk.acquire_sem, VK_NULL_HANDLE, &idx);
+    VkResult r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, 100000000ull, acquire_sem, acquire_fence, &idx);
     if (r == VK_TIMEOUT || r == VK_NOT_READY) {
         static std::atomic<int> said{0};
         if (said.fetch_add(1) < 4) host_log("present: no swapchain image within 100 ms (the window is not being shown?); frame not presented");
@@ -647,10 +788,21 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         if (!remade) {
             return;
         }
-        r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, UINT64_MAX, g_vk.acquire_sem, VK_NULL_HANDLE, &idx);
+        if (by_fence) vkResetFences(g_vk.device, 1, &g_vk.acquire_fence);
+        r = vkAcquireNextImageKHR(g_vk.device, g_vk.swapchain, UINT64_MAX, acquire_sem, acquire_fence, &idx);
+        if (r == VK_SUBOPTIMAL_KHR) r = VK_SUCCESS;  // ours all the same: not presenting it would keep it for ever
     }
     if (r != VK_SUCCESS) {
         return;
+    }
+    if (by_fence) {
+        // Until the display lets go of the image. With FIFO and frames queued
+        // that is a vblank away; this thread sleeps through it, and the
+        // renderer's queue never waits for the display.
+        present_step("waiting for the acquired image");
+        const auto t0 = std::chrono::steady_clock::now();
+        vkWaitForFences(g_vk.device, 1, &g_vk.acquire_fence, VK_TRUE, UINT64_MAX);
+        g_pstats.acquire_wait_us += us(t0, std::chrono::steady_clock::now());
     }
     const auto t_acquired = std::chrono::steady_clock::now();
     // Queued draws land before the blit: submissions on one queue execute in
@@ -658,6 +810,8 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     // to finish (host_gpu_flush) held the renderer lock through a GPU drain on
     // every presented frame - about 13 ms a frame in the world, all of it the
     // command processor blocked. BBHOST_PRESENT_FLUSH=1 (checks) waits again.
+    // And only when the flip's frame is not in a submission yet: by then the
+    // recording is usually the next frame's (host_gpu_submit_for_flip).
     static const bool present_flush = [] {
         const char* e = std::getenv("BBHOST_PRESENT_FLUSH");
         return e && e[0] == '1';
@@ -665,8 +819,11 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     present_step("submitting the renderer's work");
     if (present_flush) {
         host_gpu_flush();
+        ++g_pstats.submits_forced;
+    } else if (host_gpu_submit_for_flip(g_present_submit_always ? ~0ull : flip.submit_need)) {
+        ++g_pstats.submits_forced;
     } else {
-        host_gpu_submit();
+        ++g_pstats.submits_left;
     }
     const auto t_flushed = std::chrono::steady_clock::now();
     present_step("taking the renderer lock");
@@ -683,29 +840,7 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(g_vk.cmd, &bi);
-    host_gpu_busy_present_begin(g_vk.cmd);
-    // The renderer's writes to what the blit reads - the frame taken at its
-    // flip, or the display buffer - are in earlier submissions on this queue;
-    // submission order alone does not make them visible to this read.
-    VkMemoryBarrier frame_written{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    frame_written.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    frame_written.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    vkCmdPipelineBarrier(g_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &frame_written, 0,
-                         nullptr, 0, nullptr);
-    VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_dst.image = g_vk.images[idx];
-    to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    // From the stage the submission waits for the acquire at (wait_stage,
-    // below): from the top of the pipe, the layout change was not ordered
-    // after the acquire, and could rewrite the image while the presentation
-    // engine still read it (the validation layer's WRITE_AFTER_READ).
-    vkCmdPipelineBarrier(g_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
-                         nullptr, 1, &to_dst);
+    host_gpu_busy_present_begin(g_vk.cmd);  // the busy meter's first timestamp (host/gpu_busy.cpp)
     // The picture's rectangle (fit_picture); what it does not cover is black.
     VkRect2D area{{0, 0}, g_vk.extent};
     if (display_w && display_h) {
@@ -739,66 +874,142 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
         shown.extent.width = static_cast<std::uint32_t>(std::lround(src_w * kx));
         shown.extent.height = static_cast<std::uint32_t>(std::lround(src_h * ky));
     }
-    if (shown.extent.width != g_vk.extent.width || shown.extent.height != g_vk.extent.height) {
-        const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(g_vk.cmd, g_vk.images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
-        VkMemoryBarrier cleared{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        cleared.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        cleared.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(g_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &cleared, 0, nullptr, 0,
-                             nullptr);
+    const bool bars = shown.extent.width != g_vk.extent.width || shown.extent.height != g_vk.extent.height;
+    const float overlay_w = static_cast<float>(display_w ? display_w : g_vk.extent.width);
+    const float overlay_h = static_cast<float>(display_h ? display_h : g_vk.extent.height);
+    // The swapchain image is written from the stage its acquire is waited at.
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    bool recorded = false;
+    if (g_present_pass && present_pass_ready() && idx < g_vk.views.size() && g_vk.views[idx]) {
+        // One rendering (host/present_pass.h): the picture, the overlay and the
+        // menu, the bars its clear. Not for a picture smaller than its
+        // rectangle: FSR's upscale, on the blit's path below.
+        PresentSource src;
+        void* image = nullptr;
+        std::uint32_t format = 0, iw = 0, ih = 0;
+        const bool have = display_va && host_gpu_display_image(display_va, &image, &format, &iw, &ih);
+        bool magnified = false;
+        if (have) {
+            src.image = static_cast<VkImage>(image);
+            src.format = static_cast<VkFormat>(format);
+            src.width = iw;
+            src.height = ih;
+            // The region render_blit_display_locked takes: the registered
+            // size, inside the target (which may carry tiling padding rows).
+            src.x = std::min(src_x, iw);
+            src.y = std::min(src_y, ih);
+            src.w = src_w && src.x + src_w <= iw ? src_w : iw - src.x;
+            src.h = src_h && src.y + src_h <= ih ? src_h : ih - src.y;
+            magnified = src.w <= shown.extent.width && src.h <= shown.extent.height &&
+                        (src.w < shown.extent.width || src.h < shown.extent.height);
+        }
+        if (!magnified) {
+            // Dark red (cycling with the buffer index) when the renderer has
+            // not produced the frame yet, as the blit's path clears.
+            const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            const float none[4] = {0.06f + 0.04f * static_cast<float>(buffer_index % 3), 0.0f, 0.02f, 1.0f};
+            if (present_pass_begin(g_vk.cmd, g_vk.images[idx], g_vk.views[idx], g_vk.extent, shown, have ? &src : nullptr,
+                                   have ? black : none)) {
+                const std::uint32_t verts = host_overlay_record(g_vk.cmd, area, overlay_w, overlay_h);
+                // The plugin menu (F9) over everything else (host/ingame_menu.h).
+                const bool menu = ingame_menu_record_in_pass(g_vk.cmd, g_vk.extent);
+                present_pass_end(g_vk.cmd, g_vk.images[idx]);
+                recorded = true;
+                wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+                ++g_pstats.one_pass;
+                g_pstats.overlay_frames += verts != 0;
+                g_pstats.menu_frames += menu;
+            }
+        }
     }
-    // Blit the game's display buffer; dark red (cycling with the buffer
-    // index) when the renderer has not produced it yet.
-    void* const storage_view = g_vk.storage && idx < g_vk.views.size() ? static_cast<void*>(g_vk.views[idx]) : nullptr;
-    if (!display_va || !host_gpu_blit_display(g_vk.cmd, display_va, g_vk.images[idx], shown.offset.x, shown.offset.y,
-                                              shown.extent.width, shown.extent.height, src_w, src_h, src_x, src_y, storage_view)) {
-        VkClearColorValue color{{0.06f + 0.04f * (buffer_index % 3), 0.0f, 0.02f, 1.0f}};
-        VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdClearColorImage(g_vk.cmd, g_vk.images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+    if (!recorded) {
+        // The renderer's writes to what the blit reads - the frame taken at its
+        // flip, or the display buffer - are in earlier submissions on this queue;
+        // submission order alone does not make them visible to this read.
+        VkMemoryBarrier frame_written{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        frame_written.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        frame_written.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(g_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &frame_written, 0,
+                             nullptr, 0, nullptr);
+        VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        to_dst.image = g_vk.images[idx];
+        to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        // From the stage the submission waits for the acquire at (wait_stage,
+        // below): from the top of the pipe, the layout change was not ordered
+        // after the acquire, and could rewrite the image while the presentation
+        // engine still read it (the validation layer's WRITE_AFTER_READ).
+        vkCmdPipelineBarrier(g_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &to_dst);
+        if (bars) {
+            const VkClearColorValue black{{0.0f, 0.0f, 0.0f, 1.0f}};
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(g_vk.cmd, g_vk.images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &range);
+            VkMemoryBarrier cleared{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            cleared.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            cleared.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(g_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &cleared, 0, nullptr, 0,
+                                 nullptr);
+            ++g_pstats.clears;
+        }
+        // Blit the game's display buffer; dark red (cycling with the buffer
+        // index) when the renderer has not produced it yet.
+        void* const storage_view = g_vk.storage && idx < g_vk.views.size() ? static_cast<void*>(g_vk.views[idx]) : nullptr;
+        if (!display_va || !host_gpu_blit_display(g_vk.cmd, display_va, g_vk.images[idx], shown.offset.x, shown.offset.y,
+                                                  shown.extent.width, shown.extent.height, src_w, src_h, src_x, src_y, storage_view)) {
+            VkClearColorValue color{{0.06f + 0.04f * (buffer_index % 3), 0.0f, 0.02f, 1.0f}};
+            VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(g_vk.cmd, g_vk.images[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+            ++g_pstats.clears;
+        } else {
+            ++g_pstats.blits;
+        }
+        // The host overlay goes over the game's frame: the pointer now, the text
+        // box and the options screen later. Drawing needs
+        // the image as a colour attachment rather than a transfer destination.
+        bool as_colour = false;  // the image was moved to the colour-attachment layout, whether or not the overlay then drew
+        if (idx < g_vk.views.size() && g_vk.views[idx] && (!host_overlay_empty() || ingame_menu_open())) {
+            VkImageMemoryBarrier to_colour = to_dst;
+            to_colour.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            to_colour.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            to_colour.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            to_colour.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            vkCmdPipelineBarrier(g_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
+                                 nullptr, 0, nullptr, 1, &to_colour);
+            as_colour = true;
+            const bool overlaid = host_overlay_draw(g_vk.device, g_vk.cmd, g_vk.images[idx], g_vk.views[idx], g_vk.extent, area,
+                                                    overlay_w, overlay_h);
+            g_pstats.overlay_passes += overlaid;
+            g_pstats.overlay_frames += overlaid;
+            // The plugin menu (F9) over everything else (host/ingame_menu.h).
+            g_pstats.overlay_passes += ingame_menu_open();
+            g_pstats.menu_frames += ingame_menu_open();
+            ingame_menu_record(g_vk.cmd, g_vk.views[idx], g_vk.extent);
+        }
+        // From the layout the image is in: colour attachment once the overlay's
+        // barrier ran, even when it then drew nothing (it said transfer
+        // destination then - the validation layer's layout mismatch, and what a
+        // driver that keeps colour compressed would read wrongly).
+        VkImageMemoryBarrier to_present = to_dst;
+        to_present.oldLayout = as_colour ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        to_present.srcAccessMask = as_colour ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
+        to_present.dstAccessMask = 0;
+        vkCmdPipelineBarrier(g_vk.cmd,
+                             as_colour ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_present);
     }
-    // The host overlay goes over the game's frame: the pointer now, the text
-    // box and the options screen later. Drawing needs
-    // the image as a colour attachment rather than a transfer destination.
-    bool overlaid = false;
-    bool as_colour = false;  // the image was moved to the colour-attachment layout, whether or not the overlay then drew
-    if (idx < g_vk.views.size() && g_vk.views[idx] && (!host_overlay_empty() || ingame_menu_open())) {
-        VkImageMemoryBarrier to_colour = to_dst;
-        to_colour.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        to_colour.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        to_colour.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        to_colour.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        vkCmdPipelineBarrier(g_vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0,
-                             nullptr, 0, nullptr, 1, &to_colour);
-        as_colour = true;
-        overlaid = host_overlay_draw(g_vk.device, g_vk.cmd, g_vk.images[idx], g_vk.views[idx], g_vk.extent, area,
-                                     static_cast<float>(display_w ? display_w : g_vk.extent.width),
-                                     static_cast<float>(display_h ? display_h : g_vk.extent.height));
-        // The plugin menu (F9) over everything else (host/ingame_menu.h).
-        ingame_menu_record(g_vk.cmd, g_vk.views[idx], g_vk.extent);
-    }
-    // From the layout the image is in: colour attachment once the overlay's
-    // barrier ran, even when it then drew nothing (it said transfer
-    // destination then - the validation layer's layout mismatch, and what a
-    // driver that keeps colour compressed would read wrongly).
-    (void)overlaid;
-    VkImageMemoryBarrier to_present = to_dst;
-    to_present.oldLayout = as_colour ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    to_present.srcAccessMask = as_colour ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_present.dstAccessMask = 0;
-    vkCmdPipelineBarrier(g_vk.cmd,
-                         as_colour ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_present);
     host_gpu_busy_present_end(g_vk.cmd);  // counted as on its way from here: it is always submitted below
     vkEndCommandBuffer(g_vk.cmd);
     const auto t_recorded = std::chrono::steady_clock::now();
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.waitSemaphoreCount = 1;
-    si.pWaitSemaphores = &g_vk.acquire_sem;
-    si.pWaitDstStageMask = &wait_stage;
+    si.waitSemaphoreCount = by_fence ? 0 : 1;
+    si.pWaitSemaphores = by_fence ? nullptr : &acquire_sem;
+    si.pWaitDstStageMask = by_fence ? nullptr : &wait_stage;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &g_vk.cmd;
     const VkSemaphore rendered = idx < g_vk.render_sems.size() && g_vk.render_sems[idx] ? g_vk.render_sems[idx] : g_vk.render_sem;
@@ -810,33 +1021,42 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     // ~1.3 ms of vkQueueSubmit on a Steam Deck, held under it, cost the
     // command processor ~1.5 ms a frame. Only presenting waits for the
     // submission to have gone in.
-    const std::uint64_t ticket = host_gpu_submit_presenter(g_vk.cmd, g_vk.acquire_sem, wait_stage, rendered, g_vk.fence);
-    bool queue_held = false;
+    const std::uint64_t ticket = host_gpu_submit_presenter(g_vk.cmd, by_fence ? nullptr : acquire_sem, wait_stage, rendered, g_vk.fence);
     if (ticket) {
         host_gpu_unlock();
         locked = false;
         host_gpu_wait_submitted(ticket);
-        if (!g_vk.present_queue) {
-            host_gpu_queue_lock_only();  // its blit is in; what the game queued since need not be
-            queue_held = true;
-        }
     } else {
         host_gpu_queue_lock();
         vkQueueSubmit(g_vk.queue, 1, &si, g_vk.fence);
-        if (g_vk.present_queue) {
-            host_gpu_queue_unlock();
-        } else {
-            queue_held = true;
-        }
-    }
-    const auto t_submitted = std::chrono::steady_clock::now();
-    // The present itself goes on this thread's own queue, after the lock: it
-    // can block - Xvfb copies the image inside it, ~20 ms a frame, and a full
-    // FIFO waits for the display - and under the renderer's lock that held
-    // the command processor for 44% of the time.
-    if (g_vk.present_queue && locked) {
+        host_gpu_queue_unlock();
         host_gpu_unlock();
         locked = false;
+    }
+    const auto t_submitted = std::chrono::steady_clock::now();
+    // The frame done on the GPU before the present is asked for, on no lock
+    // (BBHOST_PRESENT_GPU_WAIT). Bounded: a lost device signals nothing.
+    if (g_vk.gpu_wait) {
+        present_step("waiting for the frame on the GPU");
+        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, 1000000000ull);
+    }
+    const auto t_gpu_done = std::chrono::steady_clock::now();
+    // The present itself goes on this thread's own queue, with no lock: it can
+    // block - Xvfb copies the image inside it, ~20 ms a frame, and a full FIFO
+    // waits for the display - and under the renderer's lock that held the
+    // command processor for 44% of the time. A device with one queue presents
+    // on the renderer's under its queue lock (the submission thread's blit is
+    // in; what the game queued since need not be), and with no submission
+    // thread under the renderer's lock too, which is what orders the command
+    // processor's own submits there.
+    bool queue_held = false;
+    if (!g_vk.present_queue) {
+        if (!ticket) {
+            host_gpu_lock();
+            locked = true;
+        }
+        host_gpu_queue_lock_only();
+        queue_held = true;
     }
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.waitSemaphoreCount = 1;
@@ -847,6 +1067,10 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     present_step("presenting");
     const VkResult pr = vkQueuePresentKHR(g_vk.present_queue ? g_vk.present_queue : g_vk.queue, &pi);
     if (queue_held) host_gpu_queue_unlock();
+    if (locked) {
+        host_gpu_unlock();
+        locked = false;
+    }
     // The next frame rebuilds first when the present says the swapchain no
     // longer fits: out of date always, suboptimal only on a new size.
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || (pr == VK_SUBOPTIMAL_KHR && surface_size_changed())) g_swap_dirty.store(true);
@@ -858,22 +1082,32 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
     // doing work (flush, blit, submit). A choppy windowed run with a healthy
     // headless one is decided by these two numbers. The work splits into
     // submitting the renderer's queued work, waiting for the renderer lock,
-    // recording the blit, the queue submit and the present; the blit and the
-    // queue submit hold the renderer lock, and so does the present when the
-    // device has no second queue for it.
+    // recording the blit, the queue submit and the present; the blit holds
+    // the renderer lock, and so does the present when the device has neither
+    // a second queue nor the submission thread. The wait for the frame on the
+    // GPU before the present is in the second line, not in the work.
     static std::uint64_t wait_us = 0, work_us = 0, presents = 0;
     static std::uint64_t flush_us = 0, lock_us = 0, blit_us = 0, submit_us = 0, queue_present_us = 0;
     static auto last = std::chrono::steady_clock::now();
-    const auto us = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
-        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
-    };
     wait_us += us(t_enter, t_acquired);
-    work_us += us(t_acquired, t_presented);
+    work_us += us(t_acquired, t_submitted) + us(t_gpu_done, t_presented);
     flush_us += us(t_acquired, t_flushed);
     lock_us += us(t_flushed, t_locked);
     blit_us += us(t_locked, t_recorded);
     submit_us += us(t_recorded, t_submitted);
-    queue_present_us += us(t_submitted, t_presented);
+    queue_present_us += us(t_gpu_done, t_presented);
+    PresentStats& ps = g_pstats;
+    ps.gpu_wait_us += us(t_submitted, t_gpu_done);
+    if (flip.arrived_ns) {
+        const auto now_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t_presented.time_since_epoch()).count());
+        const std::uint64_t lat = now_ns > flip.arrived_ns ? now_ns - flip.arrived_ns : 0;
+        ps.latency_ns += lat;
+        ps.latency_max_ns = std::max(ps.latency_max_ns, lat);
+        ++ps.latency_n;
+    }
+    ps.on_arrival += flip.on_arrival;
+    ps.cpu_ns += host_thread_cpu_ns() - cpu_enter;
     if (++presents % 300 == 0) {
         const auto now = std::chrono::steady_clock::now();
         host_log("present: 300 frames in %lld ms (display wait %llu ms, work %llu ms: submit queued work %llu, lock wait %llu, blit %llu, "
@@ -883,6 +1117,26 @@ void vk_present(int buffer_index, std::uint64_t display_va, unsigned display_w, 
                  static_cast<unsigned long long>(flush_us / 1000), static_cast<unsigned long long>(lock_us / 1000),
                  static_cast<unsigned long long>(blit_us / 1000), static_cast<unsigned long long>(submit_us / 1000),
                  static_cast<unsigned long long>(queue_present_us / 1000), static_cast<unsigned long long>(g_present_dropped.load()));
+        // What each of those frames cost and how old it was when it went up:
+        // bb-present's own CPU, the time from the command processor queueing
+        // the flip to its present returning, how many were shown as they
+        // arrived, who submitted the renderer's recording, what was recorded
+        // to put it on screen (one pass, or a blit with a clear for bars and a
+        // rendering of its own for the overlay) and how long this thread slept
+        // on the GPU's frame and on the display's image.
+        const double n = 300.0;
+        host_log("present: per frame: bb-present CPU %.3f ms; flip to present %.1f ms (max %.1f), %llu of 300 shown on arrival; "
+                 "the renderer's recording submitted here %llu, left to the command processor %llu; one pass %llu, blits %llu, clears %llu, "
+                 "overlay renderings %llu; overlay drawn %llu, F9 menu %llu; slept %.2f ms on the frame's GPU work, %.2f ms on the "
+                 "acquired image; %s, %zu images",
+                 static_cast<double>(ps.cpu_ns) / 1e6 / n, ps.latency_n ? static_cast<double>(ps.latency_ns) / 1e6 / static_cast<double>(ps.latency_n) : 0.0,
+                 static_cast<double>(ps.latency_max_ns) / 1e6, static_cast<unsigned long long>(ps.on_arrival),
+                 static_cast<unsigned long long>(ps.submits_forced), static_cast<unsigned long long>(ps.submits_left),
+                 static_cast<unsigned long long>(ps.one_pass), static_cast<unsigned long long>(ps.blits), static_cast<unsigned long long>(ps.clears),
+                 static_cast<unsigned long long>(ps.overlay_passes), static_cast<unsigned long long>(ps.overlay_frames),
+                 static_cast<unsigned long long>(ps.menu_frames), static_cast<double>(ps.gpu_wait_us) / 1e3 / n,
+                 static_cast<double>(ps.acquire_wait_us) / 1e3 / n, present_mode_name(g_vk.mode), g_vk.images.size());
+        ps = PresentStats{};
         wait_us = work_us = flush_us = lock_us = blit_us = submit_us = queue_present_us = 0;
         last = now;
     }
@@ -1747,6 +2001,10 @@ bool host_window_pump() {
         float mx = 0.0f, my = 0.0f;
         if (ours && host_mouse_position(mx, my)) host_overlay_cursor(mx, my);
     }
+    // The frame's overlay, whole, to the presenter: a present never sees one
+    // half rebuilt. Nothing on it (no counter, pointer, box or screen) and the
+    // presenter's pass draws nothing over the picture.
+    host_overlay_commit();
     // BBHOST_MOUSE_LOG=1: the pointer as the host sees it, for bringing it up
     // before there is a consumer. This **consumes** the edges, the wheel and
     // `moved` the way a real reader does - without that the first click stays
@@ -1821,6 +2079,7 @@ struct PendingPresent {
     int buffer = 0;
     std::uint64_t va = 0;
     unsigned w = 0, h = 0;
+    PresentFlip flip;
 };
 std::mutex g_present_mu;
 std::condition_variable g_present_cv;
@@ -1840,7 +2099,7 @@ void present_thread_main() {
             p = g_present_next;
             g_present_next.has = false;
         }
-        vk_present(p.buffer, p.va, p.w, p.h);
+        vk_present(p.buffer, p.va, p.w, p.h, p.flip);
         // With V-Sync on this returned on the display's vblank: the flip clock
         // uses it to stay in phase with the display.
         g_present_last_ns.store(static_cast<std::uint64_t>(
@@ -2028,7 +2287,7 @@ void host_pad_rumble(std::uint8_t small, std::uint8_t large) {
 #endif
 }
 
-void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h) {
+void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w, unsigned display_h, const PresentFlip& flip) {
 #if defined(BBHOST_HAVE_SDL3)
     if (g_active) {
         std::lock_guard<std::mutex> lk(g_present_mu);
@@ -2037,7 +2296,7 @@ void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w
             host_log("present: display behind the game; dropped %llu frames so far",
                      static_cast<unsigned long long>(g_present_dropped.load()));
         }
-        g_present_next = PendingPresent{true, buffer_index, display_va, display_w, display_h};
+        g_present_next = PendingPresent{true, buffer_index, display_va, display_w, display_h, flip};
         g_present_cv.notify_one();
         {
             // What the pointer's window position scales by.
@@ -2051,6 +2310,7 @@ void host_present(int buffer_index, std::uint64_t display_va, unsigned display_w
     (void)display_va;
     (void)display_w;
     (void)display_h;
+    (void)flip;
 #endif
 }
 

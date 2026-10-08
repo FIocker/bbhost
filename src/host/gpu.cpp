@@ -1720,6 +1720,28 @@ bool init_locked() {
         g.has_memory_budget = has("VK_EXT_memory_budget");
         // BBHOST_PIPELINE_STATS: the driver's statistics and disassembly of named pipelines (render.cpp).
         g.pipeline_stats = std::getenv("BBHOST_PIPELINE_STATS") && has("VK_KHR_pipeline_executable_properties");
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+        // The present mode FIFO_LATEST_READY (window.cpp, vk_create_swapchain):
+        // V-Sync with no queue of frames behind the display - at each refresh
+        // the newest finished frame goes up and older ones are dropped, which
+        // is MAILBOX's latency on a driver that has no MAILBOX (AMD's Windows
+        // driver lists IMMEDIATE, FIFO, FIFO_RELAXED and this). The KHR
+        // extension or its EXT original, and the feature switched on.
+        if (g_want_present) {
+            const char* name = has(VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME) ? VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME
+                               : has("VK_EXT_present_mode_fifo_latest_ready")          ? "VK_EXT_present_mode_fifo_latest_ready"
+                                                                                       : nullptr;
+            if (name) {
+                VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR ql{};
+                ql.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR;
+                VkPhysicalDeviceFeatures2 qf{};
+                qf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                qf.pNext = &ql;
+                vkGetPhysicalDeviceFeatures2(g.phys, &qf);
+                if (ql.presentModeFifoLatestReady) g.fifo_latest_ready_ext = name;
+            }
+        }
+#endif
     }
 
     // A second queue, when the family has one, is the presenter's: a present
@@ -1762,6 +1784,9 @@ bool init_locked() {
     if (g_want_present && has_swapchain) {
         dext.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
         g.present_capable = true;
+        if (g.fifo_latest_ready_ext) dext.push_back(g.fifo_latest_ready_ext);
+    } else {
+        g.fifo_latest_ready_ext = nullptr;
     }
     VkPhysicalDeviceFaultFeaturesEXT ffault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     ffault.deviceFault = VK_TRUE;
@@ -1867,6 +1892,15 @@ bool init_locked() {
             host_log("gpu: pixel shaders at the device's subgroup size %u: %s", subp.subgroupSize, why);
         }
     }
+#if defined(VK_KHR_present_mode_fifo_latest_ready)
+    VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR flatest{};
+    flatest.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR;
+    flatest.presentModeFifoLatestReady = VK_TRUE;
+    if (g.fifo_latest_ready_ext) {
+        flatest.pNext = f13.pNext;
+        f13.pNext = &flatest;
+    }
+#endif
     f13.dynamicRendering = VK_TRUE;
     f13.synchronization2 = VK_TRUE;
     {
@@ -4615,6 +4649,7 @@ GpuHandles host_gpu_handles() {
     h.queue = g.queue;
     h.present_queue = g.present_queue;
     h.family = g.family;
+    h.fifo_latest_ready = g.fifo_latest_ready_ext != nullptr;
     return h;
 }
 
@@ -4644,6 +4679,19 @@ void host_gpu_wait_submitted(std::uint64_t ticket) {
     if (!ticket) return;
     std::unique_lock<std::mutex> lk(g_sub_mu);
     g_sub_idle.wait(lk, [ticket] { return g_sub_submitted.load(std::memory_order_acquire) >= ticket; });
+}
+
+bool host_gpu_submit_for_flip(std::uint64_t need) {
+    {
+        // The command processor submits after every job (gnm_exec.cpp,
+        // BBHOST_SUBMIT_EVERY_JOB) and queues the flip after that, so the
+        // flip's frame is normally in a submission already, and whatever is
+        // being recorded now is the next frame's.
+        std::lock_guard<GpuMutex> lock(g.mu);
+        if (!g.ok || g.flushes >= need) return false;
+    }
+    host_gpu_submit();
+    return true;
 }
 
 namespace {
