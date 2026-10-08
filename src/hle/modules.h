@@ -160,6 +160,7 @@ void hle_video_set_fps_cap(int fps);  // video.fps_cap (upper bound on presented
 // A frame rate set after that applies on the next run.
 void hle_video_set_game_pace(int fps);
 void hle_video_set_loading_uncapped(bool on);  // flips complete at once while a loading screen is up (engine/loading.cpp)
+std::uint64_t hle_video_loading_unshown();      // loading flips completed without being shown, so far (video.cpp)
 void hle_dialog_set_default_name(const char* name, bool type_in_window);  // IME text (player.name) and whether to type it
 void hle_np_set_online_id(const char* id);          // sceNpGetOnlineId (online.online_id)
 
