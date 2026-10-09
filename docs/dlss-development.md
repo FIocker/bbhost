@@ -85,6 +85,15 @@ uncapped, otherwise idle GPU. NVIDIA's
 requires Reflex for its Streamline integration; the native NGX path here does
 not supply Streamline's presentation pacer or Reflex automatically.
 
+A below-cap functional check keeps the game's cap at 60 FPS with native DLAA
+and object motion enabled. GPU source intervals are about 23.6 ms (42 FPS),
+and 2x generation displays 84.84 FPS over 3,817 gameplay intervals, with zero
+evaluation failures and one reset suppressing interpolation. The matching
+FG-off run displays 47.27 FPS. These are functional observations, not a
+controlled performance benchmark: foreground presentation and an otherwise
+idle GPU were not confirmed. A larger-output stress run had no generated
+presentations and was excluded from FG results.
+
 ## Integration checks
 
 - Verified: smaller scene input reconstructs into a larger displayed output,
@@ -150,10 +159,11 @@ aspect ratio close to the output's. An output at/below scene size, an
 incompatible target, or failed SR creation/evaluation retains native DLAA
 when NGX is available. Missing NGX retains ordinary game rendering.
 
-The local experimental kit supplies separate SR+FG and DLAA+FG launchers.
-It uses the isolated playtest save/config and does not bundle game files or
-account credentials. Its in-game FPS counter measures real game frames,
-so a reading of 60 does not imply generated presentations are missing.
+The local experimental kit uses an isolated playtest save/config and does
+not bundle game files or account credentials. The host's FPS counter counts
+presentation requests, including generated images; PresentMon is used to
+check which images actually reach the display. The game's internal frame
+diagnostics still describe real game frames.
 
 ## Optional object motion vectors
 
