@@ -93,6 +93,12 @@ interval and cadence problems. Higher factors stay behind
 precede the final phase bound and do not establish cap-safe MFG.
 Unsupported higher factors fall back to 2x.
 
+After the final phase fix, a clean 3x repeat with the game cap at 60 FPS
+measured about 55 real FPS, 115.09 displayed FPS and a 16.47 ms p99 interval.
+It improved over the earlier run but still varied from 4.95 ms at p10 to
+13.05 ms at p90, skipping many generated positions against the driver limit.
+This does not justify promoting it to the normal menu.
+
 Reflex is not integrated. NVIDIA's
 [Streamline DLSS-G guide](https://github.com/NVIDIA-RTX/Streamline/blob/main/docs/ProgrammingGuideDLSS_G.md)
 requires Reflex for that integration; native NGX does not supply Streamline's
