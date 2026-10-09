@@ -264,15 +264,14 @@ void host_binding_prompt(int action, char* out, std::size_t n) {
 
 namespace {
 
-// Of two opposite directions held at once, the one pressed last wins: W while
-// S is held turns round and letting go of it turns back, and a quick A-to-D
-// that overlaps goes straight to D - where a fixed winner made W do nothing
-// under S. (Dark Souls III sums them, so both held stand still.) One caller,
-// the window's pad update, so the state is its own.
+// Two opposite directions held at once cancel, as Dark Souls III's keyboard
+// does (its digital-to-analog converter sums each axis's keys). Pressing A
+// while sprinting on W+D so runs straight on until D is let go - two turns of
+// 45 degrees. Letting the newer key win instead (#51's first cut) turned the
+// stick 90 degrees in one frame, past the character script's 90-degree
+// sprint-turn threshold, and the character spun as if told to turn round.
 constexpr int kOpposites[4][2] = {
     {kBindMoveF, kBindMoveB}, {kBindMoveL, kBindMoveR}, {kBindLookU, kBindLookD}, {kBindLookL, kBindLookR}};
-bool g_keys_were[kBindCount] = {};
-int g_pressed_last[4] = {kBindMoveF, kBindMoveL, kBindLookU, kBindLookL};
 
 }  // namespace
 
@@ -281,14 +280,8 @@ void host_bindings_keys_held(const bool* keys, int nkeys, bool held[kBindCount])
         const int sc = g_key[a].load(std::memory_order_relaxed);
         held[a] = sc > 0 && sc < nkeys && keys[sc];
     }
-    for (int i = 0; i < 4; ++i) {
-        for (const int a : kOpposites[i])
-            if (held[a] && !g_keys_were[a]) g_pressed_last[i] = a;
-    }
-    std::memcpy(g_keys_were, held, sizeof g_keys_were);
-    for (int i = 0; i < 4; ++i) {
-        const int a = kOpposites[i][0], b = kOpposites[i][1];
-        if (held[a] && held[b]) held[g_pressed_last[i] == a ? b : a] = false;
+    for (const auto& pair : kOpposites) {
+        if (held[pair[0]] && held[pair[1]]) held[pair[0]] = held[pair[1]] = false;
     }
     note_debug_key(0, held[kBindDebugMenu]);
 }
@@ -319,14 +312,14 @@ void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p) 
         if (bit == kR2) p.r2 = 255;  // the triggers are analogue as well as buttons
         if (bit == kL2) p.l2 = 255;
         switch (a) {
-            case kBindMoveF: p.ly = 0; break;
-            case kBindMoveB: p.ly = 255; break;
-            case kBindMoveL: p.lx = 0; break;
-            case kBindMoveR: p.lx = 255; break;
-            case kBindLookU: p.ry = 0; break;
-            case kBindLookD: p.ry = 255; break;
-            case kBindLookL: p.rx = 0; break;
-            case kBindLookR: p.rx = 255; break;
+            case kBindMoveF: p.ly = kStickLow; break;
+            case kBindMoveB: p.ly = kStickHigh; break;
+            case kBindMoveL: p.lx = kStickLow; break;
+            case kBindMoveR: p.lx = kStickHigh; break;
+            case kBindLookU: p.ry = kStickLow; break;
+            case kBindLookD: p.ry = kStickHigh; break;
+            case kBindLookL: p.rx = kStickLow; break;
+            case kBindLookR: p.rx = kStickHigh; break;
             case kBindGestures:
             case kBindEffects:
                 // One quarter in from the edge, half way down, and a stable id
