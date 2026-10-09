@@ -1582,7 +1582,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             const MouseState m = host_mouse_state();
             const auto axis = [](float v) {
                 const float c = static_cast<float>(kStickRest) + v;
-                return static_cast<std::uint8_t>(c < 0.0f ? 0.0f : c > 255.0f ? 255.0f : c);
+                return static_cast<std::uint8_t>(c < kStickLow ? kStickLow : c > kStickHigh ? kStickHigh : c);
             };
             // The mouse turns the camera itself, as DS3's does: an angle a
             // count added in the follow camera's update, not a stick
