@@ -1,0 +1,23 @@
+name: audit translation layout
+on: [push, workflow_dispatch]
+jobs:
+  layout:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: |
+          cat > /tmp/layout.cpp <<'CPP'
+          #include "gcn/translate.h"
+          #include <cstdio>
+          int main() {
+              printf("size=%zu vector_bool=%zu rsrc1=%zu ps_map=%zu sampler=%zu\n", sizeof(gcn::TranslateOptions), sizeof(std::vector<bool>), offsetof(gcn::TranslateOptions, rsrc1), offsetof(gcn::TranslateOptions, ps_input_map), offsetof(gcn::TranslateOptions, sampler_force_unnormalized));
+          }
+          CPP
+          clang++ -std=c++20 -Isrc /tmp/layout.cpp -o /tmp/layout
+          /tmp/layout
+          git show 8f2746c:src/gcn/translate.h > /tmp/translate-before.h
+          sed 's@gcn/translate.h@translate-before.h@' /tmp/layout.cpp > /tmp/before.cpp
+          clang++ -std=c++20 -Isrc /tmp/before.cpp -o /tmp/before
+          /tmp/before
