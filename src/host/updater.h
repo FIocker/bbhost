@@ -8,11 +8,11 @@
 // needs update.token_file. Nothing is sent but that token and a user agent:
 // never the account's.
 //
-// Each release still carries bbhost-<tag>-windows.exe and bbhost-<tag>-linux
-// (the bare executables), SHA256SUMS and SHA256SUMS.sig, besides the packages:
-// the updater of older builds installs those, and that is how such a build
-// reaches this one. The release key below signs SHA256SUMS and the official
-// plugins.
+// Each release carries the bare executables under the same names every time
+// (bbhost.exe, bbhost), SHA256SUMS and SHA256SUMS.sig, besides the packages.
+// Older builds' updater looked for bbhost-<tag>-windows.exe; finding none, it
+// says to get the release from its page. The release key below signs
+// SHA256SUMS and the official plugins.
 #pragma once
 
 #include <cstdint>
