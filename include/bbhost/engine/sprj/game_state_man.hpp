@@ -100,8 +100,8 @@ struct GameStateMan {
     // it on destruction. Gates CSNetworkFlowStep's network notifications.
     std::uint8_t title_network_events_enabled;
     // Shared world/snapshot policy byte, not just an action-state bit. Vanilla
-    // immediate lamp registration requires nonzero; BBSC intentionally uses
-    // zero for guest snapshot/scalar application and bypasses the lamp's check
+    // immediate lamp registration requires nonzero; a guest applying a host's
+    // snapshot and scalars can keep it zero and bypass the lamp's check
     // locally instead of changing this global value to light a lamp.
     std::uint8_t action_event_selector;
     Unknown<0x0d> _unknown_1593;

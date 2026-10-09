@@ -3,7 +3,7 @@
 // and `delay` seconds later, the Lua event the bells would have: the guest's
 // sign (`OnEvent_SendSoulSign_NormalCoop`) or the host's search
 // (`OnEvent_Call_SOS`), through the game's own LuaEvent_DispatchByName -
-// the entry points fromsoftware-rs's native summon runbook proved.
+// the call the scripts' own event raisers make.
 // Test scaffolding, hash-gated; off unless the variable is set.
 #pragma once
 

@@ -20,7 +20,7 @@ struct SprjEmkConditionGroupVTable {
 // frees through the condition's owning heap.
 struct SprjEmkConditionVTable {
     const void* destroy;
-    const void* delete_;  // crate name `delete` (a C++ keyword)
+    const void* delete_;  // `delete` is a C++ keyword
     const void* update;
     const void* slot_18;
     const void* release_auxiliary;
@@ -144,9 +144,9 @@ struct SprjEmkConditionGroup {
         return true;
     }
 
-    // Bit latched in event.state[0]; 0 for group zero, which has none (crate:
-    // None). x86 BT/SHL use only five shift bits, including for unusual
-    // signed-byte IDs; no 1..15 range restriction is imposed.
+    // Bit latched in event.state[0]; 0 for group zero, which has none. x86
+    // BT/SHL use only five shift bits, including for unusual signed-byte IDs;
+    // no 1..15 range restriction is imposed.
     static constexpr std::uint32_t state_mask(std::int8_t group_id) {
         if (group_id == 0) return 0;
         const std::int32_t index = group_id > 0 ? std::int32_t{group_id} - 1 : 15 - std::int32_t{group_id};
@@ -234,7 +234,7 @@ struct SprjEmkCollisionCondition {
 };
 
 namespace detail::emk_condition_layout {
-// The SprjEmkEventCore offsets in the crate's test are asserted in emk_system.hpp.
+// The SprjEmkEventCore offsets are asserted in emk_system.hpp.
 BB_SIZE(SprjEmkConditionHolder, SprjEmkConditionHolder::PREFIX_SIZE);
 static_assert(alignof(SprjEmkConditionHolder) == 8, "alignof(SprjEmkConditionHolder)");
 BB_OFFSET(SprjEmkConditionHolder, newest, 0);

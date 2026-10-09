@@ -8,7 +8,7 @@ namespace bb {
 inline constexpr std::size_t ITEM_ID_SIZE = 0x04;
 inline constexpr std::size_t OPTIONAL_ITEM_ID_SIZE = 0x04;
 
-// Why an item ID or category is invalid (crate: ItemIdError).
+// Why an item ID or category is invalid.
 enum class ItemIdError : std::uint8_t {
     None = 0,
     InvalidCategory,  // the category high bits are not a known equipment table
@@ -23,7 +23,7 @@ enum class ItemCategory : std::uint8_t {
     Goods = 4,
 };
 
-// The crate's TryFrom<u8>.
+// False for a raw value that names no category.
 inline constexpr bool item_category_from_raw(std::uint8_t value, ItemCategory* out) {
     switch (value) {
     case 0:
@@ -56,7 +56,7 @@ struct OptionalItemId {
     // Value used by the game to represent no item.
     static const OptionalItemId NONE;
 
-    // Normalizes an unknown category to NONE (the crate's From<u32>).
+    // Normalizes an unknown category to NONE.
     static constexpr OptionalItemId from_raw(std::uint32_t raw) {
         OptionalItemId id{raw};
         return id.is_valid() ? id : OptionalItemId{0xffffffffu};
@@ -101,7 +101,7 @@ struct ItemId {
     static constexpr ItemId new_unchecked(ItemCategory category, std::uint32_t param_id) {
         return ItemId{OptionalItemId{(std::uint32_t(category) << 28) | param_id}};
     }
-    // The crate's TryFrom<u32> / TryFrom<OptionalItemId>.
+    // An ItemId from a raw ID, or why it is not one.
     static constexpr ItemIdError try_from(OptionalItemId raw, ItemId* out) {
         if (!raw.is_valid()) return ItemIdError::InvalidCategory;
         *out = ItemId{raw};

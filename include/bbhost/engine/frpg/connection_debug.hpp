@@ -8,8 +8,8 @@ namespace bb {
 // These workloads manage signaling peer connections; the lobby route
 // corresponds to Matching2 lobbies, not a BB-specific backend.
 //
-// The crate's module-level constants are kept in bb::connection_debug,
-// mirroring the Rust path frpg::connection_debug; the types are in bb.
+// The module-level constants are kept in bb::connection_debug; the types are
+// in bb.
 namespace connection_debug {
 
 inline constexpr std::size_t MANAGER_OFFSET = 0x30;

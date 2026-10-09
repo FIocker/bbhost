@@ -21,7 +21,7 @@ int main() {
     check(!bb::find_symbol("NO_SUCH_SYMBOL"), "an unknown name is not found");
     check(std::strcmp(bb::params::ItemLotParam::name, "ItemLotParam") == 0, "a table tag names its table");
     // 0x184: the stride of the 1.09 NpcParam.param rows and the game's own
-    // definition (the Rust crate's generated layout says 0x188).
+    // definition.
     static_assert(sizeof(bb::params::NpcParam::Row) == 0x184, "NPC_PARAM_ST, as the 1.09 table lays it out");
     bb::Rng a(bb::seed_of("seed")), b(bb::seed_of("seed"));
     check(a.next() == b.next(), "one seed, one sequence");

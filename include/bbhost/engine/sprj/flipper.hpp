@@ -21,7 +21,7 @@ enum class SprjFlipMode : std::uint32_t {
     Fps30WithoutSkipTearing = 4,
 };
 
-// The crate's TryFrom<u32>: false for a raw value outside the five modes.
+// False for a raw value outside the five modes.
 inline constexpr bool sprj_flip_mode_from_raw(std::uint32_t value, SprjFlipMode* out) {
     if (value > 4) return false;
     *out = static_cast<SprjFlipMode>(value);

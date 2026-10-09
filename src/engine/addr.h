@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-// Bloodborne 1.09 address spaces. fromsoftware-rs and Ghidra use the
+// Bloodborne 1.09 address spaces. Ghidra uses the
 // 0x800000000 image base; bbhost maps the ELF at GuestMemory::slide
 // (preferred 0x400000). ELF file VA = Ghidra VA - kGhidraBase.
 

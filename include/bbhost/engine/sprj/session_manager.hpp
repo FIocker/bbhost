@@ -47,8 +47,8 @@ inline constexpr Rva SPRJ_SESSION_PEER_RECEIVERS_READ_FN{0x1ecc450};
 inline constexpr Rva SPRJ_SESSION_PEER_RECEIVER_CONSTRUCT_FN{0x1ecd180};
 inline constexpr Rva SPRJ_SESSION_PEER_RECEIVER_DESTRUCT_FN{0x1ecd4a0};
 inline constexpr Rva SPRJ_SESSION_PEER_RECEIVER_READ_FN{0x1ecd750};
-// Constructor-proven queue count, not a party-size limit. This does not prove
-// that the BBSC gameplay receive path uses these queues for each packet ID.
+// Constructor-proven queue count, not a party-size limit. It does not prove
+// which of these queues a gameplay packet ID is received on.
 inline constexpr std::size_t SPRJ_SESSION_PEER_RECEIVER_QUEUE_COUNT = 0x3a;
 
 // Starts the asynchronous native leave path. Roles 0/2/5 return false without
@@ -205,8 +205,7 @@ struct SprjSessionBuffer {
 
 // Contiguous 0x10-byte result element copied on matching event 0x28. Native
 // copy constructor RVA 0x0c8e4c0 installs the vtable and copies two dwords
-// (meanings not established). Not a WorldSessionObjectMan member node or a
-// BBSC coordinator slot.
+// (meanings not established). Not a WorldSessionObjectMan member node.
 struct SprjSessionPeerListEntry {
     const void* vtable;
     std::uint32_t value_08;
@@ -552,7 +551,7 @@ BB_OFFSET(SprjSessionEvent, peer_results, 0xb8);
 BB_OFFSET(SprjSessionEvent, member_results, 0xe0);
 BB_OFFSET(SprjSessionEvent, text, 0x160);
 BB_OFFSET(SprjSessionEvent, callback_context, 0x190);
-// Sizes stated in the crate's doc comments.
+// Sizes of the entry and node types.
 BB_SIZE(SprjSessionReceivePayloadEntry, 0x38);
 BB_SIZE(SprjSessionPeerListEntry, 0x10);
 BB_SIZE(SprjSessionMemberResultEntry, 0x0c);

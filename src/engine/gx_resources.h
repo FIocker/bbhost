@@ -13,7 +13,7 @@
 // destructor (0x256d1a0 / 0x256d310, memory freed through the allocator's
 // slot +0x70; a buffer's 0x256ce10 through 0x256d690), and a resource made
 // over the same memory later gets a new id: the id is the identity, the
-// address a lookup key (native-port-direction.md).
+// address a lookup key.
 //
 // The registry is keyed by holder and indexed by memory. The texture cache
 // asks it (gx_resource_at) what covers a surface's memory and whether GX

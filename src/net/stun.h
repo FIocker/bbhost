@@ -6,11 +6,11 @@
 // sends and receives on the P2P port so the mapping is that port's.
 //
 // The request is RFC 5389's shape (the magic cookie leads the transaction
-// id), which an RFC 3489 server such as the private server's stun_server.py
-// reads as a 16-byte id. The response is taken from MAPPED-ADDRESS (0x0001)
+// id), which an RFC 3489 server such as the private server's reads as a
+// 16-byte id. The response is taken from MAPPED-ADDRESS (0x0001)
 // when present, else XOR-MAPPED-ADDRESS (0x8020 or 0x0020), un-XORed with
 // the cookie when the response carries it and with the transaction id's
-// own first bytes otherwise (what stun_server.py does).
+// own first bytes otherwise (what the private server's does).
 #pragma once
 
 #include <cstddef>
@@ -24,7 +24,7 @@ constexpr std::size_t kTokenLen = 8;
 // The longest request: the header and the relay HELLO (4 + 12).
 constexpr std::size_t kMaxRequest = kHeader + 16;
 
-// The private server's relay (its stun_server.py "bbrelay"): a request with
+// The private server's relay: a request with
 // BBHOST-HELLO (0x8100: "bbr1" + the token it was given, zeros before the
 // first) gets a relay port bound to a token, and BBHOST-RELAY (0x8101:
 // "bbr1" + token + port + the address the request came from) in the answer.

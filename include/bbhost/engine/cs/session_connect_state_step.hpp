@@ -1,5 +1,5 @@
 // CSSessionConnectStateStep: the native asynchronous leave step owned by
-// SprjSessionManager (the crate re-exports it from sprj as the same type).
+// SprjSessionManager.
 #pragma once
 
 #include "bbhost/engine/base.hpp"

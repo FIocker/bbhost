@@ -572,8 +572,8 @@ struct GameDataMan {
         return session_player_records[slot];
     }
     bool full_recover_requested() const { return full_recover_request != 0; }
-    // Legacy filtered views (crate: help_white_ghost_count() /
-    // kill_black_ghost_count(), renamed because C++ cannot share a name with
+    // Legacy filtered views of help_white_ghost_count and
+    // kill_black_ghost_count (named apart because C++ cannot share a name with
     // the field). False also represents unsigned saturation at 0xffffffff; it
     // is not proof of missing game data.
     bool help_white_ghost_count_filtered(std::int32_t* out) const {

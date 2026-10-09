@@ -5270,7 +5270,7 @@ bool host_gpu_copy_guest(std::uint64_t dst, std::uint64_t src, std::size_t bytes
     return true;
 }
 
-// ---- Copy versions (G9) ----
+// ---- Copy versions ----
 // GX copies a dynamic buffer's renamed bytes back to its own address with a
 // compute pass between draws: ~30 copy tokens a frame, ~200 copies, half of
 // the tokens in the middle of a render pass (a dozen in the G-buffer pass

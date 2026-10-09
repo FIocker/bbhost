@@ -1103,8 +1103,8 @@ void options_panel_frame(float display_w, float display_h) {
     // then so had 1080 lines - so when the display is shorter than that the
     // pitch closes up to fit (the text keeps its size), rather than the last
     // rows running under the key guide and off the panel.
-    // The rows outgrew every display once the account section came (PLAN
-    // 4.8), so rather than closing the pitch up until the lines overlap, the
+    // The rows outgrew every display once the account section came, so
+    // rather than closing the pitch up until the lines overlap, the
     // list scrolls: the rows that fit are drawn, the selection is kept in
     // view, and a hint says there is more above or below.
     float rows_h = 0.0f;

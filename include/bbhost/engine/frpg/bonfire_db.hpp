@@ -10,8 +10,8 @@ namespace bb {
 // queries reorder rows, allocate, or consume notifications; they must not be
 // used as read-only inspector getters.
 //
-// The crate's module-level constants (SIZE, CONSTRUCTOR, ...) are kept in
-// bb::bonfire_db, mirroring the Rust path frpg::bonfire_db; the structs are in bb.
+// The module-level constants (SIZE, CONSTRUCTOR, ...) are kept in
+// bb::bonfire_db; the structs are in bb.
 namespace bonfire_db {
 
 inline constexpr std::size_t OWNER_OFFSET = 0xc70;
@@ -56,7 +56,8 @@ inline constexpr std::int32_t INVALID_FLAG_BASE = -1;
 // The immediate callback excludes native role 6 from its anchor write; its
 // subsequent DB activation is not excluded by that same role check. It also
 // requires GameStateMan+0x1592 != 0 and nested session state +0x98 == -1. The
-// first condition conflicts with BBSC's retained guest snapshot policy;
+// first condition conflicts with a guest that keeps that byte zero to apply a
+// host's snapshot (game_state_man.hpp);
 // native activation and return-point registration must not be conflated.
 inline constexpr Rva LUA_EVENT_ACTIVATE_LAMP{0x131e4a0};
 inline constexpr Rva LAMP_ROLE6_RETURN_POINT_BRANCH{0x131e50a};

@@ -143,7 +143,7 @@ struct CSPlaygo {
     static constexpr Rva MARK_FILE_ACTIVITY_FN{0x1fddb10};
     static constexpr SprjTaskGroupIndex TASK_GROUP = SprjTaskGroupIndex::ResStep;
 
-    // False for an index past the two flag bytes (the crate returns None).
+    // False for an index past the two flag bytes.
     bool is_flag_set(std::size_t index) const { return index < 2 && flags[index] != 0; }
 
     // Snapshot of the native request selection. Does not call the platform

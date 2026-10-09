@@ -304,7 +304,7 @@ T get(std::uint64_t a) {
 // --- SprjFlipper::Update as source -----------------------------------------
 //
 // What the eboot's 0x2434770 does, in order, read from its decompile
-// (Binary Ninja) with fromsoftware-rs's field names: pick the mode (the
+// (Binary Ninja) with sprj_flipper.h's field names: pick the mode (the
 // secondary one for one frame when requested), write the frame-advance
 // policy and the target interval for it, take the one-shot overrides, sample
 // the clock, shorten this frame's interval when the last frames ran late

@@ -15,7 +15,7 @@ struct EQUIP_PARAM_WEAPON_ST;
 
 // ---- EquipParam: fields shared across the four equipment params ----------
 
-// Which equipment row an EquipParamRef views (the crate's EquipParamStruct).
+// Which equipment row an EquipParamRef views.
 enum class EquipParamKind : std::uint8_t {
     Accessory,
     Goods,
@@ -65,8 +65,7 @@ struct EquipParamKindOf<EQUIP_PARAM_WEAPON_ST> {
     static constexpr EquipParamKind value = EquipParamKind::Weapon;
 };
 
-// A view of any equipment row through its shared fields (the crate's
-// EquipParam / EquipParamWithIcon traits).
+// A view of any equipment row through its shared fields.
 class EquipParamRef {
 public:
     EquipParamRef(void* row, EquipParamKind kind) : row_(static_cast<std::uint8_t*>(row)), kind_(kind) {}
@@ -207,7 +206,7 @@ enum class SoloParamIndex : std::size_t {
 #undef BB_SOLO_PARAM_INDEX
 };
 
-// The solo params as types (the crate's SoloParam marker structs):
+// The solo params as types:
 // solo_param::NpcParam::NAME / INDEX / STRUCT_NAME, and StructType = the
 // forward-declared row type, for templates like FD4ParamResCap::get<P>.
 #define BB_SOLO_PARAM_ROW_DECL(Name, Row, Index) struct Row;

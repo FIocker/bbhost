@@ -96,7 +96,7 @@ bool parse_reply(const std::string& what, const HttpResult& r, json::Value& out,
     } else if (r.status < 200 || r.status >= 300) {
         error = "HTTP " + std::to_string(r.status);
         // 401 on the NP surfaces is the server refusing the sign-in, not a
-        // passing failure (server/main.py AccountTokenMiddleware): say so
+        // passing failure (the server's account-token check): say so
         // once and let the poller slow down (net/account.h).
         if (r.status == 401) {
             json::Value body;
