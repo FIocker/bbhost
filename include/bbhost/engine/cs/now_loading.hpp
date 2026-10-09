@@ -124,12 +124,12 @@ struct CSNowLoadingHelper {
     static constexpr Rva SHARED_ITEM_TABLE{0x5578170};
     static constexpr SprjTaskGroupIndex UPDATE_TASK_GROUP = SprjTaskGroupIndex::FrameBegin;
 
-    // The crate's is_loading() accessor; renamed because C++ cannot share the
-    // field's name. Current frame's request byte (+0x50).
+    // Not named is_loading(): C++ cannot share the field's name. Current
+    // frame's request byte (+0x50).
     bool loading_requested() const { return is_loading != 0; }
     // Latched previous-frame value (+0x51) used by native work consumers.
     bool loading_last_frame() const { return previous_loading != 0; }
-    // The crate's menu_load_entries() slice: the shared item-ID table as
+    // The menu's load entries: the shared item-ID table as
     // pointer + count, empty when the pointer is null. Not synchronized
     // against other native readers/writers of the global table.
     std::int32_t* entries() const { return menu_load_entries; }

@@ -1,5 +1,5 @@
 // Bloodborne 1.09 image-relative addresses (functions, globals, vtables, runtime-class
-// and step-template evidence) anchored in eboot.bin; port of the crate's symbols.rs.
+// and step-template evidence) anchored in eboot.bin.
 #pragma once
 
 #include "bbhost/engine/base.hpp"
@@ -8,9 +8,9 @@ namespace bb {
 
 // Resolve every symbol against the image base: Rva::bn() is the Binary Ninja address.
 //
-// Names that another crate file also defines (same value, checked when this header was
+// Names that another header also defines (same value, checked when this header was
 // generated) carry a `_symbols` suffix here so both headers can share a translation unit;
-// ALL_SYMBOLS lists them under the crate's own name.
+// ALL_SYMBOLS lists them under their own name.
 
 // Element count of a constexpr table.
 template <typename T, std::size_t N>
@@ -21,10 +21,10 @@ struct StepCallbackSymbol;
 // SosSignMan summon/request boundaries verified in Bloodborne 1.09 eboot.bin.
 // These are address symbols only; callable ABI exposure belongs to the
 // bounded `sprj::SosSignMan` layout module.
-inline constexpr Rva SOS_SIGN_MAN_UPDATE_AND_QUEUE_SUMMON_API_JOBS_symbols{0x14b5e10};  // crate name SOS_SIGN_MAN_UPDATE_AND_QUEUE_SUMMON_API_JOBS (also in sprj/sos_sign_man.rs)
-inline constexpr Rva SOS_SIGN_MAN_QUEUE_PENDING_SIGN_symbols{0x14b8d10};  // crate name SOS_SIGN_MAN_QUEUE_PENDING_SIGN (also in sprj/sos_sign_man.rs)
-inline constexpr Rva SOS_SIGN_MAN_QUEUE_OR_STAGE_SUMMON_REQUEST_symbols{0x14baec0};  // crate name SOS_SIGN_MAN_QUEUE_OR_STAGE_SUMMON_REQUEST (also in sprj/sos_sign_man.rs)
-inline constexpr Rva SOS_SIGN_MAN_CLEAR_SPECIFIC_PENDING_CREATE_symbols{0x14bb3d0};  // crate name SOS_SIGN_MAN_CLEAR_SPECIFIC_PENDING_CREATE (also in sprj/sos_sign_man.rs)
+inline constexpr Rva SOS_SIGN_MAN_UPDATE_AND_QUEUE_SUMMON_API_JOBS_symbols{0x14b5e10};  // ALL_SYMBOLS name SOS_SIGN_MAN_UPDATE_AND_QUEUE_SUMMON_API_JOBS (also in sprj/sos_sign_man.hpp)
+inline constexpr Rva SOS_SIGN_MAN_QUEUE_PENDING_SIGN_symbols{0x14b8d10};  // ALL_SYMBOLS name SOS_SIGN_MAN_QUEUE_PENDING_SIGN (also in sprj/sos_sign_man.hpp)
+inline constexpr Rva SOS_SIGN_MAN_QUEUE_OR_STAGE_SUMMON_REQUEST_symbols{0x14baec0};  // ALL_SYMBOLS name SOS_SIGN_MAN_QUEUE_OR_STAGE_SUMMON_REQUEST (also in sprj/sos_sign_man.hpp)
+inline constexpr Rva SOS_SIGN_MAN_CLEAR_SPECIFIC_PENDING_CREATE_symbols{0x14bb3d0};  // ALL_SYMBOLS name SOS_SIGN_MAN_CLEAR_SPECIFIC_PENDING_CREATE (also in sprj/sos_sign_man.hpp)
 
 // These 0x187xxxx routines belong to the event-side SOS selection state. They
 // were formerly attributed to the FrpgNetMan-owned SosSignMan.
@@ -51,7 +51,7 @@ struct RuntimeClassSymbol {
     // Registration function that writes the class names and initializes links.
     Rva registration_function;
     // Parent class observed or strongly implied during registration.
-    const char* probable_base_class;  // nullptr when the crate has None
+    const char* probable_base_class;  // nullptr when there is none
 };
 
 // FD4/Sprj step-template callback metadata observed during class registration.
@@ -154,7 +154,7 @@ inline constexpr Rva SPRJ_EVENT_FLAG_MAN_RESOLVE_GROUP_KEY_FN{0x13bc710};
 inline constexpr Rva SPRJ_EVENT_FLAG_MAN_SERIALIZE_SHARED_SNAPSHOT_FN{0x13be3c0};
 inline constexpr Rva SPRJ_EVENT_FLAG_MAN_APPEND_FLAG_GROUP_FN{0x13beac0};
 inline constexpr Rva SPRJ_EVENT_FLAG_MAN_APPLY_SNAPSHOT_FN{0x13beca0};
-inline constexpr Rva SPRJ_EVENT_FLAG_MAN_BROADCAST_SET_FLAG_FN_symbols{0x132aad0};  // crate name SPRJ_EVENT_FLAG_MAN_BROADCAST_SET_FLAG_FN (also in sprj/world_session_packet.rs)
+inline constexpr Rva SPRJ_EVENT_FLAG_MAN_BROADCAST_SET_FLAG_FN_symbols{0x132aad0};  // ALL_SYMBOLS name SPRJ_EVENT_FLAG_MAN_BROADCAST_SET_FLAG_FN (also in sprj/world_session_packet.hpp)
 inline constexpr Rva SPRJ_EVENT_FLAG_MAN_CLEAR_BIT_RANGE_FN{0x13d0430};
 inline constexpr Rva WORLD_CHR_MAN_DBG_SINGLETON_PTR{0x553e880};
 
@@ -276,7 +276,7 @@ inline constexpr Rva CHR_INS_UPDATE_MAP_COLLISION_BINDING_FN{0x18becf0};
 inline constexpr Rva CHR_INS_INITIALIZE_MAP_COLLISION_FROM_SPAWN_FN{0x18d8be0};
 
 // Main-player fallback that only binds when `ChrIns+0x288` is null.
-inline constexpr Rva WORLD_CHR_MAN_REBIND_MAIN_PLAYER_MAP_COLLISION_FN_symbols{0x19ec030};  // crate name WORLD_CHR_MAN_REBIND_MAIN_PLAYER_MAP_COLLISION_FN (also in sprj/world_chr_man.rs)
+inline constexpr Rva WORLD_CHR_MAN_REBIND_MAIN_PLAYER_MAP_COLLISION_FN_symbols{0x19ec030};  // ALL_SYMBOLS name WORLD_CHR_MAN_REBIND_MAIN_PLAYER_MAP_COLLISION_FN (also in sprj/world_chr_man.hpp)
 
 // Applies transition occupancy state to an existing character. Client role 6
 // skips one occupancy-bit write performed for other roles.
@@ -308,11 +308,11 @@ inline constexpr Rva WORLD_CHR_AREA_APPLY_TRANSITION_OCCUPANCY_V15091700_FN{0x19
 inline constexpr Rva WORLD_CHR_AREA_APPLY_TRANSITION_OCCUPANCY_V10080300_FN{0x190e9b0};
 
 // Consumes a serialized transition snapshot into existing world characters.
-inline constexpr Rva WORLD_CHR_MAN_CONSUME_TRANSITION_SNAPSHOT_FN_symbols{0x191bdd0};  // crate name WORLD_CHR_MAN_CONSUME_TRANSITION_SNAPSHOT_FN (also in sprj/world_chr_man.rs)
+inline constexpr Rva WORLD_CHR_MAN_CONSUME_TRANSITION_SNAPSHOT_FN_symbols{0x191bdd0};  // ALL_SYMBOLS name WORLD_CHR_MAN_CONSUME_TRANSITION_SNAPSHOT_FN (also in sprj/world_chr_man.hpp)
 
 // Builds WorldChrMan's per-frame character update lists and applies
 // `ChrSetEntry` backread/area residency filtering.
-inline constexpr Rva WORLD_CHR_MAN_BUILD_CHARACTER_UPDATE_LISTS_FN_symbols{0x19173b0};  // crate name WORLD_CHR_MAN_BUILD_CHARACTER_UPDATE_LISTS_FN (also in sprj/world_chr_man.rs)
+inline constexpr Rva WORLD_CHR_MAN_BUILD_CHARACTER_UPDATE_LISTS_FN_symbols{0x19173b0};  // ALL_SYMBOLS name WORLD_CHR_MAN_BUILD_CHARACTER_UPDATE_LISTS_FN (also in sprj/world_chr_man.hpp)
 
 // Remote-player virtual `+0x128` override that selects the retained ChrSync
 // route from the derived backread/area-active state.
@@ -320,7 +320,7 @@ inline constexpr Rva PLAYER_INS_SELECT_SYNC_FOR_BACKREAD_STATE_FN{0x18f8d20};
 
 // Queues a character for removal from `WorldChrMan` without directly tearing
 // down Sprj session membership.
-inline constexpr Rva WORLD_CHR_MAN_REMOVE_CHR_DELAYED_FN_symbols{0x19186e0};  // crate name WORLD_CHR_MAN_REMOVE_CHR_DELAYED_FN (also in sprj/world_chr_man.rs)
+inline constexpr Rva WORLD_CHR_MAN_REMOVE_CHR_DELAYED_FN_symbols{0x19186e0};  // ALL_SYMBOLS name WORLD_CHR_MAN_REMOVE_CHR_DELAYED_FN (also in sprj/world_chr_man.hpp)
 
 // Map-load step that reuses `WorldChrMan+0x60` when it is non-null. The reuse
 // path does not clear the retained player's collision binding at `+0x288`.
@@ -340,7 +340,7 @@ inline constexpr Rva WORLD_RES_CHECK_PLAYER_COLLISION_READY_FN{0x154c4d0};
 
 // Clears tracked transition presentation entities. It does not detach the
 // main player's `MapCollisionEntry` pointer.
-inline constexpr Rva WORLD_TRANSITION_RESET_TRACKED_ENTITIES_FN_symbols{0x15bed10};  // crate name WORLD_TRANSITION_RESET_TRACKED_ENTITIES_FN (also in sprj/network_script_state.rs)
+inline constexpr Rva WORLD_TRANSITION_RESET_TRACKED_ENTITIES_FN_symbols{0x15bed10};  // ALL_SYMBOLS name WORLD_TRANSITION_RESET_TRACKED_ENTITIES_FN (also in sprj/network_script_state.hpp)
 
 // Destroys and recreates the dynamic `0x138`-byte entries for one group.
 inline constexpr Rva MAP_COLLISION_GROUP_REBUILD_ENTRIES_FN{0x18865c0};
@@ -356,27 +356,27 @@ inline constexpr Rva MAP_COLLISION_MANAGER_CONSTRUCTOR_FN{0x1889520};
 inline constexpr Rva WORLD_CHR_ACTION_UPDATE_FN{0x18cb0e0};
 
 // Requests the three file groups owned by one `0x420`-byte block resource.
-inline constexpr Rva WORLD_BLOCK_RES_REQUEST_FILES_FN_symbols{0x15614e0};  // crate name WORLD_BLOCK_RES_REQUEST_FILES_FN (also in sprj/world_info.rs)
+inline constexpr Rva WORLD_BLOCK_RES_REQUEST_FILES_FN_symbols{0x15614e0};  // ALL_SYMBOLS name WORLD_BLOCK_RES_REQUEST_FILES_FN (also in sprj/world_info.hpp)
 
 // Advances one block resource's internal load/unload state machine. The
 // collision-group rebuild occurs in state 6 without clearing `ChrIns` raw
 // collision pointers.
-inline constexpr Rva WORLD_BLOCK_RES_ADVANCE_LOAD_STATE_FN_symbols{0x155aae0};  // crate name WORLD_BLOCK_RES_ADVANCE_LOAD_STATE_FN (also in sprj/world_info.rs)
+inline constexpr Rva WORLD_BLOCK_RES_ADVANCE_LOAD_STATE_FN_symbols{0x155aae0};  // ALL_SYMBOLS name WORLD_BLOCK_RES_ADVANCE_LOAD_STATE_FN (also in sprj/world_info.hpp)
 
 // Computes one block resource's desired residency and then advances it.
-inline constexpr Rva WORLD_BLOCK_RES_UPDATE_FN_symbols{0x155a170};  // crate name WORLD_BLOCK_RES_UPDATE_FN (also in sprj/world_info.rs)
+inline constexpr Rva WORLD_BLOCK_RES_UPDATE_FN_symbols{0x155a170};  // ALL_SYMBOLS name WORLD_BLOCK_RES_UPDATE_FN (also in sprj/world_info.hpp)
 
 // Updates all active area/block resource records in `WorldRes`.
-inline constexpr Rva WORLD_RES_UPDATE_FN_symbols{0x1565450};  // crate name WORLD_RES_UPDATE_FN (also in sprj/world_info.rs)
+inline constexpr Rva WORLD_RES_UPDATE_FN_symbols{0x1565450};  // ALL_SYMBOLS name WORLD_RES_UPDATE_FN (also in sprj/world_info.hpp)
 
 // Requests files for every currently defined block resource.
-inline constexpr Rva WORLD_RES_REQUEST_ALL_BLOCK_FILES_FN_symbols{0x1565f80};  // crate name WORLD_RES_REQUEST_ALL_BLOCK_FILES_FN (also in sprj/world_info.rs)
+inline constexpr Rva WORLD_RES_REQUEST_ALL_BLOCK_FILES_FN_symbols{0x1565f80};  // ALL_SYMBOLS name WORLD_RES_REQUEST_ALL_BLOCK_FILES_FN (also in sprj/world_info.hpp)
 
 // Constructs the asynchronous `0xe0`-byte current-map load context.
-inline constexpr Rva WORLD_RES_LOAD_CONTEXT_CONSTRUCTOR_FN_symbols{0x1547650};  // crate name WORLD_RES_LOAD_CONTEXT_CONSTRUCTOR_FN (also in sprj/world_info.rs)
+inline constexpr Rva WORLD_RES_LOAD_CONTEXT_CONSTRUCTOR_FN_symbols{0x1547650};  // ALL_SYMBOLS name WORLD_RES_LOAD_CONTEXT_CONSTRUCTOR_FN (also in sprj/world_info.hpp)
 
 // Global pointer to the current asynchronous map-load context.
-inline constexpr Rva WORLD_RES_LOAD_CONTEXT_SINGLETON_PTR_symbols{0x553b148};  // crate name WORLD_RES_LOAD_CONTEXT_SINGLETON_PTR (also in sprj/world_info.rs)
+inline constexpr Rva WORLD_RES_LOAD_CONTEXT_SINGLETON_PTR_symbols{0x553b148};  // ALL_SYMBOLS name WORLD_RES_LOAD_CONTEXT_SINGLETON_PTR (also in sprj/world_info.hpp)
 
 // Constructs the `0xfd0`-byte distance-based character backread scheduler.
 inline constexpr Rva WORLD_BACK_READ_CONSTRUCTOR_FN{0x1554f00};
@@ -1180,7 +1180,7 @@ inline constexpr StepTemplateSymbol STEP_TEMPLATES[] = {
     CS_MENU_ASM_MODEL_REND_TEMPLATE,
 };
 
-// Every top-level address constant above, by its crate name, for run-time lookup.
+// Every top-level address constant above, by name, for run-time lookup.
 struct NamedSymbol {
     const char* name;
     Rva addr;

@@ -241,8 +241,8 @@ struct ChrIns {
     void force_network_update_authority() { network_update_authority = NETWORK_UPDATE_AUTHORITY_FORCED; }
     void normalize_network_update_authority() { network_update_authority = NETWORK_UPDATE_AUTHORITY_NORMAL; }
     // Whether EMEVD installed an explicit draw-group override.
-    bool draw_group_override_set() const { return draw_group_overridden != 0; }  // crate: draw_group_overridden()
-    std::uint16_t map_collision_transition_state_u16() const {  // crate: map_collision_transition_state()
+    bool draw_group_override_set() const { return draw_group_overridden != 0; }
+    std::uint16_t map_collision_transition_state_u16() const {
         return static_cast<std::uint16_t>(map_collision_transition_state[0] |
                                           (map_collision_transition_state[1] << 8));
     }

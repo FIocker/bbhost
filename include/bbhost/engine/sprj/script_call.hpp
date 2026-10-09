@@ -42,7 +42,7 @@ struct SprjScriptCallParam {
     std::int32_t param3;
     Unknown<0x04> _pad1c;
 
-    // Nonzero counts as true. (The crate's method shares the field's name.)
+    // Nonzero counts as true.
     bool net_message() const { return is_net_message != 0; }
 };
 

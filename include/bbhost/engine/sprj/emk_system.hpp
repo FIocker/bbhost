@@ -162,7 +162,7 @@ struct SprjEmkInstructionDispatcher {
 // at +0x58; this is deliberately only the shared vtable prefix.
 struct SprjEmkEventVTablePrefix {
     const void* destroy;
-    const void* delete_;  // crate: `delete` (a C++ keyword)
+    const void* delete_;  // `delete` is a C++ keyword
     const void* update;
     const void* restart;
     const void* slot_20;

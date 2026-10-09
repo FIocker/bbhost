@@ -40,7 +40,7 @@ inline constexpr bool map_runtime_event_flag_block(std::uint32_t map_id, std::ui
     return true;
 }
 
-// Why a raw ID is not a valid EventFlag (crate: EventFlagError).
+// Why a raw ID is not a valid EventFlag.
 enum class EventFlagError : std::uint8_t {
     None = 0,
     TooHigh,      // above the maximum value 99999999
@@ -66,7 +66,7 @@ struct EventFlag {
     // The bit within a 32-bit word, matching DS3/Sekiro bindings.
     constexpr std::uint8_t bit() const { return static_cast<std::uint8_t>(31 - ((value % 1000) % 32)); }
 
-    // The crate's TryFrom<u32>: None when `raw` is a valid flag.
+    // None when `raw` is a valid flag.
     static constexpr EventFlagError validate(std::uint32_t raw) {
         if (raw > 99999999) return EventFlagError::TooHigh;
         if (EventFlag{raw}.area() >= 90) return EventFlagError::InvalidArea;

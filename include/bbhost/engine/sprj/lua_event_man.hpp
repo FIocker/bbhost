@@ -14,8 +14,8 @@ struct SprjLuaEventConditionNode;
 // Reads GameStateMan+0x16f8 -> +0x08 and applies 7500/7501 to the supplied
 // entity for counts 1/2. There is no branch for three or more helpers.
 inline constexpr Rva LUA_MULTI_DOPING_HANDLER_FN{0x138bc70};
-// Lua accessor for the native presentation state's team-1 count. Not the BBSC
-// coordinator's persistent co-op membership count.
+// Lua accessor for the native presentation state's team-1 count, not a
+// persistent co-op membership count.
 inline constexpr Rva LUA_GET_WHITE_GHOST_COUNT_FN{0x1337970};
 // Recalculates registered event-body HP records (indices 1 through 40), using
 // their base HP and the resolved actor's current SpEffect multiplier. Does not

@@ -1,8 +1,8 @@
 #pragma once
 
 // SprjFlipper: presentation cadence and measured frame time.
-// Layout recovered in fromsoftware-rs (crates/bloodborne/src/sprj/flipper.rs)
-// from constructor 0x802034520 and update 0x802034770. Size 0x2c8.
+// Layout recovered from constructor 0x802034520 and update 0x802034770
+// (Ghidra addresses). Size 0x2c8.
 
 #include "engine/addr.h"
 

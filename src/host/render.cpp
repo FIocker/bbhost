@@ -4649,7 +4649,7 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
     // lights) ask for - and a draw of it with depth or stencil writes then
     // translated and built its twin on the command processor, nine of them in
     // a Central Yharnam warp tour, each first visit's hitch (the "early
-    // fragment tests (draw without)" misses; roadmap G6). The twin is the
+    // fragment tests (draw without)" misses). The twin is the
     // same module without that one execution mode: derived here, cached
     // under its own key, and its library built beside this one.
     std::uint64_t twin_key = 0;

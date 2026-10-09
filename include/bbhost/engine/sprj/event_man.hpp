@@ -58,7 +58,7 @@ struct SprjEventManAreaState {
 
 struct SprjEventManRuntimeState {
     Unknown<0x08> _unk00;
-    void* runtime;  // crate: *mut UnknownStruct<0x00>
+    void* runtime;  // of a type not identified yet
 };
 
 // Prefix of Bloodborne's SprjEventMan. The full allocation size is not
@@ -67,7 +67,7 @@ struct SprjEventManRuntimeState {
 struct SprjEventMan {
     void* vftable;
     SprjEventManStateFlags* state_flags;
-    void* reset_target;  // crate: *mut UnknownStruct<0x00>
+    void* reset_target;  // of a type not identified yet
     Unknown<0x48> _unk18;
     SprjEventManAreaState* area_state;
     Unknown<0x18> _unk68;

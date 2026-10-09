@@ -936,7 +936,7 @@ bool tsharp_sample_as_2d(std::uint32_t type, std::uint32_t base_array, std::uint
 int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes);
 // Whether a cached surface overlaps the range. Caller holds the GPU lock.
 bool surfaces_may_cover_locked(std::uint64_t va, std::size_t bytes);
-// GX's dynamic-buffer copy-backs as copy versions (gpu.cpp, G9): the bytes
+// GX's dynamic-buffer copy-backs as copy versions (gpu.cpp): the bytes
 // go into a staging copy at the token, the draws after it bind that copy, and
 // the copies into place wait for the next transfer batch, dispatch or
 // submission - no pass end or barrier at the token. False when this copy must

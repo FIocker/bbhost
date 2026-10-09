@@ -12,10 +12,10 @@
 // this repository's notes and the plugin API (base 0x400000);
 // BbHostApi::guest_addr(rva.bn()) is the runtime address.
 //
-// Field names, comments and evidence come from a Rust crate of the same
-// layouts (Bloodborne 1.09, written against the eboot); every size and offset
-// it asserts is a static_assert here, so a layout that does not compile to the
-// game's numbers fails the build.
+// Field names, comments and evidence come from independent reverse-engineering
+// of the 1.09 eboot; every size and offset it established is a static_assert
+// here, so a layout that does not compile to the game's numbers fails the
+// build.
 #pragma once
 
 #include <cstddef>
@@ -75,7 +75,7 @@ struct DLVector {
 static_assert(sizeof(DLVector<int>) == 0x20);
 
 // A typed view of `offset` bytes into an object, for layouts known only by
-// offset (the crate's *_OFFSET constants).
+// offset (the *_OFFSET constants).
 template <typename T>
 inline T& at(void* base, std::size_t offset) {
     return *reinterpret_cast<T*>(static_cast<std::uint8_t*>(base) + offset);

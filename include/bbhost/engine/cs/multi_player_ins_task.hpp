@@ -115,7 +115,7 @@ struct CSMultiPlayerTaskObjectRef {
 //
 // Reflected size 0x100, allocated aligned to eight. The 0xc8 SprjStepLocal
 // prefix is established by constructor and dispatcher accesses. state and
-// local_state keep the crate's legacy u32 storage; they are the current and
+// local_state are stored as u32; they are the current and
 // requested signed step indices, all bits set meaning -1. The dispatcher
 // commits requested before/after callbacks and permits up to 128 callbacks per
 // update through the continuation byte.

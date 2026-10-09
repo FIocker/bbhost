@@ -270,7 +270,6 @@ void apply(bool force = false) {
 // row, an AI (NpcThinkParam) and gear (CharaInitParam) in 0x40 bytes of type
 // data. Those are fixed-size fields, rewritten in place; the model list's
 // per-model instance counts are kept equal to the parts using them.
-// tmp/msbre/REPORT.md has the layout and how each field was established.
 //
 // A kind from the area itself has its model and AI loaded there already. One
 // from elsewhere (enemies from the whole game, roaming bosses) needs its
@@ -395,9 +394,8 @@ std::vector<std::uint8_t> utf16z(const std::string& s) {
 // The layout with models added to its model list - each after the last model
 // of its type (enemies 2, c0000 4), as the game orders the list - and every
 // part's model index past an insertion moved up. The lists are laid out
-// again as the game lays them out (tmp/msbre/msb_enemies.py does the same and
-// rebuilds all 2690 layouts of the game byte for byte); with no models to add
-// the result is the input, which write_layouts_locked checks first.
+// again as the game lays them out; with no models to add the result is the
+// input, which write_layouts_locked checks first.
 bool msb_add_models(std::vector<std::uint8_t>& b, const std::vector<std::string>& names) {
     struct List {
         std::int32_t version = 0;

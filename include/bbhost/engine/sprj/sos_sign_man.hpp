@@ -93,8 +93,8 @@ inline constexpr Rva SOS_SIGN_MAN_CLEAR_SPECIFIC_PENDING_CREATE{0x14bb3d0};
 inline constexpr Rva SOS_SIGN_MAN_OWNED_LIST_PUSH_BACK{0x14bf1d0};
 
 inline constexpr std::size_t SOS_SIGN_MAN_FRPG_NET_MAN_OFFSET = 0xc50;
-// The nine list/task offsets below are also defined (same values) by frpg.rs;
-// frpg.hpp carries its copies with a `_frpg` suffix.
+// The nine list/task offsets below are also defined (same values) in
+// frpg.hpp, which carries its copies with a `_frpg` suffix.
 inline constexpr std::size_t SOS_SIGN_MAN_NATIVE_CANDIDATE_LIST_OFFSET = 0x10;
 inline constexpr std::size_t SOS_SIGN_MAN_ACTIVE_SIGN_LIST_OFFSET = 0x30;
 inline constexpr std::size_t SOS_SIGN_MAN_CONNECT_MANAGER_OFFSET = 0x48;

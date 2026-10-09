@@ -7,11 +7,12 @@
 // the object in slot 0x593e860 names: its position at +0x40, the point it
 // looks at - the character raised by the camera's height - at +0xd0.
 //
-// The chain to the ChrIns, the module container and the camera fields are
-// fromsoftware-rs's (WorldChrMan, ChrIns, ChrExFollowCam); the position field
-// was found by a scan during a walking soak: the vector at +0x1e0 of module
-// +0x68 (and its copies at +0x1f0 and +0x2b0) followed the camera's focus
-// 1.42 below it in all 39 samples, through a reload to another place.
+// The chain to the ChrIns, the module container and the camera fields
+// (WorldChrMan, ChrIns, ChrExFollowCam) come from independent
+// reverse-engineering of the eboot; the position field was found by a scan
+// during a walking soak: the vector at +0x1e0 of module +0x68 (and its copies
+// at +0x1f0 and +0x2b0) followed the camera's focus 1.42 below it in all 39
+// samples, through a reload to another place.
 #pragma once
 
 #include <cstdint>

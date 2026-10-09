@@ -64,9 +64,9 @@ inline constexpr Rva INITIALIZE_NP_SIGNALING_FOR_LOCAL_USER_FN{0x0cc0860};
 inline constexpr std::size_t LOCAL_SIGNALING_CONTEXT_ID_OFFSET = 0x78;
 inline constexpr std::size_t LOCAL_TITLE_LOOKUP_CONTEXT_ID_OFFSET = 0x7c;
 
-// Lazy native owner of NPID-keyed peer/address records. Crate name
-// PLAYER_DATA_MANAGER_SINGLETON; frpg_net_man.rs defines the same name (same
-// value), so this copy carries the module suffix.
+// Lazy native owner of NPID-keyed peer/address records. frpg_net_man.hpp
+// defines it as PLAYER_DATA_MANAGER_SINGLETON (same value), so this copy
+// carries the module suffix.
 inline constexpr Rva PLAYER_DATA_MANAGER_SINGLETON_sprj{0x56c6d70};
 inline constexpr Rva PLAYER_DATA_MANAGER_GET_SINGLETON_FN{0x0ca48f0};
 // Lookup-or-create. Takes the polymorphic NPID target object, not a raw

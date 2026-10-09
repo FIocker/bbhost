@@ -139,13 +139,13 @@ struct ChrInsModuleContainer {
     SprjChrFallModule* fall;
     SprjChrLadderModule* ladder;
     SprjChrActionRequestModule* action_request;
-    SprjChrThrowModule* throw_;  // crate name `throw` (a C++ keyword)
+    SprjChrThrowModule* throw_;  // `throw` is a C++ keyword
     SprjChrHitStopModule* hit_stop;
     SprjChrDamageModule* damage;
     SprjChrMaterialModule* material;
     SprjChrKnockBackModule* knock_back;
     SprjChrSfxModule* sfx;
-    void* unclassified_slots[42];  // crate: [*mut UnknownStruct<0>; 42]
+    void* unclassified_slots[42];  // modules not classified yet
 
     // The data module at 0x20, or null.
     ChrDataModule* data_module() const { return data; }

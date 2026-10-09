@@ -28,7 +28,7 @@ constexpr std::uint64_t kSprjLuaEventMan = 0x593b0c8;     // SprjLuaEventMan*
 constexpr std::uint64_t kWorldChrMan = 0x593e878;         // WorldChrMan*
 constexpr std::uint64_t kSprjSessionManager = 0x5940290;  // SprjSessionManager*
 constexpr std::uint64_t kGameDataMan = 0x593b130;         // GameDataMan*; local player record at +0x08
-constexpr std::uint32_t kRecInsight = 0x84, kRecLevel = 0x90, kRecEchoes = 0x94;  // the record (fromsoftware-rs)
+constexpr std::uint32_t kRecInsight = 0x84, kRecLevel = 0x90, kRecEchoes = 0x94;  // the record
 // The bytes the menu Lua asks before a bell rings (lua_cli_IsOnline ->
 // sub_10b4320 -> *(data_5ac7058 + 0xd8); lua_cli_IsOnlineMode -> the network
 // flow object's +0x1590; CSNetworkFlowStep::STEP_OnlineMode also gates on its
@@ -584,7 +584,7 @@ void np_test_tick() {
         }
         // Every frame: the summon handshake's own state, logged when it changes, so a summon
         // that stalls between the guest's request and the host's room payload shows where. The
-        // event side's SprjEventSosSelectionState (fromsoftware-rs names; *(SprjEventMan+0x60)+0x30):
+        // event side's SprjEventSosSelectionState (*(SprjEventMan+0x60)+0x30):
         // pending guests +0x78, the descriptor being invited +0x90, accept +0xa4, result +0xa8,
         // the first outgoing work entry (list +0x1c0: SOSID +0, state +0xc) and their count
         // +0x1c8, +0x230; the native SosSignMan (FrpgNetMan+0xc50): the staged room payload
