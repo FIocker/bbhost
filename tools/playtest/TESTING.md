@@ -42,8 +42,8 @@ point.
    (`%APPDATA%\bbhost\bbhost.toml` on Windows, `~/.config/bbhost/bbhost.toml`
    on Linux), which you can also edit by hand.
 
-You do this **once**: every copy of bbhost reads that file, so a new kit, a
-new download or an in-game update needs nothing set again. Your F10 settings
+You do this **once**: every copy of bbhost reads that file, so a new kit or a
+new download needs nothing set again. Your F10 settings
 and your account are kept beside it, and your saves in
 `%LOCALAPPDATA%\bbhost\data` (Windows) or `~/.local/share/bbhost/data`
 (Linux). Coming from an earlier kit: unzip the new one over the old kit's
