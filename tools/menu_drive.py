@@ -33,6 +33,13 @@ Steps (run in order):
     padplug / padunplug   a virtual controller arrives / leaves (uinput; run
                    the game with BBHOST_GAMEPAD_MATCH=045e:02ea)
     pad:BUTTON[,S] tap a pad button (a b x y lb rb back start ls rs)
+    down:A+B       press X keys and keep them held (until up:)
+    up:A+B         release X keys held by down:
+    padhold:BUTTON / padrelease:BUTTON   hold a pad button / let it go
+    padaxis:AXIS,VALUE   set a pad axis and leave it there (0 centres it)
+    padsweep:X0:Y0:X1:Y1,S   turn the left stick from (X0,Y0) to (X1,Y1)
+                   along the arc between their angles over S seconds, as a
+                   thumb does (+-32767; a step every 8 ms), and leave it there
     padstick:AXIS,VALUE,S  hold an axis (lx ly rx ry: +-32767, lt rt: 0-255,
                    dx dy: +-1 for the d-pad) for S seconds
     shot:NAME      screenshot NAME.png         sleep:S
@@ -143,6 +150,29 @@ def pad_button(name, secs):
     code = getattr(e, PAD_BUTTONS[name])
     vpad.write(e.EV_KEY, code, 1); vpad.syn(); time.sleep(secs)
     vpad.write(e.EV_KEY, code, 0); vpad.syn()
+def pad_axis(axis, value):
+    from evdev import ecodes as e
+    pad_plug()
+    vpad.write(e.EV_ABS, getattr(e, PAD_AXES[axis]), value); vpad.syn()
+def pad_hold(name, down):
+    from evdev import ecodes as e
+    pad_plug()
+    vpad.write(e.EV_KEY, getattr(e, PAD_BUTTONS[name]), 1 if down else 0); vpad.syn()
+def pad_sweep(x0, y0, x1, y1, secs):
+    import math
+    from evdev import ecodes as e
+    pad_plug()
+    a0, a1 = math.atan2(y0, x0), math.atan2(y1, x1)
+    r0, r1 = math.hypot(x0, y0), math.hypot(x1, y1)
+    d = (a1 - a0 + math.pi) % (2 * math.pi) - math.pi  # the short way round
+    n = max(1, int(secs / 0.008))
+    for i in range(1, n + 1):
+        t = i / n
+        a, r = a0 + d * t, r0 + (r1 - r0) * t
+        x = max(-32767, min(32767, int(round(r * math.cos(a)))))
+        y = max(-32767, min(32767, int(round(r * math.sin(a)))))
+        vpad.write(e.EV_ABS, e.ABS_X, x); vpad.write(e.EV_ABS, e.ABS_Y, y); vpad.syn()
+        time.sleep(secs / n)
 def pad_stick(axis, value, secs):
     from evdev import ecodes as e
     pad_plug()
@@ -364,6 +394,24 @@ for step in sys.argv[2:]:
     elif kind == 'pad':
         name, _, secs = arg.partition(',')
         pad_button(name, float(secs or 0.15)); print('pad', name, flush=True)
+    elif kind == 'down':
+        if os.environ.get('WID'): x('windowactivate', '--sync', os.environ['WID'])
+        for name in arg.split('+'): x('keydown', name)
+        print('down', arg, flush=True)
+    elif kind == 'up':
+        for name in reversed(arg.split('+')): x('keyup', name)
+        print('up', arg, flush=True)
+    elif kind == 'padhold':
+        pad_hold(arg, True); print('pad hold', arg, flush=True)
+    elif kind == 'padrelease':
+        pad_hold(arg, False); print('pad release', arg, flush=True)
+    elif kind == 'padaxis':
+        axis, value = arg.split(',')
+        pad_axis(axis, int(value)); print('pad axis', axis, value, flush=True)
+    elif kind == 'padsweep':
+        pts, secs = arg.rsplit(',', 1)
+        x0, y0, x1, y1 = (int(v) for v in pts.split(':'))
+        pad_sweep(x0, y0, x1, y1, float(secs)); print('pad sweep', pts, secs, flush=True)
     elif kind == 'padstick':
         axis, value, secs = arg.split(',')
         pad_stick(axis, int(value), float(secs)); print('pad stick', axis, value, secs, flush=True)
