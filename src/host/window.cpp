@@ -716,6 +716,7 @@ struct PresentSourceImage {
     std::uint64_t display_va = 0;
     VkSemaphore ready = VK_NULL_HANDLE;
     bool generated_output = false;
+    std::int64_t present_at_ns = 0;
 };
 
 bool present_swapchain_image(const PresentSourceImage& source, int buffer_index,
@@ -1087,11 +1088,20 @@ bool present_swapchain_image(const PresentSourceImage& source, int buffer_index,
     const auto t_submitted = std::chrono::steady_clock::now();
     // The frame done on the GPU before the present is asked for, on no lock
     // (BBHOST_PRESENT_GPU_WAIT). Bounded: a lost device signals nothing.
-    if (g_vk.gpu_wait) {
+    if (g_vk.gpu_wait || source.present_at_ns) {
         present_step("waiting for the frame on the GPU");
-        vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, 1000000000ull);
+        const auto waited = vkWaitForFences(g_vk.device, 1, &g_vk.fence, VK_TRUE, 1000000000ull);
+        if (source.present_at_ns && waited != VK_SUCCESS) return false;
     }
     const auto t_gpu_done = std::chrono::steady_clock::now();
+    // Prepare and complete the FG compositor copy before its deadline, then
+    // pace QueuePresent itself. Sleeping before acquire/record/submit exposed
+    // every variation in those costs to the displayed generated->real interval.
+    if (source.present_at_ns) {
+        present_step("pacing the completed frame");
+        host_sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(source.present_at_ns)));
+    }
+    const auto t_present_call = std::chrono::steady_clock::now();
     // The present itself goes on this thread's own queue, with no lock: it can
     // block - Xvfb copies the image inside it, ~20 ms a frame, and a full FIFO
     // waits for the display - and under the renderer's lock that held the
@@ -1129,7 +1139,7 @@ bool present_swapchain_image(const PresentSourceImage& source, int buffer_index,
     // Driver frame limits can sleep inside QueuePresent. Learn that cost so
     // FG selects a subframe for when the call will return, rather than sending
     // an already obsolete image and making the real frame wait behind it.
-    const auto block_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t_presented - t_gpu_done).count();
+    const auto block_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t_presented - t_present_call).count();
     g_vk.present_block_ns = static_cast<std::int64_t>(g_vk.present_block_ns * 0.98);
     if (block_ns >= 1000000 && block_ns < 100000000)
         g_vk.present_block_ns = std::max<std::int64_t>(g_vk.present_block_ns, block_ns);
@@ -1148,12 +1158,12 @@ bool present_swapchain_image(const PresentSourceImage& source, int buffer_index,
     static std::uint64_t flush_us = 0, lock_us = 0, blit_us = 0, submit_us = 0, queue_present_us = 0;
     static auto last = std::chrono::steady_clock::now();
     wait_us += us(t_enter, t_acquired);
-    work_us += us(t_acquired, t_submitted) + us(t_gpu_done, t_presented);
+    work_us += us(t_acquired, t_submitted) + us(t_present_call, t_presented);
     flush_us += us(t_acquired, t_flushed);
     lock_us += us(t_flushed, t_locked);
     blit_us += us(t_locked, t_recorded);
     submit_us += us(t_recorded, t_submitted);
-    queue_present_us += us(t_gpu_done, t_presented);
+    queue_present_us += us(t_present_call, t_presented);
     PresentStats& ps = g_pstats;
     ps.gpu_wait_us += us(t_submitted, t_gpu_done);
     if (flip.arrived_ns) {
@@ -1222,7 +1232,10 @@ void vk_present_generated(int buffer_index, std::uint64_t display_va, const Pres
     };
     std::uint64_t source = 0, ready = 0;
     fg.evaluation_times(slot, &source, &ready);
-    static host::FgSchedule schedule;
+    static host::FgSchedule schedule([] {
+        const char* e = std::getenv("BBHOST_FG_SMOOTH");
+        return !e || e[0] != '0';
+    }());
     schedule.observe(source, ready, guides.render_frame_index, now_ns(),
                      guides.frame_ms, host_startup_settings().frame_cap);
     const bool suppressed = fg.is_interpolation_disabled(slot);
@@ -1233,13 +1246,18 @@ void vk_present_generated(int buffer_index, std::uint64_t display_va, const Pres
     image.generated_output = true;
     image.ready = fg.ready_semaphore(slot);
     unsigned shown = 0, skipped = 0;
+    static const bool late_pace = [] {
+        const char* e = std::getenv("BBHOST_FG_LATE_PACE");
+        return !e || e[0] != '0';
+    }();
     for (unsigned first = suppressed ? factor : 1; first <= factor; ++first) {
         const auto cost = std::min(g_vk.present_block_ns, schedule.period());
         const unsigned position = suppressed ? factor : schedule.next_position(first, factor, now_ns() + cost);
         skipped += position - first;
         first = position;
         const auto deadline = schedule.deadline(position, factor);
-        if (!suppressed)
+        image.present_at_ns = !suppressed && late_pace ? deadline - cost : 0;
+        if (!suppressed && !late_pace)
             host_sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(deadline - cost)));
         const bool real = position == factor;
         image.image = real ? fg.real_image(slot) : fg.generated_image(position - 1, slot);

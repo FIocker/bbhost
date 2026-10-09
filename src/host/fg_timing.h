@@ -24,6 +24,7 @@ private:
 // fence completion; later observations can include display/driver waiting.
 class FgSchedule {
 public:
+    explicit FgSchedule(bool smooth = true) : smooth_(smooth) {}
     void observe(std::uint64_t source, std::uint64_t ready, std::uint64_t render,
                  std::int64_t host_ready, float fallback_ms, int game_cap) {
         const auto minimum = game_cap > 0 ? 1000000000ll / game_cap : 8000000ll;
@@ -33,24 +34,42 @@ public:
             const auto measured = (source - last_source_) / (render - last_render_);
             if (measured >= 1000000 && measured <= 100000000) period = measured;
         }
-        period_ = std::max<std::int64_t>(minimum, period);
+        period = std::max<std::int64_t>(minimum, period);
+        const auto frames = render > last_render_ ? render - last_render_ : 0;
+        const bool continuous = clock_valid_ && frames && frames <= 8 &&
+            source > last_source_ && source - last_source_ <= 500000000;
+        if (smooth_ && continuous && cadence_valid_)
+            period_ += (period - period_) / 8;
+        else period_ = period;
+        if (continuous) cadence_valid_ = true;
         if (source && ready >= source) {
             const auto offset = host_ready - static_cast<std::int64_t>(ready);
             if (!clock_valid_ || offset < offset_) offset_ = offset;
             clock_valid_ = true;
-            source_host_ = offset_ + static_cast<std::int64_t>(source);
-            // One source interval of presentation lookahead hides evaluation
-            // behind the preceding frame set. Account for FG's own GPU cost.
-            evaluation_ = static_cast<std::int64_t>(ready - source);
+            const auto evaluation = static_cast<std::int64_t>(ready - source);
+            // A slowly decaying evaluation budget absorbs ordinary NGX cost
+            // variation. It does not make a fast/slow pair alternate its phase.
+            evaluation_ = smooth_ && continuous ?
+                std::max(evaluation, evaluation_ - evaluation_ / 200) : evaluation;
+            const auto target = offset_ + static_cast<std::int64_t>(source) + evaluation_;
+            if (smooth_ && continuous && cadence_valid_) {
+                const auto predicted = source_host_ + period_ * static_cast<std::int64_t>(frames);
+                // Follow sustained load changes while rejecting individual
+                // source/evaluation spikes. Presentation remains bounded by
+                // the three owned frame sets; expired subframes are skipped.
+                const auto limit = period_ / 32;
+                source_host_ = predicted + std::clamp((target - predicted) / 8, -limit, limit);
+            } else source_host_ = target;
         } else {
             source_host_ = host_ready;
             evaluation_ = 0;
+            cadence_valid_ = false;
         }
         last_source_ = source; last_render_ = render;
     }
     std::int64_t deadline(unsigned position, unsigned factor) const {
         factor = std::clamp(factor, 2u, 4u);
-        return source_host_ + evaluation_ + period_ * std::min(position, factor) / factor;
+        return source_host_ + period_ * std::min(position, factor) / factor;
     }
     std::int64_t period() const { return period_; }
     // Select the newest temporal position due now. Never submit every expired
@@ -62,7 +81,7 @@ public:
 private:
     std::uint64_t last_source_ = 0, last_render_ = 0;
     std::int64_t period_ = 16666667, source_host_ = 0, evaluation_ = 0, offset_ = 0;
-    bool clock_valid_ = false;
+    bool clock_valid_ = false, cadence_valid_ = false, smooth_ = true;
 };
 
 // Budget the generated->real spacing from evaluation *start*. GPU waiting and

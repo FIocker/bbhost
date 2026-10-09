@@ -56,4 +56,36 @@ int main() {
     const auto evaluation_ready = capped.deadline(0, 4);
     assert(capped.next_position(1, 4, evaluation_ready + driver_wait) == 2);
     assert(capped.next_position(3, 4, evaluation_ready + 2 * driver_wait) == 4);
+
+    // Alternating render/evaluation costs must not alternate output phase.
+    host::FgSchedule smooth, raw(false);
+    std::int64_t previous_smooth = 0, previous_raw = 0;
+    std::int64_t smooth_max_error = 0, raw_max_error = 0;
+    constexpr std::int64_t source_period = 33333334;
+    for (unsigned i = 1; i < 100; ++i) {
+        const auto source = 1000000000ull + i * source_period + (i % 2 ? 2000000 : 0);
+        const auto ready = source + (i % 2 ? 6000000 : 2000000);
+        smooth.observe(source, ready, i, ready + 100000000, 33.33f, 60);
+        raw.observe(source, ready, i, ready + 100000000, 33.33f, 60);
+        const auto a = smooth.deadline(2, 2), b = raw.deadline(2, 2);
+        if (i > 50) {
+            smooth_max_error = std::max(smooth_max_error, std::abs(a - previous_smooth - source_period));
+            raw_max_error = std::max(raw_max_error, std::abs(b - previous_raw - source_period));
+            assert(a > previous_smooth);
+        }
+        previous_smooth = a; previous_raw = b;
+    }
+    assert(smooth_max_error < 1500000);
+    assert(raw_max_error > 9000000);
+    // A loading gap must reset the timeline instead of pacing stale deadlines.
+    smooth.observe(6000000000, 6004000000, 200, 6104000000, 33.33f, 60);
+    assert(smooth.deadline(1, 2) > 6104000000);
+    // Sustained GPU load converges to 30 FPS instead of keeping a 60 Hz grid.
+    host::FgSchedule load;
+    std::uint64_t source = 1000000000;
+    for (unsigned i = 1; i <= 100; ++i) {
+        source += i < 20 ? 16666667 : source_period;
+        load.observe(source, source + 4000000, i, source + 104000000, 16.67f, 60);
+    }
+    assert(std::abs(load.period() - source_period) < 10000);
 }
