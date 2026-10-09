@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""A multi-block tour for tools/map_validation.sh --blocks (run with the
-server's venv python: it needs numpy for the navmesh).
+"""A multi-block tour for tools/map_validation.sh --blocks (the navmesh
+points need numpy).
 
     tools/mapval_blocks.py --app0 DIR --out DIR --blocks m23_00_00_00,m22_00_00_00
         [--navmesh N] [--hold S] [--walk S]
@@ -9,10 +9,11 @@ For each block, in order: lamp travel to its first lamp (ReturnPointParam,
 tools/bbparam.py: the row of the lowest warpChairNo in that area/block; the
 Hunter's Dream has only 2102950), then warps to every lamp in the block's
 MSB (o009900), the player starts and two message notes, a walk from the
-first lamp (the driver holds forward), N points spread over the block's navmesh (the walkable
-polygons: the world-map branch's server/tools/worldmap/navmesh.py, face
-centroids picked farthest-first), and a fall death from 30 m onto the first
-navmesh point (the player respawns at the lamp it travelled to).
+first lamp (the driver holds forward), N points spread over the block's
+navmesh (the walkable polygons' face centroids, picked farthest-first, from
+the worldmap navmesh module in MAPVAL_NAVMESH_TOOLS), and a fall death from
+30 m onto the first navmesh point (the player respawns at the lamp it
+travelled to).
 
 Positions are the MSB's own frame: the lamp travel put the player exactly
 on the MSB respawn point's coordinates (m23 at (126.4, -65.25, 36.0), no
@@ -31,7 +32,7 @@ sys.path.insert(0, HERE)
 import bbparam  # noqa: E402
 import msb  # noqa: E402
 
-NAVMESH_TOOLS = os.environ.get('MAPVAL_NAVMESH_TOOLS', '')  # the world map server's tools/ directory
+NAVMESH_TOOLS = os.environ.get('MAPVAL_NAVMESH_TOOLS', '')  # a directory holding the worldmap navmesh module
 MAIN_BLOCKS = ['m21_00_00_00', 'm21_01_00_00', 'm22_00_00_00', 'm23_00_00_00', 'm24_00_00_00', 'm24_01_00_00', 'm24_02_00_00',
                'm25_00_00_00', 'm26_00_00_00', 'm27_00_00_00', 'm28_00_00_00', 'm32_00_00_00', 'm33_00_00_00', 'm34_00_00_00',
                'm35_00_00_00', 'm36_00_00_00']

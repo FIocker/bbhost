@@ -17,9 +17,9 @@ struct Stat {
     std::uint32_t offset;
     bool is_signed;
 };
-// The record: GameDataManPlayerRecord (fromsoftware-rs), 32-bit. The
-// manager's counters (fromsoftware-rs, from the saturating add helpers
-// 0x18eb5c0..0x18eb660 and the save reader): unsigned 32-bit but ClearCount.
+// The record: GameDataManPlayerRecord, 32-bit. The manager's counters (from
+// the saturating add helpers 0x18eb5c0..0x18eb660 and the save reader):
+// unsigned 32-bit but ClearCount.
 constexpr Stat kStats[] = {
     {"hp", false, 0x14, true},          {"max_hp", false, 0x18, true},   {"stamina", false, 0x30, true},
     {"max_stamina", false, 0x34, true}, {"vitality", false, 0x40, true}, {"endurance", false, 0x48, true},

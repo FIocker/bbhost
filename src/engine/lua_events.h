@@ -2,10 +2,10 @@
 // react to events raised by name through the Lua event manager's dispatcher -
 // SprjLuaEventMan (slot at Binary Ninja 0x593b0c8), its context at +8, and
 // LuaEvent_DispatchByName (0x1739870) taking (context, name), the call the
-// scripts' own event raisers make (fromsoftware-rs's summon runbook; the
-// online test raises OnEvent_Call_SOS through it). Raised on the game's main
-// thread only: a request from any thread is queued and raised at the next
-// frame, from the frame-time manager's hook.
+// scripts' own event raisers make (the online test raises OnEvent_Call_SOS
+// through it). Raised on the game's main thread only: a request from any
+// thread is queued and raised at the next frame, from the frame-time
+// manager's hook.
 #pragma once
 
 struct ElfImage;

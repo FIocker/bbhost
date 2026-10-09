@@ -271,8 +271,8 @@ struct WorldTransitionState {
         *out = MULTIPLAYER_ACTION_EVENT_MESSAGE_IDS[row][column];
         return true;
     }
-    // (The crate's same-named methods; renamed here because C++ cannot share a
-    // name between a member and a member function.)
+    // (Named apart from their fields because C++ cannot share a name between a
+    // member and a member function.)
     bool is_transition_requested() const { return transition_requested != 0; }
     bool is_summoned_pos_requested() const { return summoned_pos_requested != 0; }
     bool is_sos_sign_warp_requested() const { return sos_sign_warp_requested != 0; }

@@ -1,4 +1,4 @@
-// Every Sprj engine header (one per crate file in sprj/, in sprj.rs module order).
+// Every Sprj engine header (one per file in sprj/).
 #pragma once
 
 #include "bbhost/engine/base.hpp"

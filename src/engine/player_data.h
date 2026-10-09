@@ -4,10 +4,10 @@
 // insight, level and blood echoes - the numbers the status screen shows and
 // the save keeps; and counters of its own: the NG+ cycle (+0x68), co-op
 // helps and invader kills (+0x78/+0x7c), true deaths and deaths (+0x84/
-// +0x88), play time in milliseconds (+0x94). Offsets from fromsoftware-rs's GameDataManPlayerRecord
-// (confirmed there by live 1.09 reads and the game's own debug menu),
-// checked here by what a loaded character reads back (a line at the first
-// frame the record exists).
+// +0x88), play time in milliseconds (+0x94). The offsets were confirmed by
+// live 1.09 reads and the game's own debug menu, and are checked here by
+// what a loaded character reads back (a line at the first frame the record
+// exists).
 #pragma once
 
 #include <cstdint>

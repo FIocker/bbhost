@@ -9,7 +9,7 @@ Sources, all in the game's data:
     must be on before the lamp can be lit - 999 for none, flag base). Found
     by scanning the scripts' argument data for 7000 followed by an entity
     pair ending x950..x959 whose second is the first + 1000.
-  - The lamp DB (FrpgNetMan +0xc70; fromsoftware-rs bonfire_db.rs)
+  - The lamp DB (FrpgNetMan +0xc70; include/bbhost/engine/frpg/bonfire_db.hpp)
     registers the base: base+10 is the lamp's lit flag, base+11 "selected"
     (the lamp last rested at in that map).
   - ReturnPointParam (tools/bbparam.py): row id = lamp entity + 1000, its

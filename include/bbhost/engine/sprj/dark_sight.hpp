@@ -12,7 +12,7 @@ namespace bb {
 // not callable function pointers).
 struct SprjDarkSightVolumeVTable {
     const void* destructor;
-    const void* delete_;  // crate name `delete` (a C++ keyword)
+    const void* delete_;  // `delete` is a C++ keyword
     const void* contains_point;
     const void* debug_draw;
 };

@@ -122,7 +122,7 @@ namespace {
 // The lamps. Each map's event script starts
 // event 7000 once per lamp with (warp object entity, lamp entity, the flag
 // that must be on before it can be lit - 999 for none, flag base); the lamp
-// DB (FrpgNetMan +0xc70, fromsoftware-rs bonfire_db.rs) registers the base,
+// DB (FrpgNetMan +0xc70, bbhost/engine/frpg/bonfire_db.hpp) registers the base,
 // and base+10 is the lamp's lit flag, base+11 "selected" (the last one
 // rested at in that map). Extracted from dvdroot_ps4/event/m*.emevd.dcx by
 // tools/mapval_lamps.py; the chalice dungeons (m29) have none there.

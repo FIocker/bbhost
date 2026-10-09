@@ -7,7 +7,7 @@
 // buttons - is one component class (vtable 0x5799fb0) whose update,
 // `sub_1ecff30`, reads the pad and moves the cursor with `sub_1ecf6b0`. That
 // update is DS3's `sub_140b23520` without the mouse. The port adds the mouse
-// back at the same place, with DS3's rules (docs/ds3-mouse.md):
+// back at the same place, with DS3's rules:
 //
 //   - hover only when the pointer moved and no direction is held;
 //   - hit-test each visible item's `Cursor` clip on its **live** display

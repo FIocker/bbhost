@@ -75,8 +75,8 @@ struct SoloParamRepositoryHeader {
 // holder 62: the 1.09 add/remove path maps 62 named params plus a fallback.
 //
 // The param-typed accessors take a P with `static constexpr std::size_t
-// INDEX` (its holder index) and `using StructType = <row struct>` (the crate's
-// SoloParam trait). The crate's get_equip_param(ItemId) is not ported.
+// INDEX` (its holder index) and `using StructType = <row struct>`. There is no
+// get_equip_param(ItemId).
 struct SoloParamRepositoryImp {
     static constexpr RuntimeClassSymbol RUNTIME_CLASS = SOLO_PARAM_REPOSITORY_IMP_RUNTIME_CLASS;
 
@@ -114,8 +114,8 @@ struct SoloParamRepositoryImp {
         ParamResCap* r = holder<P>().get_res_cap(0);
         return r ? r->param_res_cap : nullptr;
     }
-    // A row of P by param ID, or null. (The crate debug-asserts the file's
-    // struct name; that check is left to the caller.)
+    // A row of P by param ID, or null. The file's struct name is not checked;
+    // that is left to the caller.
     template <typename P>
     typename P::StructType* get(std::uint32_t param_id) const {
         FD4ParamResCap* p = fd4_param_res_cap<P>();

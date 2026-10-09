@@ -355,7 +355,7 @@ BB_OFFSET(WorldSessionObjectMan, disconnect_timer, WORLD_SESSION_OBJECT_MAN_DISC
 BB_OFFSET(WorldSessionObjectMan, create_retry_count, WORLD_SESSION_OBJECT_MAN_CREATE_RETRY_COUNT_OFFSET);
 BB_OFFSET(WorldSessionObjectMan, join_retry_count, WORLD_SESSION_OBJECT_MAN_JOIN_RETRY_COUNT_OFFSET);
 BB_OFFSET(WorldSessionObjectMan, debug_create_guard, WORLD_SESSION_OBJECT_MAN_DEBUG_CREATE_GUARD_OFFSET);
-// The crate's DEBUG_JOIN_GUARD_OFFSET (0x121) names the byte the struct calls
+// The DEBUG_JOIN_GUARD offset (0x121) names the byte the struct calls
 // debug_join_guard_121; its debug_join_guard member sits at 0x118.
 BB_OFFSET(WorldSessionObjectMan, debug_join_guard_121, WORLD_SESSION_OBJECT_MAN_DEBUG_JOIN_GUARD_OFFSET);
 BB_OFFSET(WorldSessionObjectMan, packet_storage_debug_menu, WORLD_SESSION_OBJECT_MAN_DEBUG_MENU_NODE_OFFSET);

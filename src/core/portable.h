@@ -1,6 +1,6 @@
 // The few host-OS calls the port makes outside the platform layers, behind
-// one name each, so a source file is the same on Linux and Windows (PLAN
-// 6.2). Nothing here touches guest state.
+// one name each, so a source file is the same on Linux and Windows. Nothing
+// here touches guest state.
 #pragma once
 
 #include <chrono>
