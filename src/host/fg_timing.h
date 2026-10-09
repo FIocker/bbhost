@@ -27,20 +27,19 @@ public:
     explicit FgSchedule(bool smooth = true) : smooth_(smooth) {}
     void observe(std::uint64_t source, std::uint64_t ready, std::uint64_t render,
                  std::int64_t host_ready, float fallback_ms, int game_cap) {
-        const auto minimum = game_cap > 0 ? 1000000000ll / game_cap : 8000000ll;
+        minimum_ = game_cap > 0 ? 1000000000ll / game_cap : 8000000ll;
         std::int64_t period = std::isfinite(fallback_ms) ?
-            static_cast<std::int64_t>(std::clamp<double>(fallback_ms, 8.0, 100.0) * 1e6) : minimum;
+            static_cast<std::int64_t>(std::clamp<double>(fallback_ms, 8.0, 100.0) * 1e6) : minimum_;
         if (source && last_source_ && source > last_source_ && render > last_render_) {
             const auto measured = (source - last_source_) / (render - last_render_);
             if (measured >= 1000000 && measured <= 100000000) period = measured;
         }
-        period = std::max<std::int64_t>(minimum, period);
         const auto frames = render > last_render_ ? render - last_render_ : 0;
         const bool continuous = clock_valid_ && frames && frames <= 8 &&
             source > last_source_ && source - last_source_ <= 500000000;
         if (smooth_ && continuous && cadence_valid_)
             period_ += (period - period_) / 8;
-        else period_ = period;
+        else period_ = smooth_ ? period : std::max(minimum_, period);
         if (continuous) cadence_valid_ = true;
         if (source && ready >= source) {
             const auto offset = host_ready - static_cast<std::int64_t>(ready);
@@ -57,8 +56,14 @@ public:
                 // Follow sustained load changes while rejecting individual
                 // source/evaluation spikes. Presentation remains bounded by
                 // the three owned frame sets; expired subframes are skipped.
-                const auto limit = period_ / 32;
+                const auto limit = this->period() / 32;
                 source_host_ = predicted + std::clamp((target - predicted) / 8, -limit, limit);
+                // A long burst of irregular completions must not build up
+                // presentation latency or feed output-set drops back into
+                // an increasingly late phase. Keep smoothing within half a
+                // source period of the current GPU anchor.
+                source_host_ = std::clamp(source_host_, target - this->period() / 2,
+                                                       target + this->period() / 2);
             } else source_host_ = target;
         } else {
             source_host_ = host_ready;
@@ -69,9 +74,12 @@ public:
     }
     std::int64_t deadline(unsigned position, unsigned factor) const {
         factor = std::clamp(factor, 2u, 4u);
-        return source_host_ + period_ * std::min(position, factor) / factor;
+        return source_host_ + period() * std::min(position, factor) / factor;
     }
-    std::int64_t period() const { return period_; }
+    // Apply the simulation floor to output spacing, not individual samples:
+    // clamping samples first turns zero-mean completion jitter into a slower
+    // source cadence and can drive the presentation phase into the future.
+    std::int64_t period() const { return std::max(minimum_, period_); }
     // Select the newest temporal position due now. Never submit every expired
     // subframe in a catch-up burst when a cap or late evaluation blocks present.
     unsigned next_position(unsigned first, unsigned factor, std::int64_t now) const {
@@ -80,7 +88,8 @@ public:
     }
 private:
     std::uint64_t last_source_ = 0, last_render_ = 0;
-    std::int64_t period_ = 16666667, source_host_ = 0, evaluation_ = 0, offset_ = 0;
+    std::int64_t period_ = 16666667, minimum_ = 16666667;
+    std::int64_t source_host_ = 0, evaluation_ = 0, offset_ = 0;
     bool clock_valid_ = false, cadence_valid_ = false, smooth_ = true;
 };
 

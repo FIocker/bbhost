@@ -88,4 +88,16 @@ int main() {
         load.observe(source, source + 4000000, i, source + 104000000, 16.67f, 60);
     }
     assert(std::abs(load.period() - source_period) < 10000);
+
+    // GPU completion jitter can straddle the simulation cap. Clamping each
+    // sample before filtering biases the cadence upward and sends the phase
+    // further into the future as the presenter drops completed output sets.
+    host::FgSchedule jitter;
+    for (unsigned i = 1; i <= 2000; ++i) {
+        const auto stamp = 1000000000ull + i * 16666667ull + (i % 2 ? 8000000 : 0);
+        const auto ready = stamp + 2000000;
+        if (i > 500 && i % 4) continue; // presentation backpressure
+        jitter.observe(stamp, ready, i, ready + 100000000, 16.67f, 60);
+        assert(jitter.deadline(0, 2) <= static_cast<std::int64_t>(ready + 120000000));
+    }
 }
