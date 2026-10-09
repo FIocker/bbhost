@@ -22,6 +22,11 @@ constexpr int kPadTouchW = 1920, kPadTouchH = 943;
 // 128 the keyboard's W, with no controller connected, read as forward and a
 // little right, and every turn with A or D cut a sprint short.
 constexpr std::uint8_t kStickRest = 127;
+// A key's full push, the same either way from the rest: 0 and 254. 255 is a
+// step past full on the right and down sides only (0 is 127 below the rest,
+// 255 is 128 above it), and pressing or letting go of D while sprinting
+// dropped the sprint for 8 frames where A did not.
+constexpr std::uint8_t kStickLow = kStickRest - 127, kStickHigh = kStickRest + 127;
 
 struct PadState {
     std::uint32_t buttons = 0;   // ScePadButtonDataOffset bits
