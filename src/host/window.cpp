@@ -1277,7 +1277,7 @@ void update_pad() {
         btn(SDL_GAMEPAD_BUTTON_DPAD_LEFT, kLeft);
         btn(SDL_GAMEPAD_BUTTON_DPAD_RIGHT, kRight);
         const auto further = [](std::uint8_t have, std::uint8_t v) {
-            return std::abs(static_cast<int>(v) - 128) > std::abs(static_cast<int>(have) - 128) ? v : have;
+            return std::abs(static_cast<int>(v) - kStickRest) > std::abs(static_cast<int>(have) - kStickRest) ? v : have;
         };
         p.lx = further(p.lx, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTX)));
         p.ly = further(p.ly, axis_to_u8(SDL_GetGamepadAxis(g_gamepad, SDL_GAMEPAD_AXIS_LEFTY)));
