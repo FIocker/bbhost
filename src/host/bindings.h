@@ -24,15 +24,15 @@ struct PadState;
 
 enum BindAction : int {
     // Movement
-    kBindMoveF, kBindMoveB, kBindMoveL, kBindMoveR, kBindRoll, kBindLockOn, kBindL3,
+    kBindMoveF, kBindMoveB, kBindMoveL, kBindMoveR, kBindWalk, kBindRoll, kBindLockOn,
     // Combat
     kBindAttack, kBindStrong, kBindStrongMod, kBindTransform, kBindFirearm, kBindBloodVial, kBindUseItem,
     // Items and gestures
     kBindInteract, kBindSwitchItem, kBindSwitchRight, kBindSwitchLeft, kBindDpadUp, kBindGestures, kBindEffects,
     // Camera and menus
     kBindLookU, kBindLookD, kBindLookL, kBindLookR, kBindMenu, kBindConfirm, kBindBack,
-    // Debug
-    kBindDebugMenu,
+    // Other
+    kBindL3, kBindDebugMenu,
     kBindCount,
 };
 constexpr int kBindPages = 5, kBindPerPage = 7;
