@@ -14,9 +14,18 @@
 // space the game is told to expect.
 constexpr int kPadTouchW = 1920, kPadTouchH = 943;
 
+// A stick at rest, as the game reads it: 127 is its zero - what a centred
+// controller reads through our axis conversion too. 128 is a step off it, and
+// the game reads that step as a push whenever the stick's other axis is held:
+// its analog shaping (DLUI's, which Dark Souls III shares) zeroes a small axis
+// only when its pair is small as well, then pushes what is left outward. With
+// 128 the keyboard's W, with no controller connected, read as forward and a
+// little right, and every turn with A or D cut a sprint short.
+constexpr std::uint8_t kStickRest = 127;
+
 struct PadState {
     std::uint32_t buttons = 0;   // ScePadButtonDataOffset bits
-    std::uint8_t lx = 128, ly = 128, rx = 128, ry = 128;
+    std::uint8_t lx = kStickRest, ly = kStickRest, rx = kStickRest, ry = kStickRest;
     std::uint8_t l2 = 0, r2 = 0;
     bool connected = false;
     std::uint64_t timestamp = 0;

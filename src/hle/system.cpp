@@ -1581,7 +1581,7 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
         if (want) {
             const MouseState m = host_mouse_state();
             const auto axis = [](float v) {
-                const float c = 128.0f + v;
+                const float c = static_cast<float>(kStickRest) + v;
                 return static_cast<std::uint8_t>(c < 0.0f ? 0.0f : c > 255.0f ? 255.0f : c);
             };
             // The mouse turns the camera itself, as DS3's does: an angle a
@@ -1602,8 +1602,8 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             } else if (!mouse_camera_installed() && (m.dx != 0.0f || m.dy != 0.0f)) {
                 const float sx = hs.mouse_invert_x ? -1.0f : 1.0f;
                 const float sy = hs.mouse_invert_y ? -1.0f : 1.0f;
-                p.rx = axis(static_cast<float>(p.rx) - 128.0f + sx * m.dx * 1.1f);
-                p.ry = axis(static_cast<float>(p.ry) - 128.0f + sy * m.dy * 1.1f);
+                p.rx = axis(static_cast<float>(p.rx) - kStickRest + sx * m.dx * 1.1f);
+                p.ry = axis(static_cast<float>(p.ry) - kStickRest + sy * m.dy * 1.1f);
             }
             // And the buttons, because a mouse that turns the camera and does
             // nothing when clicked is half a mouse. Each is bound to an action
@@ -1972,6 +1972,26 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
     st[76] = p.connected ? 1 : 0;
     std::memcpy(st + 80, &p.timestamp, 8);
     st[100] = p.connected ? 1 : 0;
+    // BBHOST_PAD_DUMP=1: the whole record but its timestamp, on every change.
+    {
+        static const bool dump = [] {
+            const char* e = std::getenv("BBHOST_PAD_DUMP");
+            return e && e[0] == '1';
+        }();
+        static std::uint8_t last[120];
+        static bool any = false;
+        std::uint8_t now[120];
+        std::memcpy(now, st, 120);
+        std::memset(now + 80, 0, 8);
+        if (dump && (!any || std::memcmp(now, last, 120) != 0)) {
+            any = true;
+            std::memcpy(last, now, 120);
+            char hex[241];
+            for (int i = 0; i < 120; ++i) std::snprintf(hex + i * 2, 3, "%02x", now[i]);
+            const double t = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            host_log("paddump: t=%.4f %s", t, hex);
+        }
+    }
     return 0;
 }
 // ScePadVibrationParam { u8 largeMotor; u8 smallMotor; }
