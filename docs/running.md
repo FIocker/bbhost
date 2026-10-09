@@ -79,8 +79,9 @@ A controller works as on the console. Without one, the keyboard and mouse
 take over and the button prompts follow: the mouse turns the camera and works
 in the menus, and every action can be rebound (F10 or the game's Key Bindings
 menu) - to a key, any of five mouse buttons, or the wheel turned up or down
-(each notch a press). Two opposite keys held together cancel, as in Dark Souls
-III. F9 opens the plugin menu and F10 bbhost's own settings.
+(each notch a press). Hold Left Alt with the movement keys to walk, and two
+opposite keys held together cancel, both as in Dark Souls III. F9 opens the
+plugin menu and F10 bbhost's own settings.
 
 The mouse turns the camera the way Dark Souls III's PC version does: by an
 angle for each count the mouse reports, 0.25 degrees at the default
