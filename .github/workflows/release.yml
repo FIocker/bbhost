@@ -22,12 +22,15 @@
 # plugins.signed_only is set) and never published. A newer push to the PR
 # cancels the run still going.
 #
-# The bare executables the publish job adds - bbhost-<version>-windows.exe and
-# bbhost-<version>-linux - are for older builds, whose updater installs them,
-# and only when SHA256SUMS carries the release key's signature (SHA256SUMS.sig,
-# made with the RELEASE_SIGNING_KEY secret; a tag without the secret fails
-# rather than publish unsigned). bbhost itself (src/host/updater.h) only looks
-# for a newer release and opens its page. The same key signs the official
+# The bare executables the publish job adds keep the same names in every
+# release - bbhost.exe and bbhost (Linux) - so a shortcut or a launcher entry
+# (a Steam non-Steam game) keeps working when one is replaced by the next.
+# SHA256SUMS lists them with the packages, signed with the release key
+# (SHA256SUMS.sig, made with the RELEASE_SIGNING_KEY secret; a tag without the
+# secret fails rather than publish unsigned). bbhost itself (src/host/updater.h)
+# only looks for a newer release and opens its page; older builds' updater
+# looked for bbhost-<version>-windows.exe, finds none, and says to get the
+# release from its page. The same key signs the official
 # plugins each package carries (tools/package_plugins.sh: plugins/<name>.so|.dll
 # + .sig).
 #
@@ -127,12 +130,12 @@ jobs:
           tools/package_steamdeck.sh dist/linux/*.tar.gz dist/steamdeck
           mkdir -p dist/release dist/x
           cp dist/windows/* dist/linux/* dist/steamdeck/* dist/release/
-          # The stripped executables out of the packages, under the names older builds' updater asks for.
+          # The stripped executables out of the packages, named the same in every release.
           w=$(ls dist/windows/bbhost-win-*.zip); v=$(basename "$w" .zip); v=${v#bbhost-win-}
           unzip -q -j "$w" "bbhost-win-$v/bbhost.exe" -d dist/x
-          mv dist/x/bbhost.exe "dist/release/bbhost-$v-windows.exe"
+          mv dist/x/bbhost.exe dist/release/bbhost.exe
           tar xzf dist/linux/bbhost-linux-$v.tar.gz -C dist/x "bbhost-linux-$v/bbhost"
-          install -m 755 "dist/x/bbhost-linux-$v/bbhost" "dist/release/bbhost-$v-linux"
+          install -m 755 "dist/x/bbhost-linux-$v/bbhost" dist/release/bbhost
           # The official plugins, signed in the packages, as assets of their own:
           # the plugin manager's "Get the latest official plugins" fetches
           # bbhost-plugin-<name>-windows.dll / -linux.so and their .sig.

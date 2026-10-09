@@ -89,12 +89,12 @@ every shader in the game's shader bundles.
 The release workflow (`.github/workflows/release.yml`) builds the Windows,
 Linux and Steam Deck packages from a `v*` tag, signs `SHA256SUMS` and the
 official plugins with the release key, and publishes the release that bbhost's
-update check looks for. The bare executables it attaches
-(`bbhost-<tag>-windows.exe`, `bbhost-<tag>-linux`) are for older builds, whose
-updater installs them. The packages pick no server, so they play on the live
-server (`https://thehuntersdream.com`), bbhost's default;
-`tools/check_release_bundle.sh` fails a release whose packages would go
-anywhere else, or that carries a playtest kit.
+update check looks for. The bare executables it attaches are named the same in
+every release (`bbhost.exe`, and `bbhost` for Linux), so a shortcut or a Steam
+entry pointing at one keeps working when it is replaced. The packages pick no
+server, so they play on the live server (`https://thehuntersdream.com`),
+bbhost's default; `tools/check_release_bundle.sh` fails a release whose
+packages would go anywhere else, or that carries a playtest kit.
 
 ## Continuous integration
 
