@@ -262,10 +262,33 @@ void host_binding_prompt(int action, char* out, std::size_t n) {
     if (what) std::snprintf(out, n, "%s", what);
 }
 
+namespace {
+
+// Of two opposite directions held at once, the one pressed last wins: W while
+// S is held turns round and letting go of it turns back, and a quick A-to-D
+// that overlaps goes straight to D - where a fixed winner made W do nothing
+// under S. (Dark Souls III sums them, so both held stand still.) One caller,
+// the window's pad update, so the state is its own.
+constexpr int kOpposites[4][2] = {
+    {kBindMoveF, kBindMoveB}, {kBindMoveL, kBindMoveR}, {kBindLookU, kBindLookD}, {kBindLookL, kBindLookR}};
+bool g_keys_were[kBindCount] = {};
+int g_pressed_last[4] = {kBindMoveF, kBindMoveL, kBindLookU, kBindLookL};
+
+}  // namespace
+
 void host_bindings_keys_held(const bool* keys, int nkeys, bool held[kBindCount]) {
     for (int a = 0; a < kBindCount; ++a) {
         const int sc = g_key[a].load(std::memory_order_relaxed);
         held[a] = sc > 0 && sc < nkeys && keys[sc];
+    }
+    for (int i = 0; i < 4; ++i) {
+        for (const int a : kOpposites[i])
+            if (held[a] && !g_keys_were[a]) g_pressed_last[i] = a;
+    }
+    std::memcpy(g_keys_were, held, sizeof g_keys_were);
+    for (int i = 0; i < 4; ++i) {
+        const int a = kOpposites[i][0], b = kOpposites[i][1];
+        if (held[a] && held[b]) held[g_pressed_last[i] == a ? b : a] = false;
     }
     note_debug_key(0, held[kBindDebugMenu]);
 }
