@@ -253,7 +253,7 @@ Setting g_set[kSettingCount] = {
     {"dlss_mode", "DLSS", {"Off", "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"}, 0,
      "DLAA renders at native resolution. SR presets render fewer pixels and reconstruct the selected display size. Requires RTX hardware and a restart.", true},
     {"frame_generation", "DLSS frame generation", {"Off", "2x", "3x", "4x"}, 0,
-     "Adds one, two or three generated frames between game frames. 3x/4x require supported RTX hardware; unsupported factors fall back to 2x. Use 60 fps gameplay for multiplayer. Requires a restart.", true},
+     "Adds a generated frame between game frames. Experimental 3x/4x can have uneven pacing under FPS limits. Use 60 fps gameplay for multiplayer. Requires a restart.", true},
 };
 
 const Row g_rows[] = {
@@ -850,6 +850,10 @@ void host_options_load() {
     static bool loaded = false;
     if (loaded) return;
     loaded = true;
+    if (!host::experimental_mfg_enabled()) {
+        g_set[kFrameGeneration].values.resize(2);
+        g_set[kFrameGeneration].note = "Adds one generated frame between game frames. Use 60 fps gameplay for multiplayer. Requires a restart.";
+    }
     // bbhost.toml still sets the defaults; the options file is what the player
     // changed, and the environment switches still win over both.
     host_bindings_load_defaults();
@@ -862,7 +866,8 @@ void host_options_load() {
     g_set[kFivePlayers].index = config().five_players ? 0 : 1;
     g_set[kObjectMotion].index = config().dlss_object_motion ? 1 : 0;
     g_set[kDlssMode].index = host::dlss_mode_index(config().dlss_mode);
-    g_set[kFrameGeneration].index = config().dlss_frame_generation ? std::clamp(config().dlss_fg_factor, 2, 4) - 1 : 0;
+    g_set[kFrameGeneration].index = config().dlss_frame_generation ?
+        std::clamp(config().dlss_fg_factor, 2, static_cast<int>(g_set[kFrameGeneration].values.size())) - 1 : 0;
     // video.fps_cap is the frame rate's default: 30, 60, 90 or 0 (uncapped);
     // another number takes the nearest rate below it.
     {
@@ -953,6 +958,7 @@ void host_options_load() {
             if (key == "frame_cap") frame_cap_val = val;
             if (key == "resolution") seed(kResolution, val);
             if (key == "frame_generation" && val == "On") val = "2x";
+            if (key == "frame_generation" && !host::experimental_mfg_enabled() && (val == "3x" || val == "4x")) val = "2x";
             // The four named steps mouse_sens used to have, on the new scale.
             if (key == "mouse_sens") {
                 const char* old[] = {"Low", "Medium", "High", "Very high"};
@@ -1034,6 +1040,8 @@ void host_options_load() {
     if (const char* e = std::getenv("BBHOST_DLSS_FG"); e && e[0])
         g_set[kFrameGeneration].index = e[0] >= '2' && e[0] <= '4' ? e[0] - '1' :
             (e[0] == '1' || e[0] == 't' || e[0] == 'T' ? 1 : 0);
+    g_set[kFrameGeneration].index = std::clamp(g_set[kFrameGeneration].index, 0,
+        static_cast<int>(g_set[kFrameGeneration].values.size()) - 1);
     if (g_set[kFrameGeneration].index > 0 && g_set[kDlssMode].index == 0) g_set[kDlssMode].index = 1;
     if (const char* e = std::getenv("BBHOST_DLAA"); e && e[0] == '0') {
         g_set[kDlssMode].index = 0;

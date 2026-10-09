@@ -658,9 +658,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::SetNextItemWidth(200 * scale);
         if (ImGui::Combo("DLSS", &dlss_mode, kDlssLabels, 6) && dlss_mode == 0) frame_generation = 0;
         ImGui::SetNextItemWidth(200 * scale);
-        if (ImGui::Combo("DLSS frame generation", &frame_generation, kFgLabels, 4) && frame_generation && dlss_mode == 0) dlss_mode = 1;
+        if (ImGui::Combo("DLSS frame generation", &frame_generation, kFgLabels,
+                         host::experimental_mfg_enabled() ? 4 : 2) && frame_generation && dlss_mode == 0) dlss_mode = 1;
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("3x/4x require multi-frame-generation support. Unsupported factors use 2x.");
+            ImGui::SetTooltip("2x adds one generated frame. Experimental 3x/4x may have uneven pacing under FPS limits.");
         ImGui::Checkbox("Object motion vectors", &object_motion);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Tracks animated meshes for reconstruction and frame generation. Uses extra GPU time and about 128 MiB plus the motion image.");
