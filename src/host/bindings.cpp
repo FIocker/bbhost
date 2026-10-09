@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <string>
 
@@ -38,9 +39,10 @@ const BindingInfo kInfo[kBindCount] = {
     {"move_back", "Move Back", "Left stick down.", 0, "S", 0},
     {"move_left", "Move Left", "Left stick left.", 0, "A", 0},
     {"move_right", "Move Right", "Left stick right.", 0, "D", 0},
+    // Held with the movement keys, as Dark Souls III's Left Alt: a walk.
+    {"walk", "Walk", "Hold with the movement keys to walk.", 0, "Left Alt", 0},
     {"roll", "Dodge / Sprint", "Circle. Tap to dodge, hold to sprint.", kCircle, "Space", 0},
     {"lock_on", "Lock On", "R3. Lock on to a target, or reset the camera.", kR3, "Q", 0},
-    {"l3", "Left Stick Press", "L3.", kL3, "Left Ctrl", 0},
 
     {"attack", "Attack", "R1. With the strong attack modifier held, R2.", kR1, nullptr, 1},
     {"strong_attack", "Strong Attack", "R2. Hold to charge.", kR2, "V", 0},
@@ -72,6 +74,7 @@ const BindingInfo kInfo[kBindCount] = {
     {"confirm", "Menu Confirm", "OK, in menus.", 0, "Return", 0},
     {"back", "Menu Back", "Return, in menus.", 0, "Backspace", 0},
 
+    {"l3", "Left Stick Press", "L3.", kL3, "Left Ctrl", 0},
     // The developers' debug menu: not a pad press at all. The patch opens it
     // on the touchpad's left side, which is also Gestures; this key toggles
     // the menu itself (engine/debug_menu.h), when the Debug Menu plugin is
@@ -273,6 +276,16 @@ namespace {
 constexpr int kOpposites[4][2] = {
     {kBindMoveF, kBindMoveB}, {kBindMoveL, kBindMoveR}, {kBindLookU, kBindLookD}, {kBindLookL, kBindLookR}};
 
+// Walk held on a mouse button, for the keyboard's movement keys (the mouse is
+// read on the pad read, the keyboard on the window's update).
+std::atomic<bool> g_walk_on_mouse{false};
+
+// How far the movement keys push the stick while Walk is held, of a full push.
+// Measured in the Hunter's Dream: under 35% the character stands, from 40% to
+// 80% it walks (1.65 m/s), at a full push it runs (3.7 m/s) - so the middle of
+// the walk, with room either side.
+constexpr float kWalkPush = 0.6f;
+
 }  // namespace
 
 void host_bindings_keys_held(const bool* keys, int nkeys, bool held[kBindCount]) {
@@ -283,6 +296,7 @@ void host_bindings_keys_held(const bool* keys, int nkeys, bool held[kBindCount])
     for (const auto& pair : kOpposites) {
         if (held[pair[0]] && held[pair[1]]) held[pair[0]] = held[pair[1]] = false;
     }
+    held[kBindWalk] = held[kBindWalk] || g_walk_on_mouse.load(std::memory_order_relaxed);
     note_debug_key(0, held[kBindDebugMenu]);
 }
 
@@ -291,6 +305,7 @@ void host_bindings_mouse_held(std::uint32_t buttons, bool held[kBindCount]) {
         const int m = g_mouse[a].load(std::memory_order_relaxed);
         held[a] = m >= 1 && m <= kMouseInputs && (buttons & (1u << (m - 1)));
     }
+    g_walk_on_mouse.store(held[kBindWalk], std::memory_order_relaxed);
     note_debug_key(1, held[kBindDebugMenu]);
 }
 
@@ -312,10 +327,6 @@ void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p) 
         if (bit == kR2) p.r2 = 255;  // the triggers are analogue as well as buttons
         if (bit == kL2) p.l2 = 255;
         switch (a) {
-            case kBindMoveF: p.ly = kStickLow; break;
-            case kBindMoveB: p.ly = kStickHigh; break;
-            case kBindMoveL: p.lx = kStickLow; break;
-            case kBindMoveR: p.lx = kStickHigh; break;
             case kBindLookU: p.ry = kStickLow; break;
             case kBindLookD: p.ry = kStickHigh; break;
             case kBindLookL: p.rx = kStickLow; break;
@@ -335,6 +346,21 @@ void host_bindings_apply(const bool held[kBindCount], bool strong, PadState& p) 
                 break;
             default: break;
         }
+    }
+    // The movement keys: a full push each way, a diagonal the square's corner
+    // (as Dark Souls III's keys give) - or, with Walk held, a gentle push the
+    // game reads as a walk, a diagonal's two axes shortened so that its reach,
+    // and so the walk, is the same. Opposite keys cancel (keys_held above).
+    const int x = (held[kBindMoveR] ? 1 : 0) - (held[kBindMoveL] ? 1 : 0);
+    const int y = (held[kBindMoveB] ? 1 : 0) - (held[kBindMoveF] ? 1 : 0);
+    if (x != 0 || y != 0) {
+        int reach = kStickHigh - kStickRest;
+        if (held[kBindWalk]) {
+            const float r = static_cast<float>(reach) * kWalkPush / (x != 0 && y != 0 ? std::sqrt(2.0f) : 1.0f);
+            reach = static_cast<int>(std::lround(r));
+        }
+        if (x != 0) p.lx = static_cast<std::uint8_t>(kStickRest + x * reach);
+        if (y != 0) p.ly = static_cast<std::uint8_t>(kStickRest + y * reach);
     }
     if (any) p.connected = true;
 }
