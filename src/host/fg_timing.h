@@ -1,0 +1,83 @@
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+
+namespace host {
+
+// Motion vectors describe consecutive rendered frames, not consecutive flips
+// accepted by the presentation mailbox. Keep those two serials separate.
+class FgHistory {
+public:
+    bool needs_reset(std::uint64_t render_frame) const {
+        return !render_frame || !last_ || render_frame != last_ + 1;
+    }
+    void submitted(std::uint64_t render_frame) { last_ = render_frame; }
+    void clear() { last_ = 0; }
+private:
+    std::uint64_t last_ = 0;
+};
+
+// GPU timestamps measure real source cadence even when the CPU records at the
+// selected cap. Map the GPU clock to steady_clock with the earliest observed
+// fence completion; later observations can include display/driver waiting.
+class FgSchedule {
+public:
+    void observe(std::uint64_t source, std::uint64_t ready, std::uint64_t render,
+                 std::int64_t host_ready, float fallback_ms, int game_cap) {
+        const auto minimum = game_cap > 0 ? 1000000000ll / game_cap : 8000000ll;
+        std::int64_t period = std::isfinite(fallback_ms) ?
+            static_cast<std::int64_t>(std::clamp<double>(fallback_ms, 8.0, 100.0) * 1e6) : minimum;
+        if (source && last_source_ && source > last_source_ && render > last_render_) {
+            const auto measured = (source - last_source_) / (render - last_render_);
+            if (measured >= 1000000 && measured <= 100000000) period = measured;
+        }
+        period_ = std::max<std::int64_t>(minimum, period);
+        if (source && ready >= source) {
+            const auto offset = host_ready - static_cast<std::int64_t>(ready);
+            if (!clock_valid_ || offset < offset_) offset_ = offset;
+            clock_valid_ = true;
+            source_host_ = offset_ + static_cast<std::int64_t>(source);
+            // One source interval of presentation lookahead hides evaluation
+            // behind the preceding frame set. Account for FG's own GPU cost.
+            evaluation_ = static_cast<std::int64_t>(ready - source);
+        } else {
+            source_host_ = host_ready;
+            evaluation_ = 0;
+        }
+        last_source_ = source; last_render_ = render;
+    }
+    std::int64_t deadline(unsigned position, unsigned factor) const {
+        factor = std::clamp(factor, 2u, 4u);
+        return source_host_ + evaluation_ + period_ * std::min(position, factor) / factor;
+    }
+    std::int64_t period() const { return period_; }
+    // Select the newest temporal position due now. Never submit every expired
+    // subframe in a catch-up burst when a cap or late evaluation blocks present.
+    unsigned next_position(unsigned first, unsigned factor, std::int64_t now) const {
+        while (first < factor && deadline(first + 1, factor) <= now) ++first;
+        return first;
+    }
+private:
+    std::uint64_t last_source_ = 0, last_render_ = 0;
+    std::int64_t period_ = 16666667, source_host_ = 0, evaluation_ = 0, offset_ = 0;
+    bool clock_valid_ = false;
+};
+
+// Budget the generated->real spacing from evaluation *start*. GPU waiting and
+// generated presentation already consume this budget. Never add a whole half
+// frame after a slow evaluation, or carry a synthetic 120 Hz grid into the next
+// pair. The game simulation cap is unchanged.
+inline std::int64_t fg_real_deadline_ns(std::int64_t evaluation_start_ns,
+                                        float render_ms, int game_cap, unsigned factor = 2,
+                                        unsigned generated_index = 0) {
+    const double minimum_ms = game_cap > 0 ? 1000.0 / game_cap : 8.0;
+    const double period_ms = std::isfinite(render_ms) ?
+        std::clamp<double>(render_ms, minimum_ms, std::max(minimum_ms, 100.0)) : minimum_ms;
+    factor = std::clamp(factor, 2u, 4u);
+    const unsigned step = generated_index ? std::min(generated_index, factor - 1) : factor - 1;
+    return evaluation_start_ns + static_cast<std::int64_t>(period_ms * 1000000.0 * step / factor);
+}
+
+} // namespace host

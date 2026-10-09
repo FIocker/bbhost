@@ -30,7 +30,7 @@ namespace {
 // depends on something the key does not hold would be handed to the wrong
 // program, and a result field the entry does not hold would come back empty.
 #if defined(__GLIBCXX__) && defined(__x86_64__)
-static_assert(sizeof(gcn::TranslateOptions) == 312, "a new TranslateOptions field: add it to hash_options");  // a bool can land in padding: check the list too
+static_assert(sizeof(gcn::TranslateOptions) == 320, "a new TranslateOptions field: add it to hash_options");  // a bool can land in padding: check the list too
 static_assert(sizeof(gcn::TranslateResult) == 424, "a new TranslateResult field: add it to write_result and read_result");
 static_assert(sizeof(gcn::ResourcePath) == 40 && sizeof(gcn::ResourceStep) == 8, "a new ResourcePath field: add it to the entry");
 static_assert(sizeof(gcn::ImageBinding) == 64 && sizeof(gcn::SamplerBinding) == 56 && sizeof(gcn::BufferBinding) == 56,
@@ -108,6 +108,8 @@ void hash_options(KeyHasher& h, const gcn::TranslateOptions& o) {
     for (const std::string& s : o.cb_ssbo_exclude) h.str(s);
     h.flag(o.cb_no_fallback);
     h.flag(o.exec_known);
+    h.flag(o.object_motion);
+    h.u32(o.motion_location);
     h.u32(o.rsrc1);
     h.u32(o.rsrc2);
     h.u32(o.ps_input_ena);

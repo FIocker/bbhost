@@ -223,6 +223,10 @@ if(UNIX)
 elseif(WIN32)
   # hle/net.cpp, net/session.cpp; timeBeginPeriod; WaitOnAddress (core/futex.cpp)
   target_link_libraries(bbhost PRIVATE ws2_32 winmm synchronization)
+  if(MINGW)
+    # The game-facing pthread layer and network worker threads use winpthreads.
+    target_link_libraries(bbhost PRIVATE winpthread)
+  endif()
   # The SysV convention our guest-facing functions follow lets a leaf keep
   # data in the 128 bytes below rsp, and on Windows an exception - a
   # write-watch fault in a decomp leaf's write, say - builds its frame right
@@ -261,7 +265,7 @@ if(Vulkan_FOUND)
   add_library(replay_common STATIC src/replay/json.cpp src/replay/compare.cpp)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
-  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/dlaa.cpp src/host/frame_generation.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
@@ -291,7 +295,7 @@ if(SDL3_FOUND AND Vulkan_FOUND)
   target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_SDL3=1)
   target_link_libraries(bbhost PRIVATE SDL3::SDL3 Vulkan::Vulkan)
   # The setup window (host/launcher.h): Dear ImGui (MIT,
-  # https://github.com/ocornut/imgui, third_party/imgui/VERSION) on SDL3's 2D renderer.
+  # https://github.com/ocornut/imgui, third_party/imgui/VERSION.txt) on SDL3's 2D renderer.
   add_library(imgui STATIC third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
     third_party/imgui/backends/imgui_impl_sdl3.cpp third_party/imgui/backends/imgui_impl_sdlrenderer3.cpp
@@ -305,7 +309,9 @@ if(SDL3_FOUND AND Vulkan_FOUND)
   set_source_files_properties(src/host/overlay.cpp src/host/present_pass.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/ingame_menu.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/buffer_shadow.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
-  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
+  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/dlaa.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
+  target_sources(bbhost PRIVATE src/host/object_motion.cpp)
+  set_source_files_properties(src/host/object_motion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
 else()
   message(STATUS "bbhost: SDL3/Vulkan not found; headless only")
 endif()
@@ -514,6 +520,38 @@ if(UNIX)
       set_tests_properties(gcn_sampling_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     endif()
   endif()
+endif()
+
+# Motion regressions are portable, including the native Windows renderer build.
+enable_testing()
+add_executable(display_settings_test tests/display_settings_test.cpp)
+target_include_directories(display_settings_test PRIVATE src)
+target_compile_options(display_settings_test PRIVATE -UNDEBUG)
+add_test(NAME display_settings_test COMMAND display_settings_test)
+add_executable(presentation_coordinates_test tests/presentation_coordinates_test.cpp)
+target_include_directories(presentation_coordinates_test PRIVATE src)
+target_compile_options(presentation_coordinates_test PRIVATE -UNDEBUG)
+add_test(NAME presentation_coordinates_test COMMAND presentation_coordinates_test)
+add_executable(fg_timing_test tests/fg_timing_test.cpp)
+target_include_directories(fg_timing_test PRIVATE src)
+target_compile_options(fg_timing_test PRIVATE -UNDEBUG)
+add_test(NAME fg_timing_test COMMAND fg_timing_test)
+add_executable(motion_history_test tests/motion_history_test.cpp)
+target_include_directories(motion_history_test PRIVATE src)
+target_compile_options(motion_history_test PRIVATE -UNDEBUG)
+add_test(NAME motion_history_test COMMAND motion_history_test)
+if(SPIRV_TOOLS_LIB)
+  add_executable(object_motion_shader_test tests/object_motion_shader_test.cpp)
+  target_link_libraries(object_motion_shader_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
+  add_test(NAME object_motion_shader_test COMMAND object_motion_shader_test)
+  set_tests_properties(object_motion_shader_test PROPERTIES TIMEOUT 300)
+endif()
+if(Vulkan_FOUND)
+  add_executable(dlaa_motion_test tests/dlaa_motion_test.cpp)
+  target_include_directories(dlaa_motion_test PRIVATE src)
+  target_link_libraries(dlaa_motion_test PRIVATE Vulkan::Vulkan)
+  add_test(NAME dlaa_motion_test COMMAND dlaa_motion_test)
+  set_tests_properties(dlaa_motion_test PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # `cmake --build build --target smoke`: 60 s run must time out (124) without a core dump.
