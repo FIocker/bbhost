@@ -18,7 +18,7 @@ set_target_properties(atrac9 PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_CODE 
 target_compile_options(atrac9 PRIVATE -w)
 
 # Monocypher (BSD-2-Clause or CC0, https://monocypher.org): Ed25519 signature
-# checks for updates (host/updater.cpp).
+# checks for the official plugins (host/plugins.cpp, host/updater.cpp).
 add_library(monocypher STATIC third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c)
 target_include_directories(monocypher PUBLIC third_party/monocypher)
 set_target_properties(monocypher PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_CODE ON)
@@ -358,7 +358,7 @@ if(UNIX)
   target_include_directories(thunk_args PRIVATE src)
   target_link_libraries(thunk_args PRIVATE pthread)
   add_test(NAME thunk_args COMMAND thunk_args)
-  add_executable(updater_test tests/updater_test.cpp src/host/update_verify.cpp)
+  add_executable(updater_test tests/updater_test.cpp src/host/update_verify.cpp src/replay/json.cpp)
   target_include_directories(updater_test PRIVATE src)
   target_link_libraries(updater_test PRIVATE monocypher)
   add_test(NAME updater_test COMMAND updater_test)

@@ -98,8 +98,8 @@ struct Row {
     // on this PC, 2 recover, 3 website code, 4 sign out). Info: a line the
     // host writes (field 0 who is signed in, 1 the code in play, if any).
     // Fields 10 and up are the UPDATES rows (host/updater.h): Info 10 the
-    // version and what the check found, 11 what is happening; Action 10
-    // check, 11 install, 12 restart.
+    // version and what the check found, 11 why it failed or the newer
+    // release's page; Action 10 check, 11 open that page in the browser.
     enum Kind { Header, Option, Close, Text, Action, Info } kind;
     const char* text;
     int setting = -1;
@@ -297,8 +297,7 @@ const Row g_rows[] = {
     {Row::Info, nullptr, -1, 10},
     {Row::Info, nullptr, -1, 11},
     {Row::Action, "Check for updates", -1, 10},
-    {Row::Action, "Install update", -1, 11},
-    {Row::Action, "Restart now", -1, 12},
+    {Row::Action, "Open the release page", -1, 11},
     {Row::Close, "Close"},
 };
 constexpr int kRowCount = static_cast<int>(sizeof(g_rows) / sizeof(g_rows[0]));
@@ -416,16 +415,14 @@ void link_thread() {
 // The UPDATES buttons, and whether each can do anything right now.
 void update_action(int which) {
     if (which == 10) updater::check_now();
-    if (which == 11) updater::install();
-    if (which == 12) updater::request_restart();
+    if (which == 11) updater::open_release_page();
 }
 
 bool action_idle(int which) {
     if (which < 10) return !g_acct_busy.load();
     if (updater::busy()) return false;
     if (which == 11) return updater::update_available();
-    if (which == 12) return updater::restart_ready();
-    return !updater::restart_ready();
+    return true;
 }
 
 void account_action(int which, const std::string& name, const std::string& code) {
@@ -1324,8 +1321,7 @@ void options_panel_frame(float display_w, float display_h) {
         };
         static const char* const kUpdateNotes[] = {
             "Asks GitHub for the newest release.",
-            "Downloads the new release, checks its signature and puts it in place for the next start.",
-            "Starts the installed version now (like closing the window and opening it again).",
+            "Opens the newer release's page in your browser, to download it from there.",
         };
         const int f = g_rows[g_sel].field;
         note = f >= 10 ? kUpdateNotes[f - 10] : kNotes[f];

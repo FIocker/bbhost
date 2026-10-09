@@ -143,7 +143,7 @@ src/
   hle/           the PS4 system libraries: kernel, files, threads, audio, video,
                  network, NP, Gnm and the GPU command processor
   host/          the PC side: window, input, audio, Vulkan renderer, textures,
-                 menus, overlay, plugins, updater
+                 menus, overlay, plugins, update check
   gcn/           GCN shader decoding, translation and lifting to SPIR-V
   engine/        named engine structures and the features built on them:
                  frame rate, live resolution, menus, params, event flags,
