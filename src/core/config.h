@@ -29,9 +29,8 @@ struct HostConfig {
     int playlog_sample_ms = 500;      // online.playlog_sample_ms: how often it logs the player's position (the game's own: 1500; 0 keeps it)
     int sign_timeout_seconds = 30;    // online.sign_timeout_seconds: how long a sign being answered may take (the game's own: 180; 0 keeps it)
     // [update] (host/updater.h): whether to look for a newer release at start
-    // (-1: only a release build does - one built from source is never
-    // replaced), where the releases are, and a file holding a GitHub token
-    // for a private repository's.
+    // (-1: only a release build does), where the releases are, and a file
+    // holding a GitHub token for a private repository's.
     int update_check = -1;           // update.check: true/false
     std::string update_source;       // update.source: a GitHub "releases/latest" API URL
     std::string update_token_file;   // update.token_file

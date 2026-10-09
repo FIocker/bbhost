@@ -7,6 +7,7 @@
 #include "host/options.h"
 #include "net/account.h"
 #include "host/plugin_ui.h"
+#include "host/updater.h"
 #include "log.h"
 
 #include "imgui.h"
@@ -354,6 +355,15 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::Text("bbhost %s - setup", BBHOST_VERSION);
         ImGui::TextDisabled("Saved to %s, which every copy of bbhost reads.", config_user_file().c_str());
         if (!reason.empty()) ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.30f, 1.0f), "%s", reason.c_str());
+        // While the Updates box is checked: one check, on a thread of its own
+        // (host/updater.h), and a newer release's page opens in the browser.
+        if (check_updates) updater::check_once();
+        if (check_updates && updater::update_available()) {
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextColored(ImVec4(0.95f, 0.80f, 0.40f, 1.0f), "bbhost %s is available", updater::latest_tag().c_str());
+            ImGui::SameLine();
+            if (ImGui::Button("Open the release page")) updater::open_release_page();
+        }
         ImGui::Separator();
 
         const std::string app0 = f[kApp0].str();
@@ -617,6 +627,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
 
         ImGui::SeparatorText("Updates");
         ImGui::Checkbox("Check for a newer bbhost at start", &check_updates);
+        if (check_updates) {
+            ImGui::TextDisabled("%s", updater::status().c_str());
+            if (const std::string d = updater::detail(); !d.empty()) ImGui::TextDisabled("%s", d.c_str());
+        }
         path_row("GitHub token file (only while the releases are private)", kToken, false, "");
 
         }

@@ -2,35 +2,26 @@
 
 #include "bbhost_version.h"
 #include "core/config.h"
-#include "core/sha256.h"
 #include "log.h"
 #include "replay/json.h"
 
-#include "monocypher-ed25519.h"
-
 #include <atomic>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
-#include <sstream>
 #include <thread>
-#include <vector>
 
 #if defined(BBHOST_HAVE_CURL)
 #include <curl/curl.h>
 #endif
 #if defined(_WIN32)
 #include <windows.h>
-#else
-#include <spawn.h>
-#include <sys/stat.h>
-#include <unistd.h>
-extern char** environ;
+#endif
+#if defined(BBHOST_HAVE_SDL3)
+#include <SDL3/SDL.h>
 #endif
 
 namespace updater {
@@ -40,8 +31,8 @@ namespace {
 namespace fs = std::filesystem;
 
 // The release signing key's public half. The private half signs each
-// release's SHA256SUMS in the release workflow (the RELEASE_SIGNING_KEY
-// secret); nothing it did not sign is ever installed.
+// release's SHA256SUMS and the official plugins in the release workflow (the
+// RELEASE_SIGNING_KEY secret); no official plugin it did not sign is loaded.
 constexpr std::uint8_t kReleaseKey[32] = {
     0xce, 0x83, 0x68, 0x4e, 0xe9, 0x4e, 0xc4, 0xb9, 0xc9, 0x1c, 0xf6, 0x24, 0x7a, 0x23, 0xd0, 0x8f,
     0x50, 0x1c, 0xdd, 0x7a, 0x19, 0x73, 0x3c, 0x83, 0x48, 0xca, 0x3e, 0xd6, 0xae, 0xa7, 0xad, 0x62,
@@ -54,17 +45,10 @@ namespace {
 constexpr const char* kDefaultSource = "https://api.github.com/repos/droogie/bbhost/releases/latest";
 constexpr std::size_t kMaxDownload = 256u << 20;
 
-struct Release {
-    std::string tag;
-    std::string exe_url, sums_url, sig_url;  // the assets' API URLs
-    long long exe_size = 0;
-};
-
 std::mutex g_mu;
 std::string g_status, g_detail;  // under g_mu
-Release g_release;               // under g_mu: the newer release, when there is one
-std::atomic<bool> g_busy{false}, g_available{false}, g_restart_ready{false}, g_restart_asked{false};
-std::vector<std::string> g_argv;
+std::string g_tag, g_page;       // under g_mu: the newer release and its page, when there is one
+std::atomic<bool> g_busy{false}, g_checked{false}, g_available{false};
 
 void set_lines(const std::string& status, const std::string& detail) {
     std::lock_guard<std::mutex> lk(g_mu);
@@ -111,7 +95,7 @@ std::size_t write_cb(char* ptr, std::size_t size, std::size_t nmemb, void* user)
 // A GET to GitHub. Only the update token goes with it (and only to
 // api.github.com: curl leaves a custom Authorization header behind when a
 // redirect takes it to another host, which is where asset downloads go).
-Fetch fetch(const std::string& url, bool binary, int timeout_ms) {
+Fetch fetch(const std::string& url, bool binary, int timeout_ms, const std::string& token) {
     Fetch r;
 #if defined(BBHOST_HAVE_CURL)
     static std::once_flag once;
@@ -124,7 +108,6 @@ Fetch fetch(const std::string& url, bool binary, int timeout_ms) {
     struct curl_slist* h = nullptr;
     h = curl_slist_append(h, binary ? "Accept: application/octet-stream" : "Accept: application/vnd.github+json");
     h = curl_slist_append(h, "X-GitHub-Api-Version: 2022-11-28");
-    const std::string token = read_token();
     if (!token.empty() && url.rfind("https://api.github.com/", 0) == 0) {
         h = curl_slist_append(h, ("Authorization: Bearer " + token).c_str());
     }
@@ -151,136 +134,65 @@ Fetch fetch(const std::string& url, bool binary, int timeout_ms) {
     (void)url;
     (void)binary;
     (void)timeout_ms;
+    (void)token;
     r.error = "this build has no HTTP client";
 #endif
     return r;
 }
 
-void check_thread() {
-    set_lines(std::string("bbhost ") + BBHOST_VERSION + " - checking for updates...", "");
-    const std::string source = config().update_source.empty() ? kDefaultSource : config().update_source;
-    const Fetch f = fetch(source, false, 20000);
-    json::Value v;
-    std::string err;
-    if (!f.ok() || !json::parse(f.body, v, err) || v.type != json::Value::Type::Object) {
-        std::string why = !f.error.empty() ? f.error : "HTTP " + std::to_string(f.status);
+Fetch fetch(const std::string& url, bool binary, int timeout_ms) { return fetch(url, binary, timeout_ms, read_token()); }
+
+void check_thread(const std::string& source, const std::string& token) {
+    const Fetch f = fetch(source, false, 20000, token);
+    std::string tag, page;
+    if (!f.ok() || !parse_release(f.body, tag, page)) {
+        std::string why = !f.error.empty() ? f.error : f.ok() ? "the answer is not a release" : "HTTP " + std::to_string(f.status);
         if (f.status == 404) {
-            why = read_token().empty() ? "no releases visible (a private repository needs update.token_file)" : "no release found";
+            why = token.empty() ? "no releases visible (a private repository needs update.token_file)" : "no release found";
         }
         host_log("update: check failed: %s", why.c_str());
         set_lines(std::string("bbhost ") + BBHOST_VERSION + " - could not check for updates", why);
         g_busy.store(false);
         return;
     }
-    Release rel;
-    if (const json::Value* t = v.find("tag_name"); t && t->type == json::Value::Type::String) rel.tag = t->string;
-    if (const json::Value* a = v.find("assets"); a && a->type == json::Value::Type::Array) {
-        const std::string want = asset_name(rel.tag);
-        for (const json::Value& asset : a->array) {
-            const json::Value* n = asset.find("name");
-            const json::Value* u = asset.find("url");
-            if (!n || !u || n->type != json::Value::Type::String || u->type != json::Value::Type::String) continue;
-            if (n->string == want) {
-                rel.exe_url = u->string;
-                if (const json::Value* s = asset.find("size"); s && s->type == json::Value::Type::Number) {
-                    rel.exe_size = static_cast<long long>(s->number);
-                }
-            } else if (n->string == "SHA256SUMS") {
-                rel.sums_url = u->string;
-            } else if (n->string == "SHA256SUMS.sig") {
-                rel.sig_url = u->string;
-            }
-        }
-    }
-    if (rel.tag.empty() || !is_newer(rel.tag, BBHOST_VERSION)) {
-        host_log("update: %s is current (latest release %s)", BBHOST_VERSION, rel.tag.empty() ? "?" : rel.tag.c_str());
-        set_lines(std::string("bbhost ") + BBHOST_VERSION + " - up to date", rel.tag.empty() ? "" : "Latest release: " + rel.tag);
+    if (!is_newer(tag, BBHOST_VERSION)) {
+        host_log("update: %s is current (latest release %s)", BBHOST_VERSION, tag.c_str());
+        set_lines(std::string("bbhost ") + BBHOST_VERSION + " - up to date", "Latest release: " + tag);
+        g_available.store(false);
         g_busy.store(false);
         return;
     }
-    if (rel.exe_url.empty() || rel.sums_url.empty() || rel.sig_url.empty()) {
-        host_log("update: %s is out, without a signed build for this platform", rel.tag.c_str());
-        set_lines("bbhost " + rel.tag + " is out (this is " + BBHOST_VERSION + ")",
-                  "It has no signed " + asset_name(rel.tag) + " to install; get it from the release page");
-        g_busy.store(false);
-        return;
-    }
-    host_log("update: %s is available (this is %s)", rel.tag.c_str(), BBHOST_VERSION);
-    static const bool auto_install = std::getenv("BBHOST_UPDATE_TEST") != nullptr;
+    host_log("update: %s is available (this is %s): %s", tag.c_str(), BBHOST_VERSION, page.c_str());
     {
         std::lock_guard<std::mutex> lk(g_mu);
-        g_release = rel;
-        g_status = "bbhost " + rel.tag + " is available (this is " + BBHOST_VERSION + ")";
-        g_detail = "Install update downloads it, checks its signature and swaps it in";
+        g_tag = tag;
+        g_page = page;
+        g_status = "bbhost " + tag + " is available (this is " + BBHOST_VERSION + ")";
+        g_detail = page;
     }
     g_available.store(true);
     g_busy.store(false);
-    if (auto_install) install();  // BBHOST_UPDATE_TEST: the whole path, with no screen to click
+}
+
+// A check on a thread of its own, unless one is running. `delay` keeps it out
+// of the boot's busiest seconds. What it asks with is read here: main loads
+// the configuration again after the setup window's Play, while a check the
+// window began may still be running.
+void begin_check(bool delay) {
+    if (g_busy.exchange(true)) return;
+    g_checked.store(true);
+    set_lines(std::string("bbhost ") + BBHOST_VERSION + " - checking for updates...", "");
+    std::string source = config().update_source.empty() ? kDefaultSource : config().update_source;
+    std::thread([delay, source = std::move(source), token = read_token()] {
+        if (delay) std::this_thread::sleep_for(std::chrono::seconds(5));
+        check_thread(source, token);
+    }).detach();
 }
 
 bool write_file(const fs::path& p, const std::string& data) {
     std::ofstream out(p, std::ios::binary | std::ios::trunc);
     out.write(data.data(), static_cast<std::streamsize>(data.size()));
     return static_cast<bool>(out);
-}
-
-void install_thread() {
-    Release rel;
-    {
-        std::lock_guard<std::mutex> lk(g_mu);
-        rel = g_release;
-    }
-    auto fail = [&](const std::string& why) {
-        host_log("update: %s not installed: %s", rel.tag.c_str(), why.c_str());
-        set_lines("bbhost " + rel.tag + " was not installed", why);
-        g_busy.store(false);
-    };
-    set_lines("Installing bbhost " + rel.tag + "...", "Checking the release's signature");
-    const Fetch sums = fetch(rel.sums_url, true, 30000);
-    const Fetch sig = fetch(rel.sig_url, true, 30000);
-    if (!sums.ok() || !sig.ok()) return fail("could not download its checksums (" + (sums.ok() ? sig.error : sums.error) + ")");
-    if (!signature_ok(sums.body, sig.body, kReleaseKey)) return fail("its checksums are not signed by the release key");
-    const std::string want = manifest_hash(sums.body, asset_name(rel.tag));
-    if (want.empty()) return fail("its checksums do not list " + asset_name(rel.tag));
-    char size[48] = "";
-    if (rel.exe_size > 0) std::snprintf(size, sizeof(size), " (%.1f MB)", static_cast<double>(rel.exe_size) / 1048576.0);
-    set_lines("Installing bbhost " + rel.tag + "...", std::string("Downloading") + size);
-    const Fetch exe = fetch(rel.exe_url, true, 600000);
-    if (!exe.ok()) return fail("the download failed (" + (exe.error.empty() ? "HTTP " + std::to_string(exe.status) : exe.error) + ")");
-    const std::string got = sha256_hex(reinterpret_cast<const std::uint8_t*>(exe.body.data()), exe.body.size());
-    if (got != want) return fail("the download does not match its signed checksum");
-
-    // In place: the new file beside the running one, the running one renamed
-    // aside, the new one renamed to its name. A rename keeps the running
-    // process's file open on every platform; Windows only refuses to
-    // overwrite or delete it.
-    const fs::path cur = exe_path();
-    if (cur.empty()) return fail("cannot tell where bbhost is");
-    const fs::path next = fs::path(cur).concat(".new"), old = fs::path(cur).concat(".old");
-    std::error_code ec;
-    if (!write_file(next, exe.body)) return fail("cannot write " + next.string());
-#if !defined(_WIN32)
-    struct stat st{};
-    ::chmod(next.c_str(), ::stat(cur.c_str(), &st) == 0 ? (st.st_mode & 07777) : 0755);
-#endif
-    fs::remove(old, ec);
-    fs::rename(cur, old, ec);
-    if (ec) {
-        fs::remove(next, ec);
-        return fail("cannot move the running bbhost aside: " + ec.message());
-    }
-    fs::rename(next, cur, ec);
-    if (ec) {
-        std::error_code back;
-        fs::rename(old, cur, back);
-        return fail("cannot put the new bbhost in place: " + ec.message());
-    }
-    host_log("update: %s installed at %s (signature and checksum verified); it runs from the next start", rel.tag.c_str(),
-             cur.string().c_str());
-    set_lines("bbhost " + rel.tag + " is installed", "Restart now starts it (the running copy stays until you do)");
-    g_available.store(false);
-    g_restart_ready.store(true);
-    g_busy.store(false);
 }
 
 }  // namespace
@@ -402,10 +314,10 @@ std::string plugins_status() {
 
 bool plugins_busy() { return g_plugins_busy.load(); }
 
-void start(int argc, char** argv) {
-    g_argv.assign(argv, argv + argc);
+void start() {
     {
-        // The copy the last update set aside: gone once nothing runs it.
+        // The copy an older build's update set aside (bbhost.exe.old,
+        // bbhost.old on Linux): gone once nothing runs it.
         std::error_code ec;
         const fs::path cur = exe_path();
         if (!cur.empty()) fs::remove(fs::path(cur).concat(".old"), ec);
@@ -416,21 +328,21 @@ void start(int argc, char** argv) {
     const bool release = false;
 #endif
     // BBHOST_UPDATE_TEST=1: check whatever the build and settings say, and
-    // install what is found - a test of the whole path (no restart).
+    // log what is found.
     const bool test = std::getenv("BBHOST_UPDATE_TEST") != nullptr;
     if (config().headless && !test) return;  // nobody to offer it to
+    if (g_checked.load()) return;            // the setup window has checked
     const int want = test ? 1 : config().update_check;
     set_lines(std::string("bbhost ") + BBHOST_VERSION, "");
     if (want == 0 || (want < 0 && !release)) {
         if (want < 0) set_lines(std::string("bbhost ") + BBHOST_VERSION, "Built from source: checks only when asked (update.check)");
         return;
     }
-    g_busy.store(true);
-    std::thread([] {
-        // Not during the boot's busiest seconds.
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-        check_thread();
-    }).detach();
+    begin_check(true);
+}
+
+void check_once() {
+    if (!g_checked.load()) begin_check(false);
 }
 
 std::string status() {
@@ -445,49 +357,36 @@ std::string detail() {
 
 bool busy() { return g_busy.load(); }
 bool update_available() { return g_available.load(); }
-bool restart_ready() { return g_restart_ready.load(); }
 
-void check_now() {
-    if (g_restart_ready.load() || g_busy.exchange(true)) return;
-    std::thread(check_thread).detach();
+std::string latest_tag() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    return g_tag;
 }
 
-void install() {
-    if (!g_available.load() || g_busy.exchange(true)) return;
-    std::thread(install_thread).detach();
-}
+void check_now() { begin_check(false); }
 
-void request_restart() {
-    if (g_restart_ready.load()) g_restart_asked.store(true);
-}
-
-bool take_restart_request() { return g_restart_asked.exchange(false); }
-
-bool relaunch() {
-    const fs::path cur = exe_path();
-#if defined(_WIN32)
-    std::wstring cmd = GetCommandLineW();
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(cur.wstring().c_str(), cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
-        host_log("update: restart failed (CreateProcess error %lu)", static_cast<unsigned long>(GetLastError()));
-        return false;
+bool open_release_page() {
+    std::string url;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        url = g_page;
     }
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return true;
+    if (!g_available.load() || !release_page_ok(url)) return false;
+#if defined(BBHOST_HAVE_SDL3)
+    // The system's handler for links, the default browser: ShellExecute on
+    // Windows, xdg-open on Linux (not waited for).
+    if (SDL_OpenURL(url.c_str())) {
+        host_log("update: opened %s", url.c_str());
+        return true;
+    }
+    host_log("update: could not open %s: %s", url.c_str(), SDL_GetError());
 #else
-    std::vector<char*> args;
-    for (std::string& a : g_argv) args.push_back(a.data());
-    args.push_back(nullptr);
-    pid_t pid = 0;
-    if (posix_spawn(&pid, cur.c_str(), nullptr, nullptr, args.data(), environ) != 0) {
-        host_log("update: restart failed (posix_spawn)");
-        return false;
-    }
-    return true;
+    // A build without SDL has no window, so nothing calls this.
+    host_log("update: no browser to open %s in", url.c_str());
 #endif
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_detail = "The browser did not open; the page is " + url;
+    return false;
 }
 
 }  // namespace updater

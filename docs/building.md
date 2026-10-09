@@ -31,8 +31,8 @@ cmake --build build -j
 The result is `build/bbhost`, plus the official plugins in `build/plugins/`
 and the developer tools (`gcn2spv`, `gcndis`, `drawreplay`, ...).
 
-`-DBBHOST_RELEASE=ON` makes a release build, which checks for updates at
-start by default.
+`-DBBHOST_RELEASE=ON` makes a release build, which by default checks at start
+whether a newer release is out and offers to open its page in the browser.
 
 ## Windows (cross-compiled)
 
@@ -89,10 +89,12 @@ every shader in the game's shader bundles.
 The release workflow (`.github/workflows/release.yml`) builds the Windows,
 Linux and Steam Deck packages from a `v*` tag, signs `SHA256SUMS` and the
 official plugins with the release key, and publishes the release that bbhost's
-updater reads. The packages pick no server, so they play on the live server
-(`https://thehuntersdream.com`), bbhost's default; `tools/check_release_bundle.sh`
-fails a release whose packages would go anywhere else, or that carries a
-playtest kit.
+update check looks for. The bare executables it attaches
+(`bbhost-<tag>-windows.exe`, `bbhost-<tag>-linux`) are for older builds, whose
+updater installs them. The packages pick no server, so they play on the live
+server (`https://thehuntersdream.com`), bbhost's default;
+`tools/check_release_bundle.sh` fails a release whose packages would go
+anywhere else, or that carries a playtest kit.
 
 ## Continuous integration
 

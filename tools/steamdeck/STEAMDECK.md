@@ -67,8 +67,9 @@ and keyboard instead, pick the Gamepad layout in its controller settings
   once; larger ones (for a big screen on a dock) apply at the next start,
   and may not fit - they need a gigabyte or more on top, and have not been
   tried on a Deck.
-- Updates (F10, Check for updates, Install update) replace the `bbhost`
-  program in this folder and keep everything else.
+- F10 (UPDATES) says when a newer bbhost is out, and Open the release page
+  opens its page in the browser. To update, extract the new kit and copy its
+  files over this folder.
 
 ## If something goes wrong
 

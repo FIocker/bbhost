@@ -117,19 +117,6 @@ void run_guest_start(GuestStart fn, void* argv, bool windowed) {
     }();
     auto pump_until_done = [&](auto is_done) {
         while (!is_done()) {
-            if (windowed && updater::take_restart_request()) {
-                // "Restart now" on the F10 screen after an update: as a window
-                // close, with the new bbhost started first.
-                host_log("update: restarting into the installed version");
-                host_gpu_save_pipeline_cache_at_exit();
-                host_window_stop();
-                updater::relaunch();
-                std::fflush(nullptr);
-#if defined(_WIN32)
-                TerminateProcess(GetCurrentProcess(), 0);
-#endif
-                _exit(0);
-            }
             if (host_gpu_device_lost()) device_lost_exit(windowed);
             if (windowed && !host_window_pump()) {
                 host_log("window closed");
@@ -899,9 +886,10 @@ int main(int argc, char** argv) {
         std::fflush(stderr);
         return 2;
     }
-    // Updates (host/updater.h): last update's leftover removed, a release
-    // build's check begun on a thread of its own (not in a headless run).
-    updater::start(argc, argv);
+    // Updates (host/updater.h): an older build's update leftover removed, a
+    // release build's check begun on a thread of its own (not in a headless
+    // run, nor when the setup window has checked).
+    updater::start();
     const char* eboot = cfg.eboot.c_str();
     // Text entry defaults to typing in the window (the PC equivalent of the
     // PS4 on-screen keyboard); player.ime = "auto" answers with player.name
