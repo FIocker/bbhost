@@ -32,7 +32,7 @@ struct Gpu {
     PROC(vkCreateCommandPool); PROC(vkDestroyCommandPool); PROC(vkAllocateCommandBuffers);
     PROC(vkResetCommandBuffer); PROC(vkBeginCommandBuffer); PROC(vkEndCommandBuffer);
     PROC(vkGetDeviceQueue); PROC(vkQueueSubmit); PROC(vkQueueWaitIdle);
-    PROC(vkCmdPipelineBarrier); PROC(vkCmdCopyBufferToImage); PROC(vkCmdCopyImageToBuffer);
+    PROC(vkCmdPipelineBarrier); PROC(vkCmdCopyBufferToImage); PROC(vkCmdCopyImageToBuffer); PROC(vkCmdCopyImage);
 #undef PROC
     Gpu(VkInstance instance, VkPhysicalDevice physical, VkDevice d, uint32_t family,
         PFN_vkGetInstanceProcAddr gipa, PFN_vkGetDeviceProcAddr gdpa) : device(d) {
@@ -44,7 +44,7 @@ struct Gpu {
         LOAD(vkCreateCommandPool); LOAD(vkDestroyCommandPool); LOAD(vkAllocateCommandBuffers);
         LOAD(vkResetCommandBuffer); LOAD(vkBeginCommandBuffer); LOAD(vkEndCommandBuffer);
         LOAD(vkGetDeviceQueue); LOAD(vkQueueSubmit); LOAD(vkQueueWaitIdle);
-        LOAD(vkCmdPipelineBarrier); LOAD(vkCmdCopyBufferToImage); LOAD(vkCmdCopyImageToBuffer);
+        LOAD(vkCmdPipelineBarrier); LOAD(vkCmdCopyBufferToImage); LOAD(vkCmdCopyImageToBuffer); LOAD(vkCmdCopyImage);
 #undef LOAD
         auto props = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(gipa(instance,"vkGetPhysicalDeviceMemoryProperties"));
         props(physical,&memory);
@@ -185,7 +185,19 @@ int ngx_gpu_tests(VkInstance instance,VkPhysicalDevice physical,VkDevice device,
                 z[p]=object?.5f:.99f; mv[p*2]=object?0xcc00:0; // half(-16)
             }
             g.upload(color,rgba.data(),rgba.size()); g.upload(depth,z.data(),z.size()*4); g.upload(motion,mv.data(),mv.size()*2);
-            NgxbGenerate f{}; f.color=g.images[color].api; f.output=g.images[result].api; f.real=g.images[real].api;
+            // Match the host: MFG retains one real endpoint explicitly and
+            // leaves optional OutputReal unset for the entire index sequence.
+            if (count > 1) {
+                g.begin(); g.barrier();
+                VkImageCopy copy{};
+                copy.srcSubresource=copy.dstSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};
+                copy.extent={w,h,1};
+                g.vkCmdCopyImage(g.cmd,g.images[color].api.image,VK_IMAGE_LAYOUT_GENERAL,
+                                g.images[real].api.image,VK_IMAGE_LAYOUT_GENERAL,1,&copy);
+                g.barrier(); g.submit();
+            }
+            NgxbGenerate f{}; f.color=g.images[color].api; f.output=g.images[result].api;
+            if (count == 1) f.real=g.images[real].api;
             f.depth=g.images[depth].api; f.motion=g.images[motion].api; f.disable_interpolation=g.staging;
             f.reset=frame==0 || frame==10;
             f.camera.near_plane=.1f; f.camera.far_plane=1000; f.camera.vertical_fov=1;
@@ -204,7 +216,7 @@ int ngx_gpu_tests(VkInstance instance,VkPhysicalDevice physical,VkDevice device,
             if (index==1) disabled=*static_cast<uint32_t*>(g.mapped)!=0;
             if (f.reset && !disabled) throw std::runtime_error("FG did not suppress interpolation on a history reset");
             auto copied_real=g.read(real,rgba.size());
-            if (copied_real != rgba) throw std::runtime_error("FG OutputReal did not preserve the rendered frame");
+            if (copied_real != rgba) throw std::runtime_error("FG real endpoint did not preserve the rendered frame");
             if (frame<3 || disabled) { std::printf("FG frame %d: disabled=%d\n",frame,disabled); continue; }
             auto output=g.read(result,rgba.size());
             double error_mid=0,error_prev=0,error_current=0,error_other=0;
@@ -227,7 +239,7 @@ int ngx_gpu_tests(VkInstance instance,VkPhysicalDevice physical,VkDevice device,
         if (verified<int(6*count)) throw std::runtime_error("generated images did not consistently reconstruct distinct temporal positions");
         if (verified_after_reset<int(3*count)) throw std::runtime_error("FG did not recover its interpolation history after reset");
         std::printf("PASS FG %ux: %d distinct generated images verified at their temporal positions\n",count+1,verified);
-        std::puts("PASS FG: reset suppresses interpolation, history recovers, OutputReal preserves every input frame");
+        std::puts("PASS FG: reset suppresses interpolation, history recovers, real endpoint preserves every input frame");
         }
         return 0;
     } catch (const std::exception& e) { ngxb_fg_release(); ngxb_release(); std::printf("FAIL: %s\n",e.what()); return 1; }

@@ -366,6 +366,13 @@ bool FrameGenerator::evaluate(VkCommandBuffer cmd, VkImage color_image, VkImageV
     crop.extent = {width, height, 1};
     vkCmdCopyImage(cmd, color_image, VK_IMAGE_LAYOUT_GENERAL, frame.input.image,
                    VK_IMAGE_LAYOUT_GENERAL, 1, &crop);
+    // MFG evaluates every temporal position with identical inputs. OutputReal
+    // is optional: retain the real endpoint once instead of having NGX copy
+    // it again for each generated position. The slot's lease protects both
+    // retained images until the compositor retires its last read.
+    if (generated_count_ > 1)
+        vkCmdCopyImage(cmd, color_image, VK_IMAGE_LAYOUT_GENERAL, frame.real_copy.image,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &crop);
     (void)color_view;
     (void)color_format;
 
@@ -380,7 +387,8 @@ bool FrameGenerator::evaluate(VkCommandBuffer cmd, VkImage color_image, VkImageV
 
     NgxbGenerate gen{};
     gen.color = {frame.input.image, frame.input.view, frame.input.format, width, height, VK_IMAGE_ASPECT_COLOR_BIT};
-    gen.real = {frame.real_copy.image, frame.real_copy.view, frame.real_copy.format, width, height, VK_IMAGE_ASPECT_COLOR_BIT};
+    if (generated_count_ == 1)
+        gen.real = {frame.real_copy.image, frame.real_copy.view, frame.real_copy.format, width, height, VK_IMAGE_ASPECT_COLOR_BIT};
     gen.depth = {guides.depth, guides.depth_view, guides.depth_format, guides.width, guides.height, VK_IMAGE_ASPECT_COLOR_BIT};
     gen.motion = {guides.motion, guides.motion_view, guides.motion_format, guides.width, guides.height, VK_IMAGE_ASPECT_COLOR_BIT};
     if (guides.hudless) {

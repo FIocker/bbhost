@@ -819,9 +819,22 @@ bool present_swapchain_image(const PresentSourceImage& source, int buffer_index,
         }
     }
     const auto t_flushed = std::chrono::steady_clock::now();
-    present_step("taking the renderer lock");
-    host_gpu_lock();
-    bool locked = true;
+    // Leased FG images and the compositor's command/descriptor resources are
+    // owned by this presenter, serialized by g_vk.mu and the previous fence.
+    // They do not touch the renderer's mutable display-image cache. Waiting
+    // for its recording mutex on every subframe needlessly couples MFG to
+    // the next real frame. Swapchain rebuilds above still take both locks;
+    // overlay/font uploads retain their own queue serialization.
+    const bool independent = source.generated_output && source.image && g_vk.present_queue && !submit_renderer_work;
+    static const bool force_renderer_lock = [] {
+        const char* e = std::getenv("BBHOST_FG_PRESENT_LOCK");
+        return e && e[0] == '1';
+    }();
+    bool locked = !independent || force_renderer_lock;
+    if (locked) {
+        present_step("taking the renderer lock");
+        host_gpu_lock();
+    }
     struct Unlock {
         bool& locked;
         ~Unlock() {
@@ -1066,13 +1079,14 @@ bool present_swapchain_image(const PresentSourceImage& source, int buffer_index,
     // queue. Putting their blits behind newer game renders delays every
     // subframe by that entire renderer backlog. The ready semaphore carries
     // memory visibility from NGX on the renderer queue to this queue.
-    const bool independent = source.generated_output && g_vk.present_queue;
     const std::uint64_t ticket = source.generated_output ? 0 :
         host_gpu_submit_presenter(g_vk.cmd, source.ready ? source.ready : (by_fence ? nullptr : acquire_sem),
             source.ready ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : wait_stage, rendered, g_vk.fence);
     if (independent) {
-        host_gpu_unlock();
-        locked = false;
+        if (locked) {
+            host_gpu_unlock();
+            locked = false;
+        }
         if (vkQueueSubmit(g_vk.present_queue, 1, &si, g_vk.fence) != VK_SUCCESS) return false;
     } else if (ticket) {
         host_gpu_unlock();

@@ -29,6 +29,19 @@ queue where available. Leases last through the final compositor fence,
 keeping inputs and outputs alive until their consumers finish. Missing or
 unmatched guides retain ordinary presentation.
 
+The leased-image compositor records without taking the renderer's global
+recording mutex when it has a separate presentation queue. Its command buffer,
+descriptors and image views stay serialized by the presenter mutex and its
+previous fence. Swapchain rebuilds retain renderer/queue locks, and font
+uploads retain queue serialization. Guest display-image lookups still take
+the renderer mutex. `BBHOST_FG_PRESENT_LOCK=1` restores that mutex for A/B checks.
+
+For 3x/4x, the producer retains the real endpoint once before evaluation.
+Optional NGX OutputReal stays unset for the entire consecutive-index sequence;
+the source inputs remain identical for all generated positions. 2x retains
+the SDK's OutputReal path. The GPU fixture checks the exact real endpoint on
+both paths.
+
 GPU timestamps estimate source cadence. A filtered phase rejects isolated
 completion/evaluation jitter and follows sustained rendering-load changes.
 The simulation floor applies after cadence estimation: clamping each sample
@@ -57,7 +70,7 @@ fourteen 2x midpoints, twenty-eight 3x thirds and forty-two 4x quarters against
 their expected temporal positions. It checks reset recovery and exact OutputReal
 preservation. These are pixel checks, not FPS counters.
 
-PresentMon 2.6.0 comparisons use foreground gameplay on an otherwise idle GPU,
+Earlier PresentMon 2.6.0 comparisons use foreground gameplay on an otherwise idle GPU,
 with the external NVIDIA Control Panel limit unchanged at 116 FPS. Same-save
 runs exclude the first 60 seconds for startup/warmup and the last shutdown
 second. The presentation surface is 1920x1080; GPU-bound native DLAA requests
@@ -82,6 +95,69 @@ the old filter, output sets backed up and display rate fell to 14-40 FPS.
 The unbiased, bounded phase fix removes the sustained collapse in the repeated
 sweep. Ordinary loading/shader hitches can still occur; FG cannot supply new
 source images through a loading gap.
+
+### Uncapped driver tests, 9 October 2026
+
+The external driver FPS limit was removed for these tests. The same RTX 5080
+and driver use a 119.88 Hz display, with IMMEDIATE presentation and driver
+V-Sync off. Same-save foreground camera sweeps use the 70-109 second window
+of 110 second runs, excluding startup, capture and shutdown. Object motion
+is enabled throughout; native DLAA requests about 7.0 megapixels and reaches
+96-97% GPU utilization in the load comparison.
+
+With the driver's automatic/native path, PresentMon reports Composed Copy
+with GPU GDI. A 30->60 run has clean submission spacing but display intervals
+quantized around 8.34/16.68/25.03 ms, with a 25.05 ms p99. Selecting NVIDIA
+Control Panel's per-application **Vulkan/OpenGL present method -> Prefer
+layered on DXGI swapchain** gives Hardware Composed Independent Flip. The
+updated 30->60 repeat reaches 60.00 display changes/s, no missing intervals
+and an 18.82 ms p99. This driver configuration is separate from the code fix;
+the host does not automatically rewrite driver settings.
+
+Restoring the renderer mutex with `BBHOST_FG_PRESENT_LOCK=1` reproduces uneven
+4x submissions while retaining the same average source rate: the first
+control measures 53.4 source FPS with 12.18 ms p99 submission spacing, versus
+53.1 source FPS and 7.22 ms without the mutex. At four presentations per
+source frame the old path spends about 2.6 ms per presentation waiting for
+the next game's recording. The revised path's measured mutex wait is zero.
+
+An alternating repeat gives 13.44 ms p99 submissions with the mutex and
+8.73 ms without it; source rates remain 53.4 and 53.2 FPS. Both rounds support
+the pacing improvement without claiming a higher real rendering rate.
+
+| Updated path | Real source | Display changes/s | p99 display interval |
+| --- | ---: | ---: | ---: |
+| Quality, 2x, selected 30 FPS | 30.0 | 60.00 | 18.82 ms |
+| Quality, 2x, selected 60 FPS | 60.0 | 119.99 | 10.82 ms |
+| Quality, experimental 3x, selected 30 FPS | 30.0 | 90.00 | 12.58 ms |
+| Native DLAA, FG off | 57.0 | 56.97 | 27.15 ms |
+| Native DLAA, 2x | 51.3 | 101.95 | 13.46 ms |
+| Native DLAA, experimental 3x | 47.3 | 141.15 | 11.14 ms |
+| Native DLAA, experimental 4x | 43.7 | 173.05 | 10.13 ms |
+
+These measured windows contain no rows missing display intervals. The 2x
+GPU trace contains no expired generated positions at either selected cap
+or under the native-DLAA load. The extra GPU cost remains: generation reduces
+real rendering throughput relative to the same workload with FG off.
+
+The 4x-at-30 comparison before the compositor mutex change reached 120.00
+display changes/s with no missing intervals and a 10.48 ms p99; it used the
+single retained real endpoint. It establishes working interpolation at that
+source rate, not final-path or full-session certification.
+
+The [aggregate capture data](data/dlss-fg-uncapped-2026-10-09.csv) retain
+submission and display-change percentiles separately, including both rounds
+of the compositor-mutex comparison. CSV percentiles use linear interpolation.
+GPU source/evaluation statistics use the last 39 seconds through one second
+before the final source timestamp, approximately the same gameplay window;
+FG-off source cadence is inferred from its one-present-per-real-frame path.
+One native-DLAA 4x capture lost foreground near its end and was excluded;
+the replacement capture retains foreground throughout the measured window.
+
+Display-change rates above 119.88 Hz can include torn scanouts. They are useful
+for finding submission stalls, but do not demonstrate complete 180/240 Hz
+output on this display. Higher factors remain experimental; no driver FPS
+limit is reapplied by the implementation.
 
 ### Experimental higher factors
 
@@ -112,6 +188,11 @@ existing renderer warnings. Matching NVIDIA Vulkan DLSS-G hazards are tracked
 in [Streamline issue #84](https://github.com/NVIDIA-RTX/Streamline/issues/84).
 They are recorded, not suppressed; clean synchronization validation is not
 claimed. Broader hardware, window-mode and long-session testing remain necessary.
+The uncapped 4x-at-30 synchronization-validation pair with the renderer mutex
+restored/omitted reports the same five diagnostic IDs in complete layer-log
+captures, including the runtime's clear-after-layout-transition write hazard
+on `nv.ngx.dlssg.resource`. No new diagnostic ID appears in that comparison;
+this is not a clean validation pass.
 An oversized stress test exhausted the game's direct-memory allocation and
 produced no generated presentations; it is excluded from FG results.
 This is not a Reflex/latency certification.
@@ -125,9 +206,11 @@ SDK/runtime binaries and game files are not included in the source.
 interpolation and GPU readback.
 
 Capture PresentMon CSVs with display tracking, then run
-`python tools/win/analyze_presentmon.py capture.csv --after-ms 60000`.
+`python tools/win/analyze_presentmon.py capture.csv --after-ms 60000 --refresh-hz 120`.
 Choose a gameplay-only interval and retain undisplayed rows. Distinct temporal
-pixels and actual display cadence need separate verification.
+pixels and actual display cadence need separate verification. In IMMEDIATE
+mode, display changes above the physical refresh rate can include torn
+scanouts; they do not establish that many complete displayed frames.
 
 `BBHOST_FG_SMOOTH=0` and `BBHOST_FG_LATE_PACE=0` restore the previous timing
 for A/B comparisons. `BBHOST_FG_TIMING=1` logs GPU anchors, period,
