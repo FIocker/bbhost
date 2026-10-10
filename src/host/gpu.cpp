@@ -4154,13 +4154,31 @@ std::uint64_t g_heap_host = 0;  // images placed in host memory for want of vide
 // The image heap's placement in memory type `type`: a free range in one of
 // its blocks; else, when `grow`, a new block, or memory of its own for an
 // image too large for one.
+// Blocks are tried fullest first: new images go where the heap is already
+// dense, so the emptier blocks drain as the game frees what they hold and the
+// keeper can give them back. First fit in block order kept every block a
+// little used - after ten places 9 blocks (2.3 GiB) for 1.2-1.9 GiB of
+// images. BBHOST_HEAP_FULLEST=0: block order, as before.
+const bool g_heap_fullest = [] {
+    const char* e = std::getenv("BBHOST_HEAP_FULLEST");
+    return !(e && e[0] == '0');
+}();
+
 bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool grow, ImageMemory& out) {
     const VkDeviceSize align = std::max<VkDeviceSize>(req.alignment, 256);
     if (req.size <= kHeapLargest) {
         for (int pass = 0; pass < 2; ++pass) {
+            thread_local std::vector<std::size_t> order;
+            order.clear();
             for (std::size_t k = 0; k < g_heap.size(); ++k) {
+                const HeapBlock& b = g_heap[k];
+                if (b.memory != VK_NULL_HANDLE && b.type == type && kHeapBlock - b.used >= req.size) order.push_back(k);
+            }
+            if (g_heap_fullest) {
+                std::stable_sort(order.begin(), order.end(), [](std::size_t a, std::size_t c) { return g_heap[a].used > g_heap[c].used; });
+            }
+            for (const std::size_t k : order) {
                 HeapBlock& b = g_heap[k];
-                if (b.memory == VK_NULL_HANDLE || b.type != type) continue;
                 for (auto it = b.free.begin(); it != b.free.end(); ++it) {
                     const VkDeviceSize at = (it->first + align - 1) & ~(align - 1);
                     if (at + req.size > it->first + it->second) continue;
