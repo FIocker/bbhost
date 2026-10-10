@@ -47,9 +47,10 @@ confirm button every 2 s until the world's first frame (the test request
 `menutap confirm`, which bbhost carries out only while one of the game's menus
 has the input), so it reaches the title whenever the title comes: a build's
 first start compiles its shader caches before it. At each place the probe travels to a lamp the way the
-Hunter's Dream headstones do, moves to the place's view, switches off the
-ordinary enemies within 40 m, puts the camera behind the player and holds
-still:
+Hunter's Dream headstones do - done once the player stands still in the
+place's map with the loading screen gone -, moves to the place's view,
+switches off the ordinary enemies within 40 m, puts the camera behind the
+player and holds still:
 
 1. a settle (15 s): streaming and the first compiles;
 2. the window (20 s): what the place costs;
@@ -60,6 +61,17 @@ places and captures the first draw of up to six pixel shaders at each that
 earlier places did not capture; `tools/lift_verify.py` replays each with the
 lifted pixel shader and with the translated one and compares the outputs byte
 for byte. Captures stall the GPU, which is why they get a session of their own.
+
+A place counts as measured only where the player was: each of the probe's
+marks (the arrival, the window's start and end) must be in the place's map, a
+view's within 3 m of its standpoint, and from the arrival on the player must
+not die, be placed in a map again (a respawn, or a bounce out of an area the
+game would not keep the player in), meet a loading screen in the window or
+move more than 3 m across (5 m up or down). A place that fails one of these
+says why in its status - `not there: m21_00_00_00 at the measure mark`,
+`died in the window`, `moved 40 m in the window` - and is left out of an
+A/B's numbers. The settle a place had is counted from the loading screen's
+end.
 
 For each place the report says:
 

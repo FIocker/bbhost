@@ -56,8 +56,19 @@ def mapval(fmt, *args):
     return "[bbhost] plugin: " + (fmt % args)
 
 
-def area_lines(area, t, block, window_intervals, view=None, settle_events=(), dump_dir="frames", kind="perf", captures=()):
-    """A place's lines as the probe and the host print them."""
+def mark(area, name, t, block, at, hp=None, loading=0):
+    """A mark line; `hp` given: as a probe that logs HP and the loading screen prints it."""
+    line = "mapval mark %s %.3f %s %.3f %.3f %.3f yaw %.3f" % (area.id + ":" + name, t, block, at[0], at[1], at[2], 0.5)
+    if hp is not None:
+        line += " hp %d loading %d" % (hp, loading)
+    return mapval("%s", line)
+
+
+def area_lines(area, t, block, window_intervals, view=None, settle_events=(), dump_dir="frames", kind="perf", captures=(),
+               window_events=(), at=None, hp=None):
+    """A place's lines as the probe and the host print them. The player stands
+    at the view, or where the travel put it."""
+    at = at or (view[:3] if view else (1.0, 2.0, 3.0))
     out = [mapval("mapval step %d travel %s %.3f return point %d block %s -> %s", 1, area.id, t, area.return_point, block, "queued"),
            "[bbhost] loading: begins, flip 1000", "[bbhost] loading: %.2f s (flips %d-%d, %d of them not shown)" % (3.25, 1000, 1200, 10),
            mapval("mapval travel-done %s %.3f %s %.3f %.3f %.3f after %.1f s", area.id, t + 6, block, 1.0, 2.0, 3.0, 6.0)]
@@ -66,26 +77,28 @@ def area_lines(area, t, block, window_intervals, view=None, settle_events=(), du
         out.append(mapval("mapval at %s %.3f %s %.3f %.3f %.3f yaw %.3f", area.id + ":view", t + 7.5, block, view[0], view[1], view[2], view[3]))
     out.append(mapval("mapval quiet %.3f %d enemies within %.0f m switched off, %d other characters left", t + 8, 3, 40.0, 1))
     out.append(mapval("mapval camera %.3f %s", t + 8, "reset"))
-    out.append(mapval("mapval mark %s %.3f %s %.3f %.3f %.3f yaw %.3f", area.id + ":arrived", t + 8, block, 1.0, 2.0, 3.0, 0.5))
+    out.append(mark(area, "arrived", t + 8, block, at, hp))
     out.extend(second([16.67] * 60))  # a settle second
     out.extend(settle_events)
     if kind == "perf":
-        out.append(mapval("mapval mark %s %.3f %s %.3f %.3f %.3f yaw %.3f", area.id + ":measure", t + 23, block, 1.0, 2.0, 3.0, 0.5))
-        for iv in window_intervals:
+        out.append(mark(area, "measure", t + 23, block, at, hp))
+        for k, iv in enumerate(window_intervals):
             out.extend(second(iv))
-        out.append(mapval("mapval mark %s %.3f %s %.3f %.3f %.3f yaw %.3f", area.id + ":measured", t + 43, block, 1.0, 2.0, 3.0, 0.5))
+            if k == len(window_intervals) // 2:
+                out.extend(window_events)
+        out.append(mark(area, "measured", t + 43, block, at, hp))
         for k in "ab":
             out.append(mapval("mapval dump %s %.3f", "%s-%s" % (area.id, k), t + 44))
             out.append("[bbhost] test: frame dump at flip %d to %s/%s-%s.ppm" % (5000, dump_dir, area.id, k))
     else:
         out.append(mapval("mapval capture %d %s %.3f", 6, area.id, t + 18))
         out.append("[bbhost] test: draw captures armed for %d at flip %d into %s" % (6, 4000, "/c/" + area.id))
-        out.append(mapval("mapval mark %s %.3f %s %.3f %.3f %.3f yaw %.3f", area.id + ":capture", t + 18, block, 1.0, 2.0, 3.0, 0.5))
+        out.append(mark(area, "capture", t + 18, block, at, hp))
         for name in captures:
             out.append("[bbhost] capture: wrote %s/manifest.json (%s, flip %d, draw %d, %d blobs, %d bytes)" % (
                 "/c/%s/%s-f4001-d9" % (area.id, name), name, 4001, 9, 40, 50000000))
         out.append("[bbhost] capture: %s draw %d (flip %d) not captured: %s" % ("aaaa0000+bbbb0000", 12, 4002, "indirect draw: its arguments are GPU data"))
-    out.append(mapval("mapval mark %s %.3f %s %.3f %.3f %.3f yaw %.3f", area.id + ":end", t + 47, block, 1.0, 2.0, 3.0, 0.5))
+    out.append(mark(area, "end", t + 47, block, at, hp))
     return out
 
 
@@ -392,6 +405,118 @@ class LogTest(unittest.TestCase):
         lines = [l for l in lines if "mapval at " not in l]
         self.assertEqual(ac.pass_report(lines, [rom], "perf")["areas"]["moonside-lake"]["status"], "view not reached")
 
+    def test_a_place_never_reached_is_not_ok(self):
+        """The marks say where the player was: a run once read "ok" at The Old
+        Hunters' places it never reached (growth-repro r5, 2026-10-09): the
+        arrival found no player (a load), the window stood in the Hunter's
+        Dream - and at a view the player fell through a world that was not the
+        place's. These are that run's lines."""
+        fh, ac_, lw = (ac.AREA_BY_ID[k] for k in ("fishing-hamlet", "astral-clocktower", "lumenwood-garden"))
+        lines = [
+            "[bbhost] plugin: mapval step 85 travel fishing-hamlet 1791582854.413 return point 3602950 block 24000000 -> queued",
+            "[bbhost] plugin: mapval travel-done fishing-hamlet 1791582855.965 24000000 -619.200 1594.660 -817.200 after 1.6 s",
+            "[bbhost] plugin: mapval at fishing-hamlet:view 1791582860.824 24000000 -700.200 1580.517 -905.200 yaw 0.000",
+            "[bbhost] plugin: mapval mark fishing-hamlet:arrived 1791582861.528 00000000 0.000 0.000 0.000 yaw 0.000"]
+        lines += second([16.7] * 60) + second([16.7] * 60)
+        lines += ["[bbhost] plugin: mapval mark fishing-hamlet:measure 1791582876.567 15000000 -9.200 -6.771 -19.400 yaw -2.356"]
+        lines += [l for _ in range(5) for l in second([16.7] * 60)]
+        lines += ["[bbhost] plugin: mapval mark fishing-hamlet:measured 1791582896.585 15000000 -9.200 -6.771 -19.400 yaw -2.356",
+                  "[bbhost] plugin: mapval mark fishing-hamlet:end 1791582899.648 15000000 -9.200 -6.771 -19.400 yaw -2.356",
+                  "[bbhost] plugin: mapval step 100 travel astral-clocktower 1791582899.666 return point 3502950 block 23000000 -> queued",
+                  "[bbhost] plugin: mapval travel-done astral-clocktower 1791582901.064 23000000 -318.670 1553.020 -824.221 after 1.4 s",
+                  "[bbhost] plugin: mapval at astral-clocktower:view 1791582905.578 23000000 -451.000 1595.571 -824.410 yaw 1.571",
+                  "[bbhost] plugin: mapval mark astral-clocktower:arrived 1791582906.586 23000000 -451.000 1595.571 -824.410 yaw 1.571"]
+        lines += second([16.7] * 60)
+        lines += ["[bbhost] plugin: mapval mark astral-clocktower:measure 1791582921.605 15000000 -9.200 -6.771 -19.400 yaw -2.356"]
+        lines += [l for _ in range(5) for l in second([16.7] * 60)]
+        lines += ["[bbhost] plugin: mapval mark astral-clocktower:measured 1791582941.630 15000000 -9.200 -6.771 -19.400 yaw -2.356",
+                  "[bbhost] plugin: mapval mark astral-clocktower:end 1791582944.695 15000000 -9.200 -6.771 -19.400 yaw -2.356",
+                  "[bbhost] plugin: mapval step 115 travel lumenwood-garden 1791582944.711 return point 3502950 block 23000000 -> queued",
+                  "[bbhost] plugin: mapval travel-done lumenwood-garden 1791582946.191 23000000 -318.670 1553.020 -824.221 after 1.5 s",
+                  "[bbhost] plugin: mapval at lumenwood-garden:view 1791582957.231 15000000 -377.540 1577.735 -824.550 yaw 1.571",
+                  "[bbhost] plugin: mapval mark lumenwood-garden:arrived 1791582958.261 15000000 -377.540 1554.905 -824.550 yaw 1.571"]
+        lines += second([16.7] * 60)
+        lines += ["[bbhost] plugin: mapval mark lumenwood-garden:measure 1791582973.311 15000000 -377.540 826.339 -824.550 yaw 1.571"]
+        lines += [l for _ in range(5) for l in second([16.7] * 60)]
+        lines += ["[bbhost] plugin: mapval mark lumenwood-garden:measured 1791582993.328 15000000 -377.540 -177.683 -824.550 yaw 1.571",
+                  "[bbhost] plugin: mapval mark lumenwood-garden:end 1791582996.394 15000000 -377.540 -286.382 -824.550 yaw 1.571",
+                  "[bbhost] plugin: mapval tour-done 1791582999.000"]
+        rep = ac.pass_report(lines, [fh, ac_, lw], "perf")
+        st = {k: a["status"] for k, a in rep["areas"].items()}
+        self.assertEqual(st["fishing-hamlet"], "not there: no map at the arrived mark")
+        self.assertEqual(st["astral-clocktower"], "not there: m21_00_00_00 at the measure mark")
+        self.assertTrue(st["lumenwood-garden"].startswith("not there: m21_00_00_00"), st["lumenwood-garden"])
+        self.assertEqual(rep["areas"]["fishing-hamlet"]["presence"]["marks"]["measure"]["block"], "15000000")
+        # The window still has its numbers to look at; the A/B leaves them out.
+        self.assertIsNotNone(rep["areas"]["astral-clocktower"]["window"])
+        report = {"run": {}, "passes": {"perf": dict(rep)}, "areas": rep["areas"]}
+        problems = ac.problems_of(report)
+        self.assertIn("fishing-hamlet: not there: no map at the arrived mark", problems)
+
+    def test_death_load_and_movement_in_the_window(self):
+        """A death, the player placed in a map again, a loading screen or a
+        move inside the window: the place is marked, not measured as normal."""
+        cy = ac.AREA_BY_ID["central-yharnam"]
+        win = [[16.7] * 60 for _ in range(6)]
+
+        def status(**kw):
+            rep = ac.pass_report(area_lines(cy, 100.0, "18010000", win, **kw), [cy], "perf")
+            return rep["areas"]["central-yharnam"]["status"], rep["areas"]["central-yharnam"]
+
+        self.assertEqual(status()[0], "ok")
+        self.assertEqual(status(hp=500)[0], "ok")
+        st, a = status(window_events=[mapval("mapval death %.3f %s %.3f %.3f %.3f", 125.0, "18010000", 1.0, 2.0, 3.0)])
+        self.assertEqual(st, "died in the window")
+        self.assertEqual(a["presence"]["death"], "in the window")
+        # A death while settling.
+        st, _ = status(settle_events=[mapval("mapval death %.3f %s %.3f %.3f %.3f", 110.0, "18010000", 1.0, 2.0, 3.0)])
+        self.assertEqual(st, "died before the window")
+        # A probe without death lines: two seconds in a row at 0 HP.
+        zero = [mapval("mapval pos %.3f %s %.3f %.3f %.3f %.3f %d", 125.0 + k, "18010000", 1.0, 2.0, 3.0, 0.5, 0) for k in range(2)]
+        self.assertEqual(status(window_events=zero)[0], "died in the window")
+        self.assertEqual(status(window_events=zero[:1])[0], "ok")  # one reading of 0 is not a death
+        # A mark that reads no HP (a probe that logs it).
+        self.assertTrue(status(hp=0)[0].startswith("died"))
+        # Placed in a map again: a respawn or a bounce out of the area.
+        st, _ = status(window_events=[mapval("mapval placed %.3f %s", 126.0, "18010000")])
+        self.assertEqual(st, "placed in a map again in the window")
+        # A loading screen in the window, from the host or the probe.
+        self.assertEqual(status(window_events=["[bbhost] loading: begins, flip 9000"])[0], "a loading screen in the window")
+        self.assertEqual(status(window_events=[mapval("mapval loading-begins %.3f", 126.0)])[0], "a loading screen in the window")
+        # A fall: a second of the window 20 m below.
+        fall = [mapval("mapval pos %.3f %s %.3f %.3f %.3f %.3f %d", 126.0, "18010000", 1.0, -18.0, 3.0, 0.5, 500)]
+        st, a = status(window_events=fall)
+        self.assertEqual(st, "moved 20 m in the window")
+        self.assertEqual(a["presence"]["moved_m"], [0.0, 20.0])
+        # A step aside is nothing.
+        step = [mapval("mapval pos %.3f %s %.3f %.3f %.3f %.3f %d", 126.0, "18010000", 2.0, 2.0, 3.5, 0.5, 500)]
+        self.assertEqual(status(window_events=step)[0], "ok")
+
+    def test_view_and_settle(self):
+        """A view's place measured away from its standpoint is not the view;
+        the settle that was had counts from the loading screen's end."""
+        rom = ac.AREA_BY_ID["moonside-lake"]
+        v = rom.view()
+        win = [[16.7] * 60 for _ in range(4)]
+        rep = ac.pass_report(area_lines(rom, 100.0, "20000000", win, view=v), [rom], "perf")
+        a = rep["areas"]["moonside-lake"]
+        self.assertEqual(a["status"], "ok")
+        self.assertEqual(a["presence"]["view_off_m"], 0.0)
+        self.assertEqual(a["presence"]["settle_s"], 15.0)  # arrived at 108, the window at 123
+        self.assertNotIn("loading_after_arrival", a["presence"])
+        away = (v[0] + 8.0, v[1], v[2], v[3])
+        rep = ac.pass_report(area_lines(rom, 100.0, "20000000", win, view=v, at=away[:3]), [rom], "perf")
+        self.assertEqual(rep["areas"]["moonside-lake"]["status"], "not at the view (8 m from it)")
+        # The loading screen still up at the arrival: it ended at 113.
+        late = [mapval("mapval loading-ends %.3f after %.1f s", 113.0, 9.0)]
+        rep = ac.pass_report(area_lines(rom, 100.0, "20000000", win, view=v, settle_events=late), [rom], "perf")
+        p = rep["areas"]["moonside-lake"]["presence"]
+        self.assertEqual(p["settle_s"], 10.0)
+        self.assertTrue(p["loading_after_arrival"])
+        # The travel says how long its loading screen was up.
+        line = mapval("mapval travel-done %s %.3f %s 1.000 2.000 3.000 after %.1f s, %.1f s of it loading", rom.id, 9.0, "20000000", 9.0, 6.5)
+        self.assertEqual(ac.Log([line]).events[0][2]["loading_s"], 6.5)
+
     def test_capture_pass(self):
         cy = ac.AREA_BY_ID["central-yharnam"]
         lines = area_lines(cy, 10.0, "18010000", [], kind="capture", captures=["8747a367+a22c7f71", "1234abcd+6c5edb96"])
@@ -545,6 +670,19 @@ class CompareTest(unittest.TestCase):
         self.assertIn("GPU busy ms/s better", "\n".join(ab["improved"]))
         self.assertIn("flagged:", ac.ab_text(ab))
 
+    def test_places_not_measured_leave_the_numbers(self):
+        """A visit that did not measure the place (a death, the wrong map) is
+        out of the A/B's numbers and named in its flags."""
+        a = [self.report(60.0, 17.0, 400, 0.70), self.report(59.9, 17.1, 410, 0.70)]
+        b = [self.report(30.0, 40.0, 900, 0.70, status="died in the window"), self.report(59.8, 17.0, 405, 0.70),
+             self.report(59.9, 17.1, 400, 0.70)]
+        ab = ac.compare_reports(a, b)
+        e = ab["areas"]["central-yharnam"]
+        self.assertEqual(e["perf"]["fps"]["b"], [59.8, 59.9])
+        self.assertEqual(e["perf"]["fps"]["verdict"], "within noise")
+        self.assertEqual(e["status"]["b"], ["died in the window", "ok", "ok"])
+        self.assertTrue(any("not measured in every run" in f for f in ab["flagged"]))
+
     def test_summary_text(self):
         lines, _ = LogTest().run_lines()
         perf = ac.pass_report(lines, ac.pick_areas("central-yharnam,moonside-lake"), "perf")
@@ -575,6 +713,7 @@ def log(s):
 log("bbhost v9.9.9-test (abc, Linux x86-64)")
 log("world: the first in-game frame, flip 900, 30.0 s after start")
 t, flip, block, step = 1000.0, 1000, "15000000", 0
+at = ["1.000", "2.000", "3.000"]
 def second(fps=60):
     iv = [1000.0 / fps] * fps
     log("frames: 1.00 s: %d flips (%.1f/s), displayed %.1f/s, interval avg 16.7 p95 16.7 max 16.7 ms, 0 over 16.7, 0 over 33.3; "
@@ -593,18 +732,21 @@ for line in tour:
         log("loading: 3.00 s (flips %d-%d, 0 of them not shown)" % (flip, flip + 90))
         log("render: PS %08x lifted (100 words; translated 200)" % (step,))
         t += 6
-        log("mapval travel-done %s %.3f %s 1.000 2.000 3.000 after 6.0 s" % (w[3], t, block))
+        log("mapval travel-done %s %.3f %s 1.000 2.000 3.000 after 6.0 s, 3.0 s of it loading" % (w[3], t, block))
+        at = ["1.000", "2.000", "3.000"]
     elif w[0] == "warp":
         log("mapval at %s %.3f %s %s %s %s yaw %s" % (w[1], t, block, w[2], w[3], w[4], w[5]))
+        at = w[2:5]
     elif w[0] == "quiet":
         log("mapval quiet %.3f 2 enemies within %s m switched off, 0 other characters left" % (t, w[1]))
     elif w[0] == "camera":
         log("mapval camera %.3f reset" % t)
     elif w[0] == "mark":
-        log("mapval mark %s %.3f %s 1.000 2.000 3.000 yaw 0.500" % (w[1], t, block))
+        log("mapval mark %s %.3f %s %s %s %s yaw 0.500 hp 500 loading 0" % (w[1], t, block, at[0], at[1], at[2]))
     elif w[0] == "hold":
         for _ in range(int(float(w[1]) + 0.5)):
             second()
+            log("mapval pos %.3f %s %s %s %s 0.500 500" % (t, block, at[0], at[1], at[2]))
             t += 1
             flip += 60
     elif w[0] == "dump":

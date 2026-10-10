@@ -46,6 +46,12 @@ for the arrival (the travel and the settle): the loads, pipeline compiles over
 shaders met for the first time there, lifted or not and why; the frames; and
 the lift results. report.json holds all of it, summary.txt the same to read.
 
+A place counts only where the player was (presence): every mark in the
+place's map, a view's within VIEW_REACH of its standpoint, and from the
+arrival on no death, no new placing in a map, no loading screen in the window
+and no move past STAY_ACROSS / STAY_UP. A place that fails says why in its
+status and stays out of an A/B's numbers.
+
 `ab` runs A and B alternately for --rounds rounds (2: the second round of
 each build is the noise floor) - perf passes every round, the capture pass in
 the first - and compares: a difference counts only where it is larger than the
@@ -105,6 +111,14 @@ STAND_REACH = 50.0
 # comes - a new build's first start compiles its shader caches before it.
 TITLE_TAP_FIRST_S = 5.0
 TITLE_TAP_EVERY_S = 2.0
+# Where the player must stay for a place's numbers to count: within STAY_ACROSS
+# metres (and STAY_UP up or down) of where it stood at the arrival, through the
+# window, and within VIEW_REACH of a view's standpoint. A player held still
+# moves ~0.02 m (482 visits of earlier runs); a fall, a slide or a respawn
+# elsewhere moved 16-900 m.
+STAY_ACROSS = 3.0
+STAY_UP = 5.0
+VIEW_REACH = 3.0
 
 
 # --- the places ---------------------------------------------------------------
@@ -325,9 +339,16 @@ INTERVALS = re.compile(r"\] frame intervals ms:((?: [\d.]+)+)\s*$")
 # The probe's lines, as bbhost logs a plugin's ("plugin: <line>", host/plugins.cpp).
 PROBE = r"\] (?:plugin: )?mapval "
 TRAVEL = re.compile(PROBE + r"step \d+ travel (\S+) ([\d.]+) return point (\d+) block ([0-9a-f]+) -> (\w+)")
-TRAVEL_DONE = re.compile(PROBE + r"travel-done (\S+) ([\d.]+) ([0-9a-f]+) \S+ \S+ \S+ after ([\d.]+) s")
+TRAVEL_DONE = re.compile(PROBE + r"travel-done (\S+) ([\d.]+) ([0-9a-f]+) \S+ \S+ \S+ after ([\d.]+) s(?:, ([\d.]+) s of it loading)?")
 TRAVEL_FAILED = re.compile(PROBE + r"travel-failed (\S+) ([\d.]+) in ([0-9a-f]+) after ([\d.]+) s")
-MARK = re.compile(PROBE + r"mark (\S+?):(\w+) ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+) yaw (\S+)")
+MARK = re.compile(PROBE + r"mark (\S+?):(\w+) ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+) yaw (\S+)(?: hp (-?\d+) loading (\d))?")
+# Once a second, where the player is (block, x y z, yaw, HP); and as they
+# happen, a death, the player placed in a map (a load, a respawn, a lamp) and
+# the loading screen coming and going, each with the probe's clock.
+POS = re.compile(PROBE + r"pos ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+) (\S+) (-?\d+)")
+DEATH = re.compile(PROBE + r"death ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+)")
+PLACED = re.compile(PROBE + r"placed ([\d.]+) ([0-9a-f]+)")
+PROBE_LOADING = re.compile(PROBE + r"loading-(begins|ends) ([\d.]+)")
 AT = re.compile(PROBE + r"at (\S+?):view ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+)")
 REWARP = re.compile(PROBE + r"rewarp ")
 RETRAVEL = re.compile(PROBE + r"retravel ")
@@ -337,6 +358,7 @@ DUMP_DONE = re.compile(r"\] test: frame dump at flip (\d+) to (\S+?)( failed)?\s
 CAPTURE_WROTE = re.compile(r"\] capture: wrote (\S+)/manifest\.json \((\S+), flip (\d+)")
 CAPTURE_REJECTED = re.compile(r"\] capture: (\S+) draw \d+ \(flip \d+\) not captured: (.*?)\s*$")
 LOADING = re.compile(r"\] loading: ([\d.]+) s \(flips")
+LOAD_BEGINS = re.compile(r"\] loading: begins, flip (\d+)")
 SLOW_PIPELINE = re.compile(r"\] render: slow pipeline (?!library )\S+.*vkCreateGraphicsPipelines (\d+) ms")
 SLOW_LIBRARY = re.compile(r"\] render: slow pipeline library .*?: (\d+) ms")
 STALL = re.compile(r"\] stall: flip #\d+ came (\d+) ms after")
@@ -416,20 +438,33 @@ class Log:
                 self.seconds[-1][1]["intervals"].extend(float(v) for v in m.group(1).split())
                 return
         if "mapval " in line and PROBE_LINE.search(line):
-            for kind, rx in (("travel", TRAVEL), ("travel_done", TRAVEL_DONE), ("travel_failed", TRAVEL_FAILED),
-                             ("mark", MARK), ("at", AT), ("quiet", QUIET), ("camera", CAMERA)):
+            for kind, rx in (("pos", POS), ("travel", TRAVEL), ("travel_done", TRAVEL_DONE), ("travel_failed", TRAVEL_FAILED),
+                             ("mark", MARK), ("at", AT), ("quiet", QUIET), ("camera", CAMERA), ("death", DEATH),
+                             ("placed", PLACED), ("probe_loading", PROBE_LOADING)):
                 m = rx.search(line)
                 if m:
-                    if kind == "travel":
+                    if kind == "pos":
+                        self._ev(i, kind, t=float(m.group(1)), block=m.group(2), pos=[float(m.group(k)) for k in (3, 4, 5)],
+                                 hp=int(m.group(7)))
+                    elif kind == "travel":
                         self._ev(i, kind, area=m.group(1), t=float(m.group(2)), return_point=int(m.group(3)),
                                  block=m.group(4), queued=m.group(5) == "queued")
                     elif kind == "travel_done":
-                        self._ev(i, kind, area=m.group(1), t=float(m.group(2)), block=m.group(3), seconds=float(m.group(4)))
+                        self._ev(i, kind, area=m.group(1), t=float(m.group(2)), block=m.group(3), seconds=float(m.group(4)),
+                                 loading_s=float(m.group(5)) if m.group(5) else None)
                     elif kind == "travel_failed":
                         self._ev(i, kind, area=m.group(1), t=float(m.group(2)), block=m.group(3), seconds=float(m.group(4)))
                     elif kind == "mark":
                         self._ev(i, kind, area=m.group(1), name=m.group(2), t=float(m.group(3)), block=m.group(4),
-                                 pos=[float(m.group(k)) for k in (5, 6, 7)], yaw=float(m.group(8)))
+                                 pos=[float(m.group(k)) for k in (5, 6, 7)], yaw=float(m.group(8)),
+                                 hp=int(m.group(9)) if m.group(9) is not None else None,
+                                 loading=m.group(10) == "1" if m.group(10) is not None else None)
+                    elif kind == "death":
+                        self._ev(i, kind, t=float(m.group(1)), block=m.group(2), pos=[float(m.group(k)) for k in (3, 4, 5)])
+                    elif kind == "placed":
+                        self._ev(i, kind, t=float(m.group(1)), block=m.group(2))
+                    elif kind == "probe_loading":
+                        self._ev(i, kind, begins=m.group(1) == "begins", t=float(m.group(2)))
                     elif kind == "at":
                         self._ev(i, kind, area=m.group(1), t=float(m.group(2)), block=m.group(3),
                                  pos=[float(m.group(k)) for k in (4, 5, 6)])
@@ -449,8 +484,8 @@ class Log:
                 self._ev(i, "tour_done")
             return
         for kind, rx in (("dump", DUMP_DONE), ("capture", CAPTURE_WROTE), ("capture_rejected", CAPTURE_REJECTED),
-                         ("loading", LOADING), ("slow_pipeline", SLOW_PIPELINE), ("slow_library", SLOW_LIBRARY),
-                         ("stall", STALL), ("long_frame", LONG_FRAME), ("ps_lifted", PS_LIFTED),
+                         ("loading", LOADING), ("load_begins", LOAD_BEGINS), ("slow_pipeline", SLOW_PIPELINE),
+                         ("slow_library", SLOW_LIBRARY), ("stall", STALL), ("long_frame", LONG_FRAME), ("ps_lifted", PS_LIFTED),
                          ("ps_not_lifted", PS_NOT_LIFTED), ("pipeline_failed", PIPELINE_FAILED), ("world", WORLD)):
             m = rx.search(line)
             if not m:
@@ -474,6 +509,8 @@ class Log:
                 self._ev(i, kind, pipeline=m.group(1))
             elif kind == "world":
                 self.world = {"flip": int(m.group(1)), "seconds": float(m.group(2))}
+            elif kind == "load_begins":
+                self._ev(i, kind, flip=int(m.group(1)))
             return
         m = VERSION.search(line)
         if m and not self.version:
@@ -488,6 +525,18 @@ class Log:
 
     def between(self, start, end, kinds=None):
         return [(i, k, d) for i, k, d in self.events if start < i < end and (kinds is None or k in kinds)]
+
+    def time_at(self, index):
+        """The probe's clock at a line: that of the last probe line at or
+        before it (the probe logs where the player is once a second), or
+        None before the first."""
+        t = None
+        for i, k, d in self.events:
+            if i > index:
+                break
+            if d.get("t") is not None:
+                t = d["t"]
+        return t
 
     def seconds_between(self, start, end):
         """The seconds wholly inside (start, end): the first `frames:` line after
@@ -586,6 +635,100 @@ def area_segments(log, area_ids):
     return out
 
 
+def block_name(packed):
+    """'15000000' -> 'm21_00_00_00'; '00000000' (no player) -> 'no map'."""
+    try:
+        v = int(packed, 16)
+    except (TypeError, ValueError):
+        return str(packed)
+    if not v:
+        return "no map"
+    return "m%02d_%02d_%02d_%02d" % (v >> 24, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff)
+
+
+def presence(log, area, start, end, marks, kind):
+    """Whether the player was at the place for its numbers, from the probe's
+    lines: each mark's map block (and, from probes that log them, HP and the
+    loading screen), deaths, the player placed in a map again (a respawn, a
+    bounce out of an area), loading screens, the once-a-second positions in
+    the window, the movement from the arrival on and a view's standpoint.
+    Returns (status or None, details)."""
+    want = area.block_hex()
+    evs = log.between(start, end)
+    mk = {d["name"]: (i, d) for i, k, d in evs if k == "mark" and d["area"] == area.id}
+    out = {"marks": {n: {"block": d["block"], "pos": d["pos"], "hp": d.get("hp"), "loading": d.get("loading")}
+                     for n, (i, d) in mk.items() if n in ("arrived", "measure", "measured")}}
+    a_i = mk["arrived"][0] if "arrived" in mk else start
+    w0 = mk["measure"][0] if "measure" in mk else (mk["capture"][0] if "capture" in mk else None)
+    w1 = mk["measured"][0] if "measured" in mk else (mk["end"][0] if "end" in mk else end)
+    span = "the window" if kind == "perf" else "the captures"
+
+    def when(i):
+        if w0 is None or i < w0:
+            return "before " + span
+        return "in " + span if i <= w1 else "after " + span
+
+    status = None
+    for name in ("arrived", "measure", "measured"):
+        if name in mk and mk[name][1]["block"] != want:
+            status = status or "not there: %s at the %s mark" % (block_name(mk[name][1]["block"]), name)
+    deaths = [i for i, k, d in evs if k == "death" and i > a_i]
+    pos = [(i, d) for i, k, d in evs if k == "pos" and i > a_i]
+    run = 0
+    for i, d in pos:  # a probe without death lines: two seconds in a row at 0 HP
+        run = run + 1 if d["hp"] <= 0 and d["block"] == want else 0
+        if run == 2:
+            deaths.append(i)
+    for i, d in mk.values():
+        if d.get("hp") is not None and d["hp"] <= 0 and d["block"] == want and i > a_i:
+            deaths.append(i)
+    if deaths:
+        out["death"] = when(min(deaths))
+        status = status or "died " + when(min(deaths))
+    placed = [i for i, k, d in evs if k == "placed" and i > a_i]
+    if placed:
+        out["placed_again"] = when(min(placed))
+        status = status or "placed in a map again " + when(min(placed))
+    if w0 is not None:
+        loads = [i for i, k, d in evs if (k in ("load_begins", "loading") or (k == "probe_loading")) and w0 < i < w1]
+        loads += [i for n in ("measure", "measured") if n in mk and mk[n][1].get("loading") for i in [mk[n][0]]]
+        if loads:
+            status = status or "a loading screen in " + span
+    if "arrived" in mk:
+        p0 = mk["arrived"][1]["pos"]
+        last = mk.get("measured", mk.get("end", (None, None)))[1]
+        moved = []
+        if last and last["block"] == want:
+            moved.append((math.hypot(last["pos"][0] - p0[0], last["pos"][2] - p0[2]), abs(last["pos"][1] - p0[1])))
+        if w0 is not None and "measure" in mk:
+            pm = mk["measure"][1]["pos"]
+            moved += [(math.hypot(d["pos"][0] - pm[0], d["pos"][2] - pm[2]), abs(d["pos"][1] - pm[1]))
+                      for i, d in pos if w0 < i < w1 and d["block"] == want]
+        if moved:
+            across, up = max(m[0] for m in moved), max(m[1] for m in moved)
+            out["moved_m"] = [round(across, 2), round(up, 2)]
+            if across > STAY_ACROSS or up > STAY_UP:
+                status = status or "moved %.0f m in %s" % (max(across, up), "the window" if kind == "perf" else "the visit")
+    v = area.view()
+    at_mark = mk.get("measure", mk.get("capture", mk.get("arrived")))
+    if v and at_mark and at_mark[1]["block"] == want:
+        off = math.hypot(at_mark[1]["pos"][0] - v[0], at_mark[1]["pos"][2] - v[2])
+        out["view_off_m"] = round(off, 2)
+        if off > VIEW_REACH:
+            status = status or "not at the view (%.0f m from it)" % off
+    # The settle that was had: from the last loading screen's end before the
+    # window (or the arrival) to the window.
+    if "arrived" in mk and w0 is not None:
+        t_w = mk["measure"][1]["t"] if "measure" in mk else mk["capture"][1]["t"]
+        ends = [d["t"] for i, k, d in evs if k == "probe_loading" and not d["begins"] and a_i < i < w0]
+        ends += [t for i, k, d in evs if k == "loading" and a_i < i < w0 for t in [log.time_at(i)] if t is not None]
+        t0 = max([mk["arrived"][1]["t"]] + ends)
+        out["settle_s"] = round(t_w - t0, 1)
+        if ends:
+            out["loading_after_arrival"] = True
+    return status, out
+
+
 def area_report(log, area, seg, kind):
     """One place's numbers from one pass's log."""
     start, end = seg
@@ -603,6 +746,7 @@ def area_report(log, area, seg, kind):
     rep["quiet"] = sum(d["switched_off"] for _, k, d in evs if k == "quiet")
     rep["camera"] = next((d["result"] for _, k, d in evs if k == "camera"), None)
     arrived = marks.get("arrived")
+    where, rep["presence"] = presence(log, area, start, end, marks, kind)
     if failed or arrived is None:
         rep["status"] = "travel failed" if failed else "not reached"
     elif done and done["block"] != area.block_hex():
@@ -610,7 +754,7 @@ def area_report(log, area, seg, kind):
     elif area.view() and not at:
         rep["status"] = "view not reached"
     else:
-        rep["status"] = "ok"
+        rep["status"] = where or "ok"
     # The arrival: the travel and the settle, up to the window (or, in the
     # capture pass, to the captures).
     arrival_end = marks.get("measure" if kind == "perf" else "capture", marks.get("end", end))
@@ -934,9 +1078,13 @@ def compare_reports(a_runs, b_runs, frame_pairs=None):
            "a_version": sorted({str(r["run"]["version"]) for r in a_runs if (r.get("run") or {}).get("version")}),
            "b_version": sorted({str(r["run"]["version"]) for r in b_runs if (r.get("run") or {}).get("version")}), "areas": {}}
     for aid in ids:
-        A = [r["areas"].get(aid, {}) for r in a_runs]
-        B = [r["areas"].get(aid, {}) for r in b_runs]
-        ent = {"status": {"a": [x.get("status") for x in A], "b": [x.get("status") for x in B]}, "perf": {}, "arrival": {}}
+        A_all = [r["areas"].get(aid, {}) for r in a_runs]
+        B_all = [r["areas"].get(aid, {}) for r in b_runs]
+        ent = {"status": {"a": [x.get("status") for x in A_all], "b": [x.get("status") for x in B_all]}, "perf": {}, "arrival": {}}
+        # Only a visit that measured the place counts: a death, a load or the
+        # player somewhere else made other numbers.
+        A = [x if x.get("status") == "ok" else {} for x in A_all]
+        B = [x if x.get("status") == "ok" else {} for x in B_all]
         for label, path, hb, mn in PERF_METRICS:
             d = metric_delta([dig(x.get("window"), path) for x in A], [dig(x.get("window"), path) for x in B], hb, mn)
             if d:
@@ -953,11 +1101,12 @@ def compare_reports(a_runs, b_runs, frame_pairs=None):
                           [dig(x.get("window"), ("draws", "failures")) for x in B], False, 1)
         if wf:
             ent["window_draw_failures"] = wf
-        la = next((x.get("lift") for x in A if x.get("lift")), None)
-        lb = next((x.get("lift") for x in B if x.get("lift")), None)
+        # The lift checks are the capture pass's, whatever the perf pass met.
+        la = next((x.get("lift") for x in A_all if x.get("lift")), None)
+        lb = next((x.get("lift") for x in B_all if x.get("lift")), None)
         if la or lb:
-            ra = next((lift_rows(x) for x in A if x.get("lift")), {})
-            rb = next((lift_rows(x) for x in B if x.get("lift")), {})
+            ra = next((lift_rows(x) for x in A_all if x.get("lift")), {})
+            rb = next((lift_rows(x) for x in B_all if x.get("lift")), {})
             changed = {ps: {"a": ra.get(ps), "b": rb.get(ps)} for ps in sorted(set(ra) & set(rb)) if ra.get(ps) != rb.get(ps)}
             ent["lift"] = {"a": (la or {}).get("totals"), "b": (lb or {}).get("totals"), "changed": changed,
                            "b_different": sorted(ps for ps, s in rb.items() if s in ("different", "invalid"))}
@@ -998,7 +1147,7 @@ def compare_frames(a_dirs, b_dirs, area_ids, out_dir=None):
         except (OSError, ValueError):
             return {}
         return {aid: {n: f["path"] for n, f in (a.get("frames") or {}).items() if f.get("ok")}
-                for aid, a in rep.get("areas", {}).items()}
+                for aid, a in rep.get("areas", {}).items() if a.get("status") == "ok"}
     fa = [frames_of(d) for d in a_dirs]
     fb = [frames_of(d) for d in b_dirs]
     cache = {}
@@ -1070,6 +1219,16 @@ def summary_text(report):
     out.append("")
     for aid, a in report.get("areas", {}).items():
         out.append("%-19s %s (%s): %s" % (aid, a.get("name"), a.get("block"), a.get("status")))
+        pr = a.get("presence") or {}
+        where = []
+        if pr.get("settle_s") is not None:
+            where.append("settled %.0f s%s" % (pr["settle_s"], " (counted from the loading screen's end)" if pr.get("loading_after_arrival") else ""))
+        if pr.get("view_off_m") is not None:
+            where.append("%.1f m from the view" % pr["view_off_m"])
+        if pr.get("moved_m"):
+            where.append("moved %.1f m across, %.1f m up or down" % tuple(pr["moved_m"]))
+        if where:
+            out.append("  where: " + "; ".join(where))
         w = a.get("window")
         if w:
             fm = w.get("frame_ms", {})
@@ -1437,6 +1596,12 @@ def problems_of(report):
         tot = (a.get("lift") or {}).get("totals", {})
         if tot.get("different") or tot.get("invalid"):
             out.append("%s: %d lifted shaders render differently, %d invalid" % (aid, tot.get("different", 0), tot.get("invalid", 0)))
+        # A settle cut to less than half by a loading screen still up at the
+        # arrival (an older probe declared a lamp travel done under it).
+        settle = report.get("run", {}).get("settle_s")
+        pr = a.get("presence") or {}
+        if a.get("status") == "ok" and settle and pr.get("settle_s") is not None and pr["settle_s"] < settle / 2:
+            out.append("%s: settled %.0f s of the %.0f asked: the loading screen was still up at the arrival" % (aid, pr["settle_s"], settle))
     return out
 
 
