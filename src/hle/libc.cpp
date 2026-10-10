@@ -68,7 +68,7 @@ int qsort_host_cmp(const void* a, const void* b) {
 short g_ctype[257];
 short g_tolower[257];
 short g_toupper[257];
-lconv g_lconv{};
+bb::libc::Lconv g_lconv{};
 std::once_flag g_ctype_once;
 
 void init_ctype() {
@@ -77,9 +77,6 @@ void init_ctype() {
         g_ctype[i] = bb::libc::ctype_flags(c);
         g_tolower[i] = static_cast<short>(c >= 'A' && c <= 'Z' ? c + 32 : c);
         g_toupper[i] = static_cast<short>(c >= 'a' && c <= 'z' ? c - 32 : c);
-    }
-    if (struct lconv* lc = localeconv()) {
-        g_lconv = *lc;
     }
 }
 
@@ -569,11 +566,8 @@ GUEST_ABI int hle_stat(const char* p, void* sb) {
     return -1;
 }
 
-GUEST_ABI char* hle_setlocale(int cat, const char* loc) { return std::setlocale(cat, loc); }
-GUEST_ABI lconv* hle_localeconv() {
-    std::call_once(g_ctype_once, init_ctype);
-    return &g_lconv;
-}
+GUEST_ABI char* hle_setlocale(int, const char* loc) { return bb::libc::set_c_locale(loc); }
+GUEST_ABI bb::libc::Lconv* hle_localeconv() { return &g_lconv; }
 // The tables are built when libc registers (hle_register_libc), so these
 // touch no thread-local state and run raw: the main loop calls them ~850
 // times a frame.

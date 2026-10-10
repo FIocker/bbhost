@@ -36,4 +36,24 @@ inline std::tm tm_to_host(const Tm* g) {
     return t;
 }
 
+struct Lconv {
+    const char* int_curr_symbol = "";
+    const char* currency_symbol = "";
+    const char* mon_decimal_point = "";
+    const char* mon_thousands_sep = "";
+    const char* mon_grouping = "";
+    const char* positive_sign = "";
+    const char* negative_sign = "";
+    unsigned char monetary_flags[14] = {127, 127, 127, 127, 127, 127, 127,
+                                       127, 127, 127, 127, 127, 127, 127};
+    const char* decimal_point = ".";
+    const char* thousands_sep = "";
+    const char* grouping = "";
+};
+static_assert(sizeof(Lconv) == 96 && offsetof(Lconv, decimal_point) == 0x48);
+inline char* set_c_locale(const char* name) {
+    static char c[] = "C";
+    return !name || !*name || (name[0] == 'C' && name[1] == '\0') ? c : nullptr;
+}
+
 }  // namespace bb::libc

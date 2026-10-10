@@ -41,5 +41,16 @@ int main() {
     CHECK(std::strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", &roundtrip) == 19);
     CHECK(std::strcmp(date, "2024-07-11 19:24:37") == 0);
 
+    Lconv lc;
+    const char* decimal = nullptr;
+    std::memcpy(&decimal, reinterpret_cast<const char*>(&lc) + 0x48, sizeof(decimal));
+    CHECK(std::strcmp(decimal, ".") == 0);
+    CHECK(*lc.currency_symbol == 0 && *lc.thousands_sep == 0);
+    for (auto flag : lc.monetary_flags) CHECK(flag == 127);
+    CHECK(std::strcmp(set_c_locale(nullptr), "C") == 0);
+    CHECK(std::strcmp(set_c_locale(""), "C") == 0);
+    CHECK(std::strcmp(set_c_locale("C"), "C") == 0);
+    CHECK(!set_c_locale("POSIX") && !set_c_locale("en_US.UTF-8"));
+
     std::puts("libc ABI tests passed");
 }
