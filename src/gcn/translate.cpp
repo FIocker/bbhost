@@ -2203,6 +2203,7 @@ struct Translator {
             const int nv = static_cast<int>(op) - 3;
             std::vector<Id> vals;
             for (int k = 0; k < nv; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
+            vals = store_dst_sel_rt(vals, w3);
             exec_guard([&] { format_store_dynamic(ba.addr, dfmt, nfmt, vals); });
             break;
         }
@@ -2343,6 +2344,43 @@ struct Translator {
                                sel(ieq(s3, cu(7)), comps[3], sel(ieq(s3, c_one_u), one, c_zero_u)))));
             out.push_back(v);
         }
+        return out;
+    }
+    // The data a format store writes through a descriptor's DST_SEL (word 3
+    // bits 11:0): memory component c takes the data component whose select
+    // names it - X..W are 4..7 - the first in x, y, z, w order, and 0 where
+    // none does. It is the inverse of what a load applies (apply_dst_sel_rt),
+    // so a store of what a load returned puts each component back where it
+    // came from. The game's texture upload depends on it: the copy shader GX
+    // runs for a texture created with data (gx_upload_initial_data, e2c27f0c)
+    // loads its source through a V# with the A8 select (0, 0, 0, X) and stores
+    // the (0, 0, 0, a) it gets through a T# with the same select, which on the
+    // console writes a to R. Stored as given, the 4x4 dither texture the hair
+    // and skin alpha test reads came out zero - every partly transparent hair
+    // card cut at an alpha threshold half a unit too high. `data` holds raw
+    // dwords; an identity select (0xfac over the components given) keeps them
+    // as they are, and the selects run only for another (word 3 is uniform).
+    std::vector<Id> store_dst_sel_rt(const std::vector<Id>& data, Id w3) {
+        const int n = static_cast<int>(data.size());
+        std::vector<Id> vars;
+        for (int k = 0; k < n; ++k) {
+            const Id v = m.local_variable(p_fn_u32, c_zero_u);
+            m.store(v, data[static_cast<std::size_t>(k)]);
+            vars.push_back(v);
+        }
+        const std::uint32_t mask = (1u << (3 * n)) - 1;
+        const Id other = m.emit(spv::OpINotEqual, t_bool, {iand(w3, cu(mask)), cu(0xfacu & mask)});
+        if_then(other, [&] {
+            for (int c = 0; c < n; ++c) {
+                Id v = c_zero_u;
+                for (int k = n - 1; k >= 0; --k) {
+                    v = sel(ieq(ubfe(w3, 3 * k, 3), cu(4u + static_cast<std::uint32_t>(c))), data[static_cast<std::size_t>(k)], v);
+                }
+                m.store(vars[static_cast<std::size_t>(c)], v);
+            }
+        });
+        std::vector<Id> out;
+        for (Id v : vars) out.push_back(ld(v));
         return out;
     }
     // Writes `n` loaded components to VGPRs vdata.. through the V#'s DST_SEL.
@@ -2838,11 +2876,11 @@ struct Translator {
             std::vector<Id> coords;
             for (int k = 0; k < ncoord; ++k) coords.push_back(i(ld(vgpr_var(in.vaddr + k))));
             const Id coord = ncoord == 1 ? coords[0] : m.emit(spv::OpCompositeConstruct, ncoord == 2 ? t_v2i : ncoord == 3 ? t_v3i : t_v4i, coords);
+            std::vector<Id> raws;
+            for (int k = 0; k < 4; ++k) raws.push_back(ld(vgpr_var(in.vdata + std::min(k, popcount4(in.dmask) - 1))));
+            raws = store_dst_sel_rt(raws, read_s(in.srsrc + 3, in));
             std::vector<Id> vals;
-            for (int k = 0; k < 4; ++k) {
-                const Id raw = ld(vgpr_var(in.vdata + std::min(k, popcount4(in.dmask) - 1)));
-                vals.push_back(img.kind == 1 ? raw : img.kind == 2 ? i(raw) : f(raw));
-            }
+            for (const Id raw : raws) vals.push_back(img.kind == 1 ? raw : img.kind == 2 ? i(raw) : f(raw));
             const Id texel = img.kind ? m.emit(spv::OpCompositeConstruct, texel_type(img), vals) : vec4f(vals[0], vals[1], vals[2], vals[3]);
             exec_guard([&] {
                 const Id image = load_image(img);

@@ -1,5 +1,6 @@
-// Execute synthetic GCN on Vulkan: check sampled values, not just SPIR-V validity.
-// No game files are needed. Exit 77 if no suitable Vulkan device is available.
+// Execute synthetic GCN on Vulkan: check sampled and stored values, not just
+// SPIR-V validity. No game files are needed. Exit 77 if no suitable Vulkan
+// device is available.
 #include "gcn/translate.h"
 #include <spirv-tools/libspirv.hpp>
 #include <vulkan/vulkan.h>
@@ -37,6 +38,16 @@ struct Fixture {
     VkImage cube_image{};
     VkDeviceMemory cube_mem{};
     VkImageView cube_view{};
+    // Guest memory for the buffer loads and stores: one 64 KiB page behind the
+    // two-level page table StageParams::l1_table names - every L1 entry the
+    // one L2 table, every L2 entry the page - so a guest address reads and
+    // writes the page at (address & 0xffff).
+    static constexpr VkDeviceSize kGuestL2 = 64 << 10, kGuestL1 = kGuestL2 + (std::uint64_t{gcn::kL2Entries} << 3),
+                                  kGuestBytes = kGuestL1 + (gcn::kL1Entries << 3);
+    static constexpr std::uint64_t kGuestData = 0x1'0000'0100ull;  // a guest address; the page's byte 0x100
+    VkBuffer guest{};
+    VkDeviceMemory guest_mem{};
+    std::uint8_t* guest_map{};
 
     // Twelve 4x4 layers (two cubes of six faces), texel (x, y, layer, 1): what a
     // Sea Islands cube T# is bound as.
@@ -89,6 +100,145 @@ struct Fixture {
         vkDestroyBuffer(device, staging, nullptr); vkFreeMemory(device, staging_mem, nullptr);
     }
 
+    void init_guest() {
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = kGuestBytes;
+        bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        check(vkCreateBuffer(device, &bi, nullptr, &guest));
+        VkMemoryRequirements req{}; vkGetBufferMemoryRequirements(device, guest, &req);
+        VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO}; flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.pNext = &flags; ai.allocationSize = req.size;
+        ai.memoryTypeIndex = memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        check(vkAllocateMemory(device, &ai, nullptr, &guest_mem)); check(vkBindBufferMemory(device, guest, guest_mem, 0));
+        void* map = nullptr; check(vkMapMemory(device, guest_mem, 0, VK_WHOLE_SIZE, 0, &map));
+        guest_map = static_cast<std::uint8_t*>(map);
+        std::memset(guest_map, 0, kGuestBytes);
+        VkBufferDeviceAddressInfo dai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO}; dai.buffer = guest;
+        const VkDeviceAddress base = vkGetBufferDeviceAddress(device, &dai);
+        auto* l2 = reinterpret_cast<std::uint64_t*>(guest_map + kGuestL2);
+        for (std::uint32_t i = 0; i < gcn::kL2Entries; ++i) l2[i] = base;
+        auto* l1 = reinterpret_cast<std::uint64_t*>(guest_map + kGuestL1);
+        for (std::uint32_t i = 0; i < gcn::kL1Entries; ++i) l1[i] = base + kGuestL2;
+        static_cast<gcn::StageParams*>(mapped)->l1_table = base + kGuestL1;
+    }
+
+    // A compute program of `body`, then run once against the fixture's set:
+    // the destination texel back as four floats.
+    std::array<float, 4> dispatch_compute(const std::vector<gcn::Inst>& body, std::uint32_t user_sgprs) {
+        gcn::Program p;
+        for (gcn::Inst in : body) { in.offset = uint32_t(p.insts.size() * 8); in.size = 2; p.insts.push_back(in); }
+        gcn::Inst end; end.enc = gcn::Enc::SOPP; end.op = 1; end.offset = uint32_t(p.insts.size() * 8); end.size = 1; p.insts.push_back(end);
+        gcn::TranslateOptions o; o.stage = gcn::Stage::Compute; o.rsrc2 = user_sgprs << 1; o.cs_threads[0] = 1;
+        o.sampler_force_unnormalized = {false};
+        const auto translated = gcn::translate(p, o);
+        if (!translated.ok()) throw std::runtime_error(translated.errors[0]);
+        spvtools::SpirvTools validator(SPV_ENV_VULKAN_1_2);
+        validator.SetMessageConsumer([](auto, auto, const auto&, const char* msg) { std::fprintf(stderr,"%s\n",msg); });
+        if (!validator.Validate(translated.spirv)) throw std::runtime_error("invalid SPIR-V");
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = translated.spirv.size()*4; mi.pCode = translated.spirv.data(); VkShaderModule module{};
+        check(vkCreateShaderModule(device, &mi, nullptr, &module));
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO}; ci.layout = pipeline_layout;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; ci.stage.module = module; ci.stage.pName = "main"; VkPipeline pipeline{};
+        check(vkCreateComputePipelines(device, {}, 1, &ci, nullptr, &pipeline));
+        begin(); barrier(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &set, 0, nullptr);
+        vkCmdDispatch(cmd, 1, 1, 1);
+        barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT);
+        VkBufferImageCopy copy{}; copy.bufferOffset = 2048; copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT,0,0,1}; copy.imageExtent = {1,1,1};
+        vkCmdCopyImageToBuffer(cmd, dest, VK_IMAGE_LAYOUT_GENERAL, buffer, 1, &copy);
+        barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT); submit();
+        vkDestroyPipeline(device, pipeline, nullptr); vkDestroyShaderModule(device, module, nullptr);
+        std::array<float, 4> r{};
+        std::memcpy(r.data(), static_cast<char*>(mapped) + 2048, sizeof(r));
+        return r;
+    }
+    static gcn::Inst vmov(int reg, std::uint32_t bits) {
+        gcn::Inst in; in.enc = gcn::Enc::VOP1; in.op = 1; in.dst = static_cast<std::uint16_t>(reg);
+        in.src0 = gcn::kLiteral; in.has_literal = true; in.literal = bits; return in;
+    }
+    // A store of v[16:19] to the destination (0, 0) through the T# in s[0:7]
+    // whose word 3 is `t_w3`; first a sample through the same T#, so the store
+    // is the program's second image binding (81) as in run().
+    static void image_store_body(std::vector<gcn::Inst>& body) {
+        body.push_back(vmov(26, 0)); body.push_back(vmov(27, 0));
+        gcn::Inst sample; sample.enc = gcn::Enc::MIMG; sample.op = 39;  // image_sample_lz
+        sample.srsrc = 0; sample.ssamp = 8; sample.vaddr = 26; sample.vdata = 30; sample.dmask = 15; body.push_back(sample);
+        body.push_back(vmov(24, 0)); body.push_back(vmov(25, 0));
+        gcn::Inst store; store.enc = gcn::Enc::MIMG; store.op = 8;  // image_store
+        store.srsrc = 0; store.vaddr = 24; store.vdata = 16; store.dmask = 15; body.push_back(store);
+    }
+    static bool near4(const std::array<float, 4>& got, const float (&want)[4]) {
+        for (int k = 0; k < 4; ++k) if (std::abs(got[static_cast<std::size_t>(k)] - want[k]) > 0.002f) return false;
+        return true;
+    }
+    // image_store goes through the inverse of the T#'s DST_SEL (memory
+    // component c from the data component that selects it, 0 where none does):
+    // the data (1, 2, 3, 4) through the select `t_w3`.
+    bool run_store_select(std::uint32_t t_w3, const float (&want)[4], const char* what) {
+        auto* params = static_cast<gcn::StageParams*>(mapped);
+        params->user_sgpr[3] = t_w3; params->user_sgpr[8] = 0;
+        std::vector<gcn::Inst> body;
+        for (int k = 0; k < 4; ++k) body.push_back(vmov(16 + k, std::bit_cast<std::uint32_t>(float(k + 1))));
+        image_store_body(body);
+        const auto got = dispatch_compute(body, 12);
+        const bool ok = near4(got, want);
+        std::printf("%s image_store through DST_SEL %03x (%s): got (%g,%g,%g,%g), expected (%g,%g,%g,%g)\n", ok ? "PASS" : "FAIL", t_w3 & 0xfff, what,
+                    got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+        return ok;
+    }
+    // The shape of GX's texture upload copy (gx_upload_initial_data, for a
+    // texture created with data): buffer_load_format_xyzw of one 8-bit unorm
+    // element, at an odd byte, through a V# with the A8 select (0, 0, 0, X) -
+    // word 3 0x8800 - then image_store of the four components through a T#
+    // with the same select. The load gives (0, 0, 0, a) and the inverse store
+    // puts a in R: on the console the 4x4 dither texture holds its Bayer
+    // values this way.
+    bool run_upload_copy() {
+        static const std::uint8_t bayer[16] = {0x00, 0x88, 0x22, 0xaa, 0xcc, 0x44, 0xee, 0x66, 0x33, 0xbb, 0x11, 0x99, 0xff, 0x77, 0xdd, 0x55};
+        std::memcpy(guest_map + (kGuestData & 0xffff), bayer, sizeof(bayer));
+        auto* params = static_cast<gcn::StageParams*>(mapped);
+        params->user_sgpr[3] = 0x800; params->user_sgpr[8] = 0;
+        params->user_sgpr[12] = static_cast<std::uint32_t>(kGuestData);
+        params->user_sgpr[13] = static_cast<std::uint32_t>(kGuestData >> 32) | 1u << 16;  // stride 1
+        params->user_sgpr[14] = 16;                                                     // records
+        params->user_sgpr[15] = 0x8800;  // DFMT 8, NFMT unorm, DST_SEL (0, 0, 0, X)
+        std::vector<gcn::Inst> body;
+        body.push_back(vmov(0, 5));  // element 5: 0x44
+        gcn::Inst load; load.enc = gcn::Enc::MUBUF; load.op = 3;  // buffer_load_format_xyzw
+        load.vaddr = 0; load.vdata = 16; load.srsrc = 12; load.soffset = 128; load.idxen = true; body.push_back(load);
+        image_store_body(body);
+        const auto got = dispatch_compute(body, 16);
+        const float want[4] = {0x44 / 255.0f, 0, 0, 0};
+        const bool ok = near4(got, want);
+        std::printf("%s A8 upload copy, buffer_load_format then image_store: got (%g,%g,%g,%g), expected (%g,0,0,0)\n", ok ? "PASS" : "FAIL",
+                    got[0], got[1], got[2], got[3], want[0]);
+        return ok;
+    }
+    // buffer_store_format goes through the inverse of the V#'s DST_SEL too:
+    // (0, 0, 0, 0.5) through an A8 V# writes 128 into its one byte, at an odd
+    // address, and leaves the bytes around it.
+    bool run_buffer_store_select() {
+        std::memset(guest_map + (kGuestData & 0xffff), 0x5a, 16);
+        auto* params = static_cast<gcn::StageParams*>(mapped);
+        params->user_sgpr[12] = static_cast<std::uint32_t>(kGuestData);
+        params->user_sgpr[13] = static_cast<std::uint32_t>(kGuestData >> 32) | 1u << 16;
+        params->user_sgpr[14] = 16;
+        params->user_sgpr[15] = 0x8800;
+        std::vector<gcn::Inst> body;
+        body.push_back(vmov(0, 7));
+        body.push_back(vmov(16, 0)); body.push_back(vmov(17, 0)); body.push_back(vmov(18, 0));
+        body.push_back(vmov(19, std::bit_cast<std::uint32_t>(0.5f)));
+        gcn::Inst store; store.enc = gcn::Enc::MUBUF; store.op = 7;  // buffer_store_format_xyzw
+        store.vaddr = 0; store.vdata = 16; store.srsrc = 12; store.soffset = 128; store.idxen = true; body.push_back(store);
+        dispatch_compute(body, 16);
+        const std::uint8_t* b = guest_map + (kGuestData & 0xffff);
+        const bool ok = b[7] == 128 && b[6] == 0x5a && b[8] == 0x5a;
+        std::printf("%s A8 buffer_store_format: byte %u (expected 128), neighbours %02x %02x (expected 5a 5a)\n", ok ? "PASS" : "FAIL", b[7], b[6], b[8]);
+        return ok;
+    }
+
     void bind_sampled(VkImageView view) {
         VkDescriptorImageInfo info{{}, view, VK_IMAGE_LAYOUT_GENERAL};
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -122,6 +272,7 @@ struct Fixture {
         validator.SetMessageConsumer([](auto, auto, const auto&, const char* msg) { std::fprintf(stderr,"%s\n",msg); });
         if (!validator.Validate(translated.spirv)) throw std::runtime_error("invalid SPIR-V");
         static_cast<gcn::StageParams*>(mapped)->user_sgpr[8] = 0;
+        static_cast<gcn::StageParams*>(mapped)->user_sgpr[3] = 0xfac;
         bind_sampled(cube_view);
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mi.codeSize = translated.spirv.size()*4; mi.pCode = translated.spirv.data(); VkShaderModule module{};
@@ -323,6 +474,7 @@ struct Fixture {
         validator.SetMessageConsumer([](auto, auto, const auto&, const char* msg) { std::fprintf(stderr,"%s\n",msg); });
         if (!validator.Validate(translated.spirv)) throw std::runtime_error("invalid SPIR-V");
         auto* params = static_cast<gcn::StageParams*>(mapped); params->user_sgpr[8] = force ? 1u << 15 : 0;
+        params->user_sgpr[3] = 0xfac;  // the T#'s DST_SEL: X, Y, Z, W, which the store goes through
         VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mi.codeSize = translated.spirv.size()*4; mi.pCode = translated.spirv.data(); VkShaderModule module{};
         check(vkCreateShaderModule(device, &mi, nullptr, &module));
@@ -353,6 +505,8 @@ struct Fixture {
             vkDestroyDescriptorSetLayout(device,layout,nullptr); vkDestroySampler(device,sampler,nullptr);
             vkDestroyImageView(device,source_view,nullptr); vkDestroyImageView(device,dest_view,nullptr);
             vkDestroyImageView(device,cube_view,nullptr); vkDestroyImage(device,cube_image,nullptr); vkFreeMemory(device,cube_mem,nullptr);
+            if (guest_map) vkUnmapMemory(device,guest_mem);
+            vkDestroyBuffer(device,guest,nullptr); vkFreeMemory(device,guest_mem,nullptr);
             vkDestroyImage(device,source,nullptr); vkDestroyImage(device,dest,nullptr);
             vkFreeMemory(device,source_mem,nullptr); vkFreeMemory(device,dest_mem,nullptr);
             if (mapped) vkUnmapMemory(device,buffer_mem);
@@ -378,5 +532,12 @@ int main() try {
     ok &= f.run_cube(1.375f, 1.625f, 3.0f, 1, 2, 3);    // face 3 of the first cube
     ok &= f.run_cube(1.125f, 1.875f, 0.0f, 0, 3, 0);    // face 0, far corner row
     ok &= f.run_cube(1.875f, 1.125f, 11.0f, 3, 0, 9);   // second cube (8 + face 3) is layer 9
+    ok &= f.run_store_select(0xfac, {1, 2, 3, 4}, "X Y Z W: as given");
+    ok &= f.run_store_select(0x800, {4, 0, 0, 0}, "the A8 select 0 0 0 X: w to R, nothing else");
+    ok &= f.run_store_select(0xf2e, {3, 2, 1, 4}, "Z Y X W: R and B swapped back");
+    ok &= f.run_store_select(0x924, {1, 0, 0, 0}, "X X X X: the first data component");
+    f.init_guest();
+    ok &= f.run_upload_copy();
+    ok &= f.run_buffer_store_select();
     return ok ? 0 : 1;
 } catch (const std::exception& e) { std::fprintf(stderr,"%s\n",e.what()); return 1; }
