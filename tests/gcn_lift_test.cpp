@@ -871,6 +871,39 @@ void loads_and_sizes() {
     }
 }
 
+// A VCC branch on a texel: the tone map's adaptation samples one texel at
+// constant coordinates and branches on comparing it, which every lane does
+// alike - the same coordinates sample the same texel - so it is an if. At
+// per-pixel coordinates the texels differ and the branch is the wave's.
+void uniform_texels() {
+    const auto program = [](bool per_pixel) {
+        Asm a;
+        if (per_pixel) {
+            a.interp(0, 0, 0);
+            a.interp(1, 0, 1);
+        } else {
+            a.vop1(1, 0, kZero);  // v_mov_b32 v0, 0
+            a.vop1(1, 1, kZero);
+        }
+        a.mimg(kSampleLz, 2, 0, 0x3);  // image_sample_lz v[2:3], v[0:1], s[4:11], s[12:15]
+        a.w.push_back(0xbf8c0070u);   // s_waitcnt vmcnt(0)
+        a.vopc(4, 256 + 2, 3);        // v_cmp_gt_f32 vcc, v2, v3
+        const std::size_t skip = a.branch(6);  // s_cbranch_vccz
+        a.vop1(1, 4, kOne);           // then: v4 = 1.0
+        const std::size_t join = a.branch(2);  // s_branch
+        a.land(skip);
+        a.vop1(1, 4, kHalf);          // else: v4 = 0.5
+        a.land(join);
+        for (std::uint32_t k = 5; k < 8; ++k) a.vop1(1, k, kZero);
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        return a.w;
+    };
+    const gcn::LiftResult uniform = lift(program(false));
+    CHECK(lifted(uniform) && proof_says(uniform, "1 ifs on a bit every lane holds alike"));
+    CHECK(rejected_with(lift(program(true)), "s_cbranch_vccz tests a VCC that may differ between lanes"));
+}
+
 void cases() {
     // A sample under a varying EXEC whose coordinates were computed for every
     // pixel: lifted for every pixel, its texel written under EXEC.
@@ -2972,6 +3005,7 @@ int main(int argc, char** argv) {
     lane_ops::run();
     lod::cases();
     lod::loads_and_sizes();
+    lod::uniform_texels();
     lod::loops();
     lod::helper_lanes();
     if (g_failures) {

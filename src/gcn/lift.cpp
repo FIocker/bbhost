@@ -1590,6 +1590,10 @@ private:
             return;  // s_mov_b64 leaves SCC, as in the translator
         }
         case 10: {  // s_wqm_b64
+            if (opt.stage != Stage::Pixel) {
+                reject("whole-quad mode outside a pixel shader: a quad's other lanes are other vertices");
+                return;
+            }
             const Val a = read_lane(in.src0);
             if (!a.constant && !widen_ok) {
                 if (begin_whole_quad(in, a)) return;
@@ -2522,7 +2526,12 @@ private:
     std::size_t image_loads = 0;
 
     void mimg(const Inst& in) {
-        inst_uniform = false;  // texels are not tracked as uniform
+        // A texel, a size or a LOD is a function of the image and sampler,
+        // which are the draw's, and of the operands: every lane holds it
+        // alike where every lane holds those alike (note_read sees each of
+        // them read, EXEC included where it selects the write). The same
+        // coordinates in every pixel of a quad have no derivative, so even an
+        // implicit LOD is the same everywhere.
         const std::uint32_t op = in.op;
         if (in.tfe || in.lwe) {  // the translator does not write it either
             reject(std::string(mnemonic(in) ? mnemonic(in) : "an image instruction") +
@@ -4696,7 +4705,9 @@ private:
         cur_label = m.label();
         if (opt.stage == Stage::Pixel && opt.ps_clip_discard) clip_discard_prologue();
         lanes[kKeyExec] = lane_const(true);   // every running pixel starts with its bit set
-        lanes[kKeyExec].helper_inexact = true;  // and GCN's helper lanes with theirs clear, until whole-quad mode
+        // ... and GCN's helper lanes with theirs clear, until whole-quad mode.
+        // A vertex shader has none (it takes no whole-quad mode, sop1).
+        lanes[kKeyExec].helper_inexact = opt.stage == Stage::Pixel;
         lanes[kKeyExec].helpers_clear = true;
         lanes[kKeyVcc] = lane_const(false);   // VCC starts clear
         scc_mask = lane_const(false);         // and so does SCC
