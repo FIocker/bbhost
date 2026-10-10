@@ -66,6 +66,12 @@ int main() {
     CHECK(std::strftime(date, sizeof(date), "%Y-%m-%d %H:%M:%S", &roundtrip) == 19);
     CHECK(std::strcmp(date, "2024-07-11 19:24:37") == 0);
 
+    CHECK(buffer_mode(0) == _IOFBF && buffer_mode(1) == _IOLBF && buffer_mode(2) == _IONBF);
+    CHECK(buffer_mode(-1) == -1 && buffer_mode(3) == -1);
+    FILE* stream = std::tmpfile();
+    CHECK(stream && std::setvbuf(stream, nullptr, buffer_mode(2), 0) == 0);
+    CHECK(std::fclose(stream) == 0);
+
     Lconv lc;
     const char* decimal = nullptr;
     std::memcpy(&decimal, reinterpret_cast<const char*>(&lc) + 0x48, sizeof(decimal));

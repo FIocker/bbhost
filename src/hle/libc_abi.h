@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <ctime>
 #include <limits>
 
@@ -57,6 +58,16 @@ static_assert(sizeof(Lconv) == 96 && offsetof(Lconv, decimal_point) == 0x48);
 inline char* set_c_locale(const char* name) {
     static char c[] = "C";
     return !name || !*name || (name[0] == 'C' && name[1] == '\0') ? c : nullptr;
+}
+
+// Guest buffering modes are 0/1/2; Microsoft's _IOLBF/_IONBF are 64/4.
+inline int buffer_mode(int mode) {
+    switch (mode) {
+        case 0: return _IOFBF;
+        case 1: return _IOLBF;
+        case 2: return _IONBF;
+        default: return -1;
+    }
 }
 
 // _Dtest returns a short: normal=-1, denormal=-2, zero=0, infinity=1, NaN=2.

@@ -275,7 +275,9 @@ GUEST_ABI int hle_fputc(int c, FILE* f) { return std::fputc(c, f); }
 GUEST_ABI int hle_fputs(const char* s, FILE* f) { return std::fputs(s, f); }
 GUEST_ABI int hle_fgetpos(FILE* f, std::fpos_t* p) { return std::fgetpos(f, p); }
 GUEST_ABI int hle_setvbuf(FILE* f, char* b, int m, std::uint64_t n) {
-    return std::setvbuf(f, b, m, static_cast<std::size_t>(n));
+    const int host_mode = bb::libc::buffer_mode(m);
+    if (host_mode < 0) return -1;
+    return std::setvbuf(f, b, host_mode, static_cast<std::size_t>(n));
 }
 
 GUEST_ABI int hle_usleep(unsigned int usec) {
