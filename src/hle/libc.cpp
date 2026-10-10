@@ -701,42 +701,43 @@ GUEST_ABI float hle_sinf_q(float x, unsigned q) {
     }
 }
 GUEST_ABI double hle_tan(double x) { return std::tan(x); }
-GUEST_ABI float hle_tanf(float x) { return std::tanf(x); }
-GUEST_ABI float hle_tanhf(float x) { return std::tanhf(x); }
+// Use the standard float overloads, not non-portable std::<name>f aliases.
+GUEST_ABI float hle_tanf(float x) { return std::tan(x); }
+GUEST_ABI float hle_tanhf(float x) { return std::tanh(x); }
 GUEST_ABI double hle_acos(double x) { return std::acos(x); }
-GUEST_ABI float hle_acosf(float x) { return std::acosf(x); }
+GUEST_ABI float hle_acosf(float x) { return std::acos(x); }
 GUEST_ABI double hle_asin(double x) { return std::asin(x); }
-GUEST_ABI float hle_asinf(float x) { return std::asinf(x); }
+GUEST_ABI float hle_asinf(float x) { return std::asin(x); }
 GUEST_ABI double hle_atan(double x) { return std::atan(x); }
-GUEST_ABI float hle_atanf(float x) { return std::atanf(x); }
+GUEST_ABI float hle_atanf(float x) { return std::atan(x); }
 GUEST_ABI double hle_atan2(double y, double x) { return std::atan2(y, x); }
-GUEST_ABI float hle_atan2f(float y, float x) { return std::atan2f(y, x); }
+GUEST_ABI float hle_atan2f(float y, float x) { return std::atan2(y, x); }
 GUEST_ABI double hle_exp(double x) { return std::exp(x); }
-GUEST_ABI float hle_expf(float x) { return std::expf(x); }
+GUEST_ABI float hle_expf(float x) { return std::exp(x); }
 GUEST_ABI double hle_exp2(double x) { return std::exp2(x); }
-GUEST_ABI float hle_exp2f(float x) { return std::exp2f(x); }
+GUEST_ABI float hle_exp2f(float x) { return std::exp2(x); }
 GUEST_ABI double hle_log(double x) { return std::log(x); }
-GUEST_ABI float hle_logf(float x) { return std::logf(x); }
+GUEST_ABI float hle_logf(float x) { return std::log(x); }
 GUEST_ABI double hle_pow(double x, double y) { return std::pow(x, y); }
-GUEST_ABI float hle_powf(float x, float y) { return std::powf(x, y); }
+GUEST_ABI float hle_powf(float x, float y) { return std::pow(x, y); }
 GUEST_ABI double hle_sqrt(double x) { return std::sqrt(x); }
-GUEST_ABI float hle_sqrtf(float x) { return std::sqrtf(x); }
+GUEST_ABI float hle_sqrtf(float x) { return std::sqrt(x); }
 GUEST_ABI double hle_ceil(double x) { return std::ceil(x); }
-GUEST_ABI float hle_ceilf(float x) { return std::ceilf(x); }
+GUEST_ABI float hle_ceilf(float x) { return std::ceil(x); }
 GUEST_ABI double hle_floor(double x) { return std::floor(x); }
-GUEST_ABI float hle_floorf(float x) { return std::floorf(x); }
+GUEST_ABI float hle_floorf(float x) { return std::floor(x); }
 GUEST_ABI double hle_fabs(double x) { return std::fabs(x); }
-GUEST_ABI float hle_fabsf(float x) { return std::fabsf(x); }
+GUEST_ABI float hle_fabsf(float x) { return std::fabs(x); }
 GUEST_ABI double hle_fmod(double x, double y) { return std::fmod(x, y); }
-GUEST_ABI float hle_fmodf(float x, float y) { return std::fmodf(x, y); }
+GUEST_ABI float hle_fmodf(float x, float y) { return std::fmod(x, y); }
 GUEST_ABI double hle_frexp(double x, int* e) { return std::frexp(x, e); }
-GUEST_ABI float hle_frexpf(float x, int* e) { return std::frexpf(x, e); }
+GUEST_ABI float hle_frexpf(float x, int* e) { return std::frexp(x, e); }
 GUEST_ABI double hle_ldexp(double x, int e) { return std::ldexp(x, e); }
-GUEST_ABI float hle_ldexpf(float x, int e) { return std::ldexpf(x, e); }
+GUEST_ABI float hle_ldexpf(float x, int e) { return std::ldexp(x, e); }
 GUEST_ABI double hle_modf(double x, double* i) { return std::modf(x, i); }
-GUEST_ABI float hle_modff(float x, float* i) { return std::modff(x, i); }
-GUEST_ABI float hle_coshf(float x) { return std::coshf(x); }
-GUEST_ABI float hle_sinhf(float x) { return std::sinhf(x); }
+GUEST_ABI float hle_modff(float x, float* i) { return std::modf(x, i); }
+GUEST_ABI float hle_coshf(float x) { return std::cosh(x); }
+GUEST_ABI float hle_sinhf(float x) { return std::sinh(x); }
 
 GUEST_ABI ldiv_t hle_ldiv(long n, long d) { return std::ldiv(n, d); }
 
