@@ -495,6 +495,14 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                      shaded ? 100.0 * static_cast<double>(ps[kDrawPsLifted]) / static_cast<double>(shaded) : 0.0,
                      static_cast<unsigned long long>(ps[kDrawPsTranslated]), static_cast<unsigned long long>(ps[kDrawPsFallback]),
                      static_cast<unsigned long long>(ps[kDrawPsNone]));
+            // ... and by how their vertex shader ran.
+            std::uint64_t vs[kDrawVsCount], all = 0;
+            for (int i = 0; i < kDrawVsCount; ++i) all += vs[i] = now.draws_vs[i] - last.draws_vs[i];
+            host_log("  vertex shaders: %llu draws lifted (%.1f%%), %llu translated on vertex input, %llu with the fetch shader or tessellation, "
+                     "%llu on the fallback",
+                     static_cast<unsigned long long>(vs[kDrawVsLifted]), all ? 100.0 * static_cast<double>(vs[kDrawVsLifted]) / static_cast<double>(all) : 0.0,
+                     static_cast<unsigned long long>(vs[kDrawVsTranslated]), static_cast<unsigned long long>(vs[kDrawVsOther]),
+                     static_cast<unsigned long long>(vs[kDrawVsFallback]));
         }
         if (const std::string arena = hle_gnm_arena_report(); !arena.empty()) host_log("arena:%s", arena.c_str());
         std::string ph;

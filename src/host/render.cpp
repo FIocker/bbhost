@@ -1919,6 +1919,14 @@ int draw_ps_kind(const GfxPipeline& p) {
     if (!p.ps.module && p.ps.meta().spirv.empty()) return kDrawPsNone;
     return p.lean ? kDrawPsTranslated : kDrawPsFallback;
 }
+// ... and its vertex shader (GpuStats::draws_vs): the lifter takes only a
+// vertex shader on vertex input, and only a no-fallback stage - which a
+// fallback pipeline laid out from its no-fallback stages has too (layout_only).
+int draw_vs_kind(const GfxPipeline& p, bool vertex_input) {
+    if (p.vs.lifted) return kDrawVsLifted;
+    if (!vertex_input || p.tess_hw) return kDrawVsOther;
+    return p.lean || p.layout_only ? kDrawVsTranslated : kDrawVsFallback;
+}
 
 struct DrawState {
     std::uint64_t vs_va = 0, ps_va = 0, fetch_va = 0;
@@ -13682,6 +13690,7 @@ static bool draw_impl(const GpuDraw& d) {
     cmds.publish();  // the diagnostics below may record or flush: they come after this draw
     bump(g.draws);  // the one writer, under g.mu: no locked add
     bump(g.draws_ps[draw_ps_kind(*bind_pl)]);
+    bump(g.draws_vs[draw_vs_kind(*bind_pl, use_vertex_input)]);
     draw_stamp.to(kRenderCostRecord);
     if (g_render_cost_enabled) report_render_split(false);
     if (capture_session) {

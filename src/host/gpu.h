@@ -356,11 +356,18 @@ struct GpuStats {
     // reason (host_gpu_draw_fail_name).
     std::uint64_t draws_ps[4];
     std::uint64_t draw_fail_why[16];
+    // The same draws by how their vertex shader ran (DrawVs).
+    std::uint64_t draws_vs[4];
 };
 // How a draw's pixel shader ran: its typed lift (BBHOST_DECOMP), a
 // translation in the no-fallback pipeline (not lifted, or not asked to be),
 // the page-table fallback pipeline's translation, or no pixel shader at all.
 enum DrawPs { kDrawPsLifted, kDrawPsTranslated, kDrawPsFallback, kDrawPsNone, kDrawPsCount };
+// How a draw's vertex shader ran: its typed lift (BBHOST_DECOMP), a
+// translation on vertex input in the no-fallback pipeline (not lifted), a
+// translation the lifter does not take (the fetch shader inlined, or a
+// tessellation stage), or the page-table fallback pipeline's translation.
+enum DrawVs { kDrawVsLifted, kDrawVsTranslated, kDrawVsOther, kDrawVsFallback, kDrawVsCount };
 // A draw failure reason's name ("pixel shader"), or null past the last.
 const char* host_gpu_draw_fail_name(int reason);
 enum GpuPhase { kPhaseDraw, kPhaseDispatch, kPhasePrefetch, kPhasePipeline, kPhaseBind, kPhaseExec, kPhaseWait, kPhaseLock, kPhaseCount };
