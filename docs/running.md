@@ -199,19 +199,24 @@ bbhost paces the game to the refresh rate of the display its window is on;
 `[video] vblank_hz` overrides a display that reports the wrong rate.
 
 The frame rate is the game's own speed, chosen when it starts (a change
-applies on the next run): 30 is the game as it shipped; 60 and 90 run its
-logic at that rate with its fixed steps converted (Kyo's 60 and 90 FPS++
-lists, `engine/frame_rate.cpp`); Uncapped steps it by the measured frame time
-(1/240 to 1/30 s), at the display's refresh rate with V-Sync on and up to 240
-fps with it off. At 90 and Uncapped the game paces itself and its frames are
-shown as they come, so 90 on a 60 Hz display shows 60 of them a second.
-`BBHOST_GAME_FPS=30|60|90|0` overrides the setting for a run (0 is uncapped),
-`BBHOST_UNCAPPED_FPS=N` sets the uncapped limit (30-240) whatever V-Sync says,
-and `BBHOST_UNCAPPED_LOG=1` logs once a second the frame time uncapped steps
-by and the values it wrote. The start of the log says which rate runs and how
-many values and code sites were converted (`frame rate:` lines), and names
-any site whose bytes were not the expected ones (that rate is then refused:
-90 or uncapped falls back to 60).
+applies on the next run): 30 is the game as it shipped; 60 and 90 run its logic
+at that rate; Uncapped steps it by the measured frame time (1/240 to 1/30
+s), at the display's refresh rate with V-Sync on and up to 240 fps with it off.
+Above 30 the game's step is the frame's measured time (at most 1/30 s), and the
+places that stepped a fixed 1/30 s a frame - physics, enemy AI, ragdolls,
+grass, the camera's easing, momentum, fades - follow it, so the game runs at
+the same speed at every rate (`engine/frame_rate.cpp`, from Kyo's FPS++ lists
+and yogesh1239's high-FPS fixes). Above 60 and Uncapped the game paces itself
+and its frames are shown as they come, so 90 on a 60 Hz display shows 60 of
+them a second; a rate the machine cannot hold runs slower than real time in
+the few places that count frames.
+`BBHOST_GAME_FPS=30|60|90|0` overrides the setting for a run (0 is
+uncapped), `BBHOST_UNCAPPED_FPS=N` sets the uncapped limit (30-240) whatever
+V-Sync says, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
+game steps by and values written from it. The start of the log says which rate
+runs and how many values and code sites were converted (`frame rate:` lines),
+and names any site whose bytes were not the expected ones (that rate is then
+refused: 90 or uncapped falls back to 60).
 A frame goes to the screen as soon as the game has finished it; only its flip,
 which the game paces itself on, waits for the next tick of that clock. The game
 keeps two flips queued, and showing each frame at the tick that completed it
