@@ -7356,6 +7356,153 @@ std::string render_target_copy_report() {
     return buf;
 }
 
+// A snapshot image for a copy into `dst_base`: `format`, width x height, one
+// layer, written by the depth copy's compute pass when it holds a depth plane
+// and that pass is there. Null when the image could not be made.
+RtImage* make_copy_snapshot_locked(std::uint64_t src_base, std::uint64_t dst_base, VkFormat format, std::uint32_t width,
+                                   std::uint32_t height, bool from_depth) {
+    RtImage r;
+    r.base = dst_base;
+    r.format = format;
+    r.width = width;
+    r.height = height;
+    r.depth = false;
+    r.mutable_format = true;
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = r.format;
+    ici.extent = {r.width, r.height, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    // A depth snapshot is written by the copy's compute pass (depth_copy.cpp).
+    r.storage = from_depth && depth_copy_available_locked();
+    if (r.storage) ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(g.device, &ici, nullptr, &r.image) != VK_SUCCESS) return nullptr;
+    if (!rt_image_memory(r.image, r.memory)) {
+        vkDestroyImage(g.device, r.image, nullptr);
+        if (r.memory.memory) defer_destroy_image(VK_NULL_HANDLE, r.memory);
+        return nullptr;
+    }
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = r.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = r.format;
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(g.device, &vci, nullptr, &r.view) != VK_SUCCESS) {
+        vkDestroyImage(g.device, r.image, nullptr);
+        defer_destroy_image(VK_NULL_HANDLE, r.memory);
+        return nullptr;
+    }
+    static std::atomic<int> logs{0};
+    if (logs.fetch_add(1) < 16) {
+        host_log("render: %s target 0x%llx copied to 0x%llx (%ux%u format %d): snapshot image", from_depth ? "depth" : "colour",
+                 static_cast<unsigned long long>(src_base), static_cast<unsigned long long>(dst_base), r.width, r.height, r.format);
+    }
+    ++g_rt_gen;
+    RtImage& made = g_snapshots.emplace(dst_base, r).first->second;
+    g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(made));
+    rt_written(made);
+    made.created_flip = made.written_flip;
+    bump_view_epoch();
+    return &made;
+}
+
+// Records the copy of `src`'s top-left width x height into `dst` at (0, 0):
+// colour image to image, a depth plane by the compute pass into a snapshot
+// made for it, else through a buffer. False when that buffer could not be
+// made.
+bool record_target_copy_locked(RtImage& src, RtImage& dst, std::uint32_t width, std::uint32_t height) {
+    const bool from_depth = src.depth;
+    rt_written(dst);
+    begin_recording_locked();
+    render_end_pass_locked();
+    if (!dst.initialised) {
+        image_barrier(g_cmd(), dst.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+                      VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        dst.initialised = true;
+    }
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    // A depth plane into a snapshot made for it: one compute pass.
+    const bool by_compute = from_depth && dst.storage && depth_copy_available_locked();
+    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    mb.dstAccessMask = by_compute ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         by_compute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    // BBHOST_GPU_PROFILE: the copy as an entry of its own, by kind and size.
+    static std::map<std::string, std::string> copy_names;
+    if (g.profile) {
+        char key[96];
+        std::snprintf(key, sizeof(key), "rt-copy-%s-%ux%u-f%d", by_compute ? "depth-compute" : from_depth ? "depth" : "colour", width,
+                      height, static_cast<int>(src.format));
+        profile_begin_locked(&copy_names.emplace(key, key).first->second);
+    }
+    if (by_compute && depth_copy_record_locked(src.image, src.format, dst.image, width, height)) {
+        if (g.profile) profile_end_locked();
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
+                             nullptr);
+        if (g_pending_clears.erase(dst.base)) ++g_pending_gen;
+        dst.fill_last = false;
+        g_rt_copies.fetch_add(1);
+        return true;
+    }
+    if (by_compute) {
+        // The pass could not be recorded: the buffer copies, behind the transfer barrier they expect.
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+    if (from_depth) {
+        // Depth and colour formats cannot be copied image-to-image: go through a
+        // buffer. One, kept and grown: a buffer allocated per copy and freed
+        // at the slot's retirement was ~4% of the command processor in the
+        // world (vkAllocateMemory and vkFreeMemory, several copies a frame).
+        // The barrier above orders each reuse after the last one's reads.
+        static DevBuffer scratch;
+        const std::size_t need = static_cast<std::size_t>(width) * height * 4;
+        if (scratch.size < need) {
+            if (scratch.buffer) defer_destroy(scratch);
+            scratch = DevBuffer{};
+            std::uint64_t want = 1ull << 20;
+            while (want < need) want <<= 1;
+            if (!create_dev_buffer(scratch, want, false)) {
+                scratch = DevBuffer{};
+                return false;
+            }
+        }
+        VkBufferImageCopy bic{};
+        bic.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+        bic.imageExtent = {width, height, 1};
+        rec().copy_image_to_buffer(src.image, VK_IMAGE_LAYOUT_GENERAL, scratch.buffer, 1, &bic);
+        VkMemoryBarrier tb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        tb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        tb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &tb, 0, nullptr, 0, nullptr);
+        bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        rec().copy_buffer_to_image(scratch.buffer, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &bic);
+    } else {
+        VkImageCopy region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.extent = {width, height, 1};
+        rec().copy_image(src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    }
+    if (g.profile) profile_end_locked();
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    if (g_pending_clears.erase(dst.base)) ++g_pending_gen;
+    dst.fill_last = false;
+    g_rt_copies.fetch_add(1);
+    return true;
+}
+
 bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes, const char* via) {
     // BBHOST_WATCH_COPY_DST=0x<base>: every whole-target copy into that
     // address, with the flip. A frame can go wrong without any draw being
@@ -7410,73 +7557,24 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         rt->second.height == src.height) {
         into = &rt->second;
     }
-    auto st = g_snapshots.find(dst_base);
-    if (!into && st != g_snapshots.end() &&
-        (st->second.format != snap_format || st->second.width != src.width || st->second.height != src.height)) {
-        g.rt_replacements.fetch_add(1);
-        destroy_rt_image(st->second);
-        g_snapshots.erase(st);
-        ++g_rt_gen;
-        bump_view_epoch();
-        st = g_snapshots.end();
-    }
-    if (!into && st == g_snapshots.end()) {
-        RtImage r;
-        r.base = dst_base;
-        r.format = snap_format;
-        r.width = src.width;
-        r.height = src.height;
-        r.depth = false;
-        r.mutable_format = true;
-        VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-        ici.imageType = VK_IMAGE_TYPE_2D;
-        ici.format = r.format;
-        ici.extent = {r.width, r.height, 1};
-        ici.mipLevels = 1;
-        ici.arrayLayers = 1;
-        ici.samples = VK_SAMPLE_COUNT_1_BIT;
-        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        // A depth snapshot is written by the copy's compute pass (depth_copy.cpp).
-        r.storage = from_depth && depth_copy_available_locked();
-        if (r.storage) ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vkCreateImage(g.device, &ici, nullptr, &r.image) != VK_SUCCESS) {
-            note_copy_refused_locked(kCopyRefusedNoImage, via, src_base, dst_base, bytes);
-            return false;
-        }
-        if (!rt_image_memory(r.image, r.memory)) {
-            vkDestroyImage(g.device, r.image, nullptr);
-            if (r.memory.memory) defer_destroy_image(VK_NULL_HANDLE, r.memory);
-            note_copy_refused_locked(kCopyRefusedNoImage, via, src_base, dst_base, bytes);
-            return false;
-        }
-        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vci.image = r.image;
-        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vci.format = r.format;
-        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        if (vkCreateImageView(g.device, &vci, nullptr, &r.view) != VK_SUCCESS) {
-            vkDestroyImage(g.device, r.image, nullptr);
-            defer_destroy_image(VK_NULL_HANDLE, r.memory);
-            note_copy_refused_locked(kCopyRefusedNoImage, via, src_base, dst_base, bytes);
-            return false;
-        }
-        static std::atomic<int> logs{0};
-        if (logs.fetch_add(1) < 16) {
-            host_log("render: %s target 0x%llx copied to 0x%llx (%ux%u format %d): snapshot image", from_depth ? "depth" : "colour",
-                     static_cast<unsigned long long>(src_base), static_cast<unsigned long long>(dst_base), r.width, r.height, r.format);
-        }
-        ++g_rt_gen;
-        st = g_snapshots.emplace(dst_base, r).first;
-        g_max_rt_bytes = std::max<std::uint64_t>(g_max_rt_bytes, rt_size_bytes(st->second));
-        rt_written(st->second);
-        st->second.created_flip = st->second.written_flip;
-        bump_view_epoch();
-    }
+    RtImage* snap = nullptr;
     if (!into) {
+        auto st = g_snapshots.find(dst_base);
+        if (st != g_snapshots.end() &&
+            (st->second.format != snap_format || st->second.width != src.width || st->second.height != src.height)) {
+            g.rt_replacements.fetch_add(1);
+            destroy_rt_image(st->second);
+            g_snapshots.erase(st);
+            ++g_rt_gen;
+            bump_view_epoch();
+            st = g_snapshots.end();
+        }
+        snap = st != g_snapshots.end() ? &st->second
+                                       : make_copy_snapshot_locked(src_base, dst_base, snap_format, src.width, src.height, from_depth);
+        if (!snap) {
+            note_copy_refused_locked(kCopyRefusedNoImage, via, src_base, dst_base, bytes);
+            return false;
+        }
         // A render target at the destination that did not match is now stale -
         // the copy overwrote the memory it stands for - and samplers would
         // still prefer it over the snapshot. Drop it.
@@ -7488,88 +7586,10 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
             bump_view_epoch();
         }
     }
-    RtImage& dst = into ? *into : st->second;
-    rt_written(dst);
-    begin_recording_locked();
-    render_end_pass_locked();
-    if (!dst.initialised) {
-        image_barrier(g_cmd(), dst.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
-                      VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
-        dst.initialised = true;
+    if (!record_target_copy_locked(src, into ? *into : *snap, src.width, src.height)) {
+        note_copy_refused_locked(kCopyRefusedNoImage, via, src_base, dst_base, bytes);
+        return false;
     }
-    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    // A depth plane into a snapshot made for it: one compute pass.
-    const bool by_compute = from_depth && dst.storage && depth_copy_available_locked();
-    mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    mb.dstAccessMask = by_compute ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         by_compute ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    // BBHOST_GPU_PROFILE: the copy as an entry of its own, by kind and size.
-    static std::map<std::string, std::string> copy_names;
-    if (g.profile) {
-        char key[96];
-        std::snprintf(key, sizeof(key), "rt-copy-%s-%ux%u-f%d", by_compute ? "depth-compute" : from_depth ? "depth" : "colour", src.width,
-                      src.height, static_cast<int>(src.format));
-        profile_begin_locked(&copy_names.emplace(key, key).first->second);
-    }
-    if (by_compute && depth_copy_record_locked(src.image, src.format, dst.image, src.width, src.height)) {
-        if (g.profile) profile_end_locked();
-        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0,
-                             nullptr);
-        if (g_pending_clears.erase(dst_base)) ++g_pending_gen;
-        dst.fill_last = false;
-        g_rt_copies.fetch_add(1);
-        return true;
-    }
-    if (by_compute) {
-        // The pass could not be recorded: the buffer copies, behind the transfer barrier they expect.
-        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-        rec().pipeline_barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    }
-    if (from_depth) {
-        // Depth and colour formats cannot be copied image-to-image: go through a
-        // buffer. One, kept and grown: a buffer allocated per copy and freed
-        // at the slot's retirement was ~4% of the command processor in the
-        // world (vkAllocateMemory and vkFreeMemory, several copies a frame).
-        // The barrier above orders each reuse after the last one's reads.
-        static DevBuffer scratch;
-        if (scratch.size < src_bytes) {
-            if (scratch.buffer) defer_destroy(scratch);
-            scratch = DevBuffer{};
-            std::uint64_t want = 1ull << 20;
-            while (want < src_bytes) want <<= 1;
-            if (!create_dev_buffer(scratch, want, false)) {
-                scratch = DevBuffer{};
-                note_copy_refused_locked(kCopyRefusedNoImage, via, src_base, dst_base, bytes);
-                return false;
-            }
-        }
-        VkBufferImageCopy bic{};
-        bic.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
-        bic.imageExtent = {src.width, src.height, 1};
-        rec().copy_image_to_buffer(src.image, VK_IMAGE_LAYOUT_GENERAL, scratch.buffer, 1, &bic);
-        VkMemoryBarrier tb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        tb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        tb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &tb, 0, nullptr, 0, nullptr);
-        bic.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        rec().copy_buffer_to_image(scratch.buffer, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &bic);
-    } else {
-        VkImageCopy region{};
-        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.extent = {src.width, src.height, 1};
-        rec().copy_image(src.image, VK_IMAGE_LAYOUT_GENERAL, dst.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-    }
-    if (g.profile) profile_end_locked();
-    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-    rec().pipeline_barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
-    if (g_pending_clears.erase(dst_base)) ++g_pending_gen;
-    dst.fill_last = false;
-    g_rt_copies.fetch_add(1);
     return true;
 }
 
