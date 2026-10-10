@@ -527,6 +527,7 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
         if (!prof.empty()) host_log("  gpu profile:%s", prof.c_str());
         if (const std::string busy = host_gpu_busy_report(); !busy.empty()) host_log("  %s", busy.c_str());
         host_log("  fill: %s", host_gpu_fill_stats().c_str());
+        if (const std::string r = host_gpu_target_copy_report(); !r.empty()) host_log("  %s", r.c_str());
         // The guest's clock reads and sync slow paths a second (hle/kernel.cpp),
         // and the pacing: the frame limiter's margin and spin
         // (engine/frame_rate.cpp), the vblank clock's lateness and the flips'

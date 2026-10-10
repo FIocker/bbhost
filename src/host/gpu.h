@@ -251,6 +251,9 @@ void host_gpu_report();
 void host_gpu_submit();
 std::string host_gpu_profile_report();  // BBHOST_GPU_PROFILE=1: top pipelines by GPU time since the last call
 std::string host_gpu_fill_stats();      // fill-pending / fill-applied counters
+// Copies out of render targets: into images, and refused (copied as memory,
+// the destination's image left stale), by reason. Empty without a GPU.
+std::string host_gpu_target_copy_report();
 // Writes the Vulkan pipeline cache under the data root when pipelines were
 // created since the last save (the 300-flip report calls it); the write runs on
 // a background thread. BBHOST_PIPELINE_CACHE=0 turns loading and saving off.

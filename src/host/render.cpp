@@ -312,6 +312,31 @@ const bool g_lazy_barriers = [] {
 std::atomic<std::uint64_t> g_barriers_paid{0}, g_barriers_skipped{0}, g_barriers_mid_pass{0};
 
 std::atomic<std::uint64_t> g_rt_created{0}, g_untraced_draws{0}, g_clears{0}, g_rt_copies{0};
+// ---- Copies out of a render target that stay in memory ----
+// A copy whose source is a render target reaches the destination's image only
+// here. One refused here is copied as guest memory (host_gpu_copy_guest, or
+// the copy dispatch's own pass), which the target's draws never wrote, so the
+// destination's image - what samplers read - keeps what it held before, and
+// nothing said so. That was half of the 4K and ultrawide black world: a copy
+// one 3840x2160 surface long out of a 5120x2160 display buffer was refused,
+// and the colour grading drew the stale intermediate over the picture. Each
+// refusal is counted by its reason (the 5-second report's "target copies"
+// line), and each source, destination and reason is logged once.
+enum CopyRefusal : int {
+    kCopyRefusedSmaller,      // fewer bytes than the source target holds
+    kCopyRefusedSnapshot,     // the source is a copy's snapshot, not a drawn target
+    kCopyRefusedUndrawn,      // a target nothing has drawn into yet
+    kCopyRefusedDepthFormat,  // a depth format without a copy path
+    kCopyRefusedNoImage,      // the destination image (or the depth scratch) could not be made
+    kCopyRefusedCount
+};
+const char* const kCopyRefusedNames[kCopyRefusedCount] = {"smaller destination", "snapshot source", "undrawn source",
+                                                          "depth format", "no image"};
+const char* const kCopyRefusedWhy[kCopyRefusedCount] = {
+    "fewer bytes than the source target holds", "the source is a copy's snapshot, not a drawn target",
+    "nothing has drawn into the source yet", "a depth format without a copy path", "the destination image could not be made"};
+std::atomic<std::uint64_t> g_copy_refused[kCopyRefusedCount] = {};
+
 // Targets re-created in another format of the same size and texel size, their
 // pixels carried over (rt_image), and re-created with their pixels lost; of
 // those, the ones whose old image had last taken a fill that covers the new
@@ -7051,12 +7076,15 @@ void render_report() {
              "initialised, cleared to zero: %llu",
              static_cast<unsigned long long>(g_rt_carried.load()), static_cast<unsigned long long>(g_rt_lost.load()),
              static_cast<unsigned long long>(g_rt_refilled.load()), static_cast<unsigned long long>(g_rt_zeroed.load()));
-    host_log("render: targets=%llu clears=%llu fill-pending=%llu fill-applied=%llu target-copies=%llu untraced-draws=%llu "
-             "vport-scissor-narrowed=%llu%s",
+    std::uint64_t copies_refused = 0;
+    for (const auto& n : g_copy_refused) copies_refused += n.load(std::memory_order_relaxed);
+    host_log("render: targets=%llu clears=%llu fill-pending=%llu fill-applied=%llu target-copies=%llu target-copies-refused=%llu "
+             "untraced-draws=%llu vport-scissor-narrowed=%llu%s",
              static_cast<unsigned long long>(g_rt_created.load()), static_cast<unsigned long long>(g_clears.load()),
              static_cast<unsigned long long>(g_fill_pending.load()), static_cast<unsigned long long>(g_fill_applied.load()),
-             static_cast<unsigned long long>(g_rt_copies.load()), static_cast<unsigned long long>(g_untraced_draws.load()),
-             static_cast<unsigned long long>(g_vport_narrowed.load()), g_vport_scissor ? "" : " (not applied)");
+             static_cast<unsigned long long>(g_rt_copies.load()), static_cast<unsigned long long>(copies_refused),
+             static_cast<unsigned long long>(g_untraced_draws.load()), static_cast<unsigned long long>(g_vport_narrowed.load()),
+             g_vport_scissor ? "" : " (not applied)");
     if (g_gx_resolves[kGxRecord].load() || g_gx_resolves[kGxNoDescriptor].load() || g_gx_resolves[kGxShape].load()) {
         const auto n = [](int k) { return static_cast<unsigned long long>(g_gx_resolves[k].load()); };
         host_log("render: GX bindings from records %llu; from user data: no descriptor %llu, path shape %llu, record shorter "
@@ -7268,7 +7296,67 @@ RtImage* find_render_target(std::uint64_t base) {
     return st == g_snapshots.end() ? nullptr : &st->second;
 }
 
-bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes) {
+// What a copy's destination is to the host: the image samplers would read
+// there, or the GX texture the game made there, or nothing but memory.
+std::string copy_destination_describe_locked(std::uint64_t dst_base) {
+    char buf[160];
+    if (auto rt = g_rts.find(dst_base); rt != g_rts.end()) {
+        const RtImage& d = rt->second;
+        std::snprintf(buf, sizeof(buf), "%s target %ux%u format %d%s", d.depth ? "depth" : "colour", d.width, d.height,
+                      static_cast<int>(d.format), d.initialised ? "" : " (never drawn)");
+    } else if (auto st = g_snapshots.find(dst_base); st != g_snapshots.end()) {
+        std::snprintf(buf, sizeof(buf), "a copy's snapshot %ux%u format %d", st->second.width, st->second.height,
+                      static_cast<int>(st->second.format));
+    } else if (std::uint32_t t[8]; gx_resource_tsharp(dst_base, t)) {
+        std::snprintf(buf, sizeof(buf), "GX texture %ux%u dfmt %u nfmt %u, no image of a target", (t[2] & 0x3fff) + 1,
+                      ((t[2] >> 14) & 0x3fff) + 1, (t[1] >> 20) & 0x3f, (t[1] >> 26) & 0xf);
+    } else {
+        std::snprintf(buf, sizeof(buf), "no image, memory only");
+    }
+    return buf;
+}
+
+void note_copy_refused_locked(CopyRefusal why, const char* via, std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes) {
+    g_copy_refused[why].fetch_add(1, std::memory_order_relaxed);
+    static std::set<std::tuple<std::uint64_t, std::uint64_t, int>> seen;  // under g.mu
+    static int lines = 0;
+    constexpr int kMaxLines = 48;
+    if (lines >= kMaxLines || !seen.emplace(src_base, dst_base, static_cast<int>(why)).second) return;
+    char source[160];
+    if (const RtImage* s = find_render_target(src_base)) {
+        const std::size_t src_bytes = static_cast<std::size_t>(s->width) * s->height * (s->depth ? 4 : rt_bytes_per_pixel(*s));
+        std::snprintf(source, sizeof(source), "%s %ux%u format %d (0x%zx bytes)",
+                      !g_rts.count(src_base) ? "a copy's snapshot" : s->depth ? "depth target" : "colour target", s->width, s->height,
+                      static_cast<int>(s->format), src_bytes);
+    } else {
+        std::snprintf(source, sizeof(source), "not a render target");
+    }
+    host_log("render: %s 0x%llx -> 0x%llx 0x%zx bytes copied as memory, the destination's image left as it was (%s): source %s; "
+             "destination %s; flip %llu, after draw %llu%s",
+             via, static_cast<unsigned long long>(src_base), static_cast<unsigned long long>(dst_base), bytes, kCopyRefusedWhy[why],
+             source, copy_destination_describe_locked(dst_base).c_str(), static_cast<unsigned long long>(hle_video_flip_count()),
+             static_cast<unsigned long long>(g_draw_rec_next),
+             ++lines == kMaxLines ? " (the last such line; the 5-second report counts the rest)" : "");
+}
+
+std::string render_target_copy_report() {
+    std::uint64_t total = 0;
+    std::string reasons;
+    for (int k = 0; k < kCopyRefusedCount; ++k) {
+        const std::uint64_t n = g_copy_refused[k].load(std::memory_order_relaxed);
+        total += n;
+        if (n) reasons += std::string(reasons.empty() ? ": " : ", ") + kCopyRefusedNames[k] + " " + std::to_string(n);
+    }
+    static std::uint64_t last_total = 0;  // the 5-second report is the only caller
+    char buf[384];
+    std::snprintf(buf, sizeof(buf), "target copies: %llu into images; refused, copied as memory, %llu (+%llu in these flips)%s",
+                  static_cast<unsigned long long>(g_rt_copies.load()), static_cast<unsigned long long>(total),
+                  static_cast<unsigned long long>(total - last_total), reasons.c_str());
+    last_total = total;
+    return buf;
+}
+
+bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes, const char* via) {
     // BBHOST_WATCH_COPY_DST=0x<base>: every whole-target copy into that
     // address, with the flip. A frame can go wrong without any draw being
     // different - the engine also moves whole surfaces around, and a copy from
@@ -7287,15 +7375,28 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         }
     }
     auto it = g_rts.find(src_base);
-    if (it == g_rts.end() || !it->second.initialised) return false;
+    if (it == g_rts.end()) {
+        if (g_snapshots.count(src_base)) note_copy_refused_locked(kCopyRefusedSnapshot, via, src_base, dst_base, bytes);
+        return false;
+    }
+    if (!it->second.initialised) {
+        note_copy_refused_locked(kCopyRefusedUndrawn, via, src_base, dst_base, bytes);
+        return false;
+    }
     RtImage& src = it->second;
     // A depth source becomes an R32_SFLOAT colour snapshot (its Z plane),
     // sampled by the lighting passes as a plain float texture.
     const bool from_depth = src.depth;
-    if (from_depth && src.format != VK_FORMAT_D32_SFLOAT && src.format != VK_FORMAT_D32_SFLOAT_S8_UINT) return false;
+    if (from_depth && src.format != VK_FORMAT_D32_SFLOAT && src.format != VK_FORMAT_D32_SFLOAT_S8_UINT) {
+        note_copy_refused_locked(kCopyRefusedDepthFormat, via, src_base, dst_base, bytes);
+        return false;
+    }
     const VkFormat snap_format = from_depth ? VK_FORMAT_R32_SFLOAT : src.format;
     const std::size_t src_bytes = static_cast<std::size_t>(src.width) * src.height * (from_depth ? 4 : rt_bytes_per_pixel(src));
-    if (bytes < src_bytes) return false;
+    if (bytes < src_bytes) {
+        note_copy_refused_locked(kCopyRefusedSmaller, via, src_base, dst_base, bytes);
+        return false;
+    }
     // If a render target already lives at the destination, copy into *it*.
     // find_render_target() - and so every sampler - prefers g_rts over
     // g_snapshots, so writing a parallel snapshot here would leave the copy
@@ -7342,10 +7443,14 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         r.storage = from_depth && depth_copy_available_locked();
         if (r.storage) ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vkCreateImage(g.device, &ici, nullptr, &r.image) != VK_SUCCESS) return false;
+        if (vkCreateImage(g.device, &ici, nullptr, &r.image) != VK_SUCCESS) {
+            note_copy_refused_locked(kCopyRefusedNoImage, via, src_base, dst_base, bytes);
+            return false;
+        }
         if (!rt_image_memory(r.image, r.memory)) {
             vkDestroyImage(g.device, r.image, nullptr);
             if (r.memory.memory) defer_destroy_image(VK_NULL_HANDLE, r.memory);
+            note_copy_refused_locked(kCopyRefusedNoImage, via, src_base, dst_base, bytes);
             return false;
         }
         VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -7356,6 +7461,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
         if (vkCreateImageView(g.device, &vci, nullptr, &r.view) != VK_SUCCESS) {
             vkDestroyImage(g.device, r.image, nullptr);
             defer_destroy_image(VK_NULL_HANDLE, r.memory);
+            note_copy_refused_locked(kCopyRefusedNoImage, via, src_base, dst_base, bytes);
             return false;
         }
         static std::atomic<int> logs{0};
@@ -7436,6 +7542,7 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
             while (want < src_bytes) want <<= 1;
             if (!create_dev_buffer(scratch, want, false)) {
                 scratch = DevBuffer{};
+                note_copy_refused_locked(kCopyRefusedNoImage, via, src_base, dst_base, bytes);
                 return false;
             }
         }
@@ -7916,6 +8023,10 @@ std::string image_reuse_report_locked() {
 using namespace gpu;
 
 std::string host_gpu_fill_stats() { return render_fill_stats(); }
+std::string host_gpu_target_copy_report() {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    return g.ok ? render_target_copy_report() : std::string();
+}
 void host_gpu_pipeline_time_us(std::uint64_t out[5]) { render_pipeline_time_us(out); }
 
 // Dynamic state already recorded into the command buffer being built. Every
