@@ -210,44 +210,18 @@ constexpr Constant kConstants[] = {
     {0x4cf6424, 0x3dcccccd, 0x3d4ccccd},  // 0.1 -> 0.05
     {0x4cf6428, 0x3dcccccd, 0x3d4ccccd},  // 0.1 -> 0.05
     {0x4cf642c, 0x3dcccccd, 0x3d4ccccd},  // 0.1 -> 0.05
-    {0x4d02f10, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f14, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f18, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f1c, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f70, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f74, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f78, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d02f7c, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d0b5b0, 0x3f733333, 0x3f798497},  // 0.95 -> 0.974679 (0.95^(1/2))
-    {0x4d0b5b4, 0x3f733333, 0x3f798497},  // 0.95 -> 0.974679
-    {0x4d0b5b8, 0x3f733333, 0x3f798497},  // 0.95 -> 0.974679
-    {0x4d0b5bc, 0x3f733333, 0x3f798497},  // 0.95 -> 0.974679
     {0x4d2577c, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4d25840, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x4d25e68, 0x3dcccccd, 0x3d523176},  // 0.1 -> 0.0513167 (1 - 0.9^(1/2))
     {0x4d25e94, 0x3d088889, 0x3c89b0c3},  // 0.0333333 -> 0.0168070
-    {0x4d2632c, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d26334, 0x3f4ccccd, 0x3f64f92e},  // 0.8 -> 0.894427 (0.8^(1/2))
-    {0x4d26338, 0x3f99999a, 0x3f8c378c},  // 1.2 -> 1.095445 (1.2^(1/2))
-    {0x4d26440, 0x41f00000, 0x42700000},  // 30 -> 60
-    {0x4d26478, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x4d265fc, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d26618, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4d26c9c, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4d270e4, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d27554, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4d275e8, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x4d275f4, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d27c4c, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4d27fd4, 0xbdcccccd, 0xbd4ccccd},  // -0.1 -> -0.05
-    {0x4d27fe0, 0x3dcccccd, 0x3d4ccccd},  // 0.1 -> 0.05
     {0x4d28e98, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d29170, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4d2979c, 0x3c888889, 0x3c088889},  // 0.0166667 -> 0.00833333
     {0x4d29b80, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4d29e74, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x5528370, 0x3f800000, 0x3f000000},  // 1 -> 0.5 (.data)
-    {0x5528374, 0x3f266666, 0x3f4e64d0},  // 0.65 -> 0.806226 (0.65^(1/2), .data)
 };
 
 // The constants above that follow the rate, and how; the rest of the table
@@ -283,8 +257,8 @@ constexpr Rated kRated[] = {
     // YEBIS's elapsed time once more: the post-process context's +4 (set to
     // 1/60 here in its initialisation, 0x25df516, and never again) is stored
     // into CPostEffect+0x6ac every frame (0x25d7e56) after the write of
-    // 0x4d2979c below (0x25d6af0), so it is the one the eye adaptation and
-    // afterimage decays read; half a frame, at the rate's value.
+    // 0x4d2979c's value (0x25d6af0, kDtLoads), so it is the one the eye
+    // adaptation and afterimage decays read; half a frame, at the rate's value.
     {0x25df519, Kind::Amount, false},
     // A tenth of the change over 0x192c3ff's 10-frame interval, a frame: it
     // and the interval (kCounts) go together, 1/20 and 20 at 60, 1/30 and 30
@@ -293,84 +267,17 @@ constexpr Rated kRated[] = {
     {0x4cf6424, Kind::Amount, false},
     {0x4cf6428, Kind::Amount, false},
     {0x4cf642c, Kind::Amount, false},
-    // The movement controller's momentum kept a frame (sub_1e4a730 from the
-    // movement update sub_1914500: vmulps at 0x1e4abca on the X and Z of the
-    // body's velocity), 0.95 at 30: 0.95^(30 dt), so a jump carries as far at
-    // any frame rate. Until 2026-10-10 60 ran it at 0.95^(1/3) - the 90 value
-    // Kyo's first 60 list held - which kept 0.95^20 of the speed a second
-    // instead of 0.95^30; his 1.3 lists compute 0.95^(30 dt) the same way.
-    {0x4d0b5b0, Kind::Keep, true},
-    {0x4d0b5b4, Kind::Keep, true},
-    {0x4d0b5b8, Kind::Keep, true},
-    {0x4d0b5bc, Kind::Keep, true},
-    // The target bank's refresh accumulator (SprjTargetBankManager::Update,
-    // 0x16a4416; with the 60 FPS++ sites that load reads the frame time).
-    {0x4d2577c, Kind::Step, true},
-    // An attack hitbox's velocity, its movement this frame times 30 (sub_1c60a60
-    // at 0x1c60cc3 and sub_1c60fb0 at 0x1c61281, from ChrIns::UpdateEffectsAndStats):
-    // a rate, 60 at 60 and 1/dt at any rate.
-    {0x4d02f10, Kind::Rate, true},
-    {0x4d02f14, Kind::Rate, true},
-    {0x4d02f18, Kind::Rate, true},
-    {0x4d02f1c, Kind::Rate, true},
-    {0x4d02f70, Kind::Rate, true},
-    {0x4d02f74, Kind::Rate, true},
-    {0x4d02f78, Kind::Rate, true},
-    {0x4d02f7c, Kind::Rate, true},
-    // The targeting system's load-spreading ring (SprjTargetingSystemBase::vfunc_3,
-    // 0x16ab623 and 0x16ab6cf): a delay times 30 picks a slot in a ring that
-    // advances a slot a frame, and an overflow adds k/30 s.
-    {0x4d25840, Kind::Rate, true},
     // The follow camera's distance ease, 0.1 a frame at 30 (0x183af8c); Kyo's
     // first 60 list held 0.025, half the 60 value (his 1.3: scaled by dt).
     {0x4d25e68, Kind::Decay, true},
     // The follow camera's chase-rate ease (0x183e2b3: value += (target - value) * w).
     {0x4d25e94, Kind::Decay, true},
-    // The sprint's wall test in the movement update (0x1914c24): the
-    // distance moved this frame times 30 under 1 is "blocked" (slowed by 0.8 a
-    // frame down to half speed) - under 1 unit a second at 30, but under 2 at
-    // 60 and under 4 at 120, where a sprint starting below that locks at half
-    // speed (yogesh1239's Sprint Speed Fix measured 3.2 against 6.9 units a
-    // second at 200). The distance divided by the frame's time instead: 1/dt.
-    {0x4d2632c, Kind::Rate, true},
-    // And what that test does a frame: blocked, the movement's scale x0.8 down
-    // to 0.5 (0x1914c4d); free, x1.2 back to 1 (0x1914c77) - kept shares.
-    {0x4d26334, Kind::Keep, true},
-    {0x4d26338, Kind::Keep, true},
-    // Remote characters' locomotion picked from their movement this frame
-    // times 30: NetAIManipulator::vfunc_38 walks an enemy another player owns
-    // below 2.5 units a second (0x1923a12), NetworkManipulator::vfunc_38
-    // picks a remote player's stand/walk/run/dash at 0.01/2/6 (0x1925982) - at
-    // 60 a remote player never showed the dash and its run met the walk
-    // threshold. Rates.
-    {0x4d26440, Kind::Rate, true},
-    {0x4d26478, Kind::Rate, true},
-    // UI steps a frame: the equipment screen's character preview (sub_19dc100)
-    // and the shop's tab animation (sub_1b34510).
-    {0x4d26c9c, Kind::Step, true},
-    {0x4d270e4, Kind::Step, true},
-    // A physics-driven bone's impulse in the ragdoll/clip player C
-    // (sub_1c0df90, 0x1c0f15e): the gap times the mass times 30, to close the
-    // gap in one physics step - whose length is now the frame's: 1/dt.
-    {0x4d275e8, Kind::Rate, true},
-    // CSSlopeCtrl::UpdateResponse, the slide down a steep slope (from
-    // chr_motion_physics_update, once a frame): its speed grows by the slope's
-    // pull times "slope fall speed" (スロープ落下速度, 1) a frame and, off the
-    // slope, keeps "slope fall damping" (スロープ落下減衰力, 0.65) of itself a
-    // frame - debug-menu tunables in .data. An amount and a kept share.
-    {0x5528370, Kind::Amount, true},
-    {0x5528374, Kind::Keep, true},
-    // NS_SPRJ::ReplayGhostIns::UpdateFade, the online replay ghosts' fade:
-    // 0.1 down or up a frame at 30 (0x1d084f5..0x1d0854c).
-    {0x4d27fd4, Kind::Amount, true},
-    {0x4d27fe0, Kind::Amount, true},
-    // A step one load reads (0x2377d4a; the 60 FPS++ sites point it at the
-    // frame time).
-    {0x4d29170, Kind::Step, true},
-    // YEBIS's frame time (gx_flip_present, 0x25d6ae2): half a 30 fps frame,
-    // 1/60, so the eye adaptation and the other timed effects ran twice as
-    // fast at 60. Visual only.
-    {0x4d2979c, Kind::Amount, true},
+    // The per-frame values that were here (the sprint's wall test, remote
+    // characters' locomotion, the hitbox velocity, the targeting ring, the
+    // bone impulse, the UI steps, the ghosts' fade, YEBIS's frame time,
+    // momentum, the sprint ramps and the slope slide) are read through
+    // kDtLoads' slots instead; 0x4d2577c and 0x4d29170, whose loads the 60
+    // FPS++ sites point at the frame-time slot, need nothing.
 };
 constexpr bool rated_in_constants() {
     for (const Rated& r : kRated) {
@@ -562,6 +469,59 @@ bool kyo_camera_site(std::uint32_t at) {
 }
 bool kyo_camera_constant(std::uint32_t at) { return at >= kKyoCameraFirst && at <= kKyoCameraLast; }
 
+// Redirected loads: a constant the game reads where it means "a frame" - a
+// weight or a share kept a frame, an amount a frame, a step, a count a
+// second - is read from a slot of ours instead, in the image's tail
+// (core/elf.h), which each frame's seconds rewrite. The instruction's rip
+// displacement is pointed at the slot; the constant itself stays the game's.
+// So a constant other code reads with another meaning (a duration, a unit)
+// keeps it, no page of .rodata is written while the game runs, and any rate -
+// one that moves every frame too - converts exactly. The table,
+// engine/frame_rate_dt_loads.inc, is generated by tools/dt_loads.py from
+// tools/dt_loads.txt and the eboot: each instruction's bytes and its
+// displacement's target are checked first, and one mismatch leaves the whole
+// table out. Kinds as kRated's; an Amount may be negative (a timer counted
+// down a fixed amount a call).
+struct DtLoad {
+    std::uint32_t insn;      // the instruction (Binary Ninja address)
+    std::uint8_t len, disp;  // its length and where its 4-byte rip displacement is
+    std::uint32_t constant;  // the value it reads (.rodata or .data)
+    Kind kind;               // how that value follows the frame's time
+    std::uint8_t lanes;      // 1 (a dword), 2 (a qword), 4 (an xmmword)
+    const char* bytes;       // the instruction as the eboot has it
+};
+//
+// What it holds (each with its reader in the .inc):
+//  - kept shares a frame: the movement controller's momentum (0.95 a frame on
+//    the body's X/Z, chr_motion_physics_update; 0.95^(30 dt) keeps a jump's
+//    reach at any rate), the sprint wall test's ramps (x0.8 blocked, x1.2
+//    free), CSSlopeCtrl's slope fall damping (0.65, a .data tunable);
+//  - amounts a frame: the slope fall speed (1.0, .data), the replay ghosts'
+//    fade (+-0.1), YEBIS's frame time (half a 30 fps frame: the eye
+//    adaptation's), a state-table fade (+-0.05 at 0x1d3251e/0x1d3259b), and
+//    SprjWorldAiManager::TickLua's timer (-1/30 a call before a full GC of
+//    the AI Lua state: every 0.25 s at 60, 0.125 s at 120 until now);
+//  - rates (a distance this frame times 30 is a speed: 1/dt): the sprint's
+//    wall test (blocked under 1 unit a second; at 60 a sprint from rest
+//    started blocked), remote characters' locomotion (NetAIManipulator's 2.5,
+//    NetworkManipulator's 0.01/2/6: at 60 a remote player never showed the
+//    dash), the attack hitbox velocity (two 4-lane vectors), a physics-driven
+//    bone's impulse (close the gap in one physics step), the targeting ring's
+//    slot (x30) and overflow (/30);
+//  - steps: the equipment screen's character preview, the shop's tab
+//    animation.
+constexpr DtLoad kDtLoads[] = {
+#include "engine/frame_rate_dt_loads.inc"
+};
+constexpr bool dt_loads_apart() {
+    for (const DtLoad& d : kDtLoads) {
+        for (const Constant& c : kConstants)
+            if (c.at >= d.constant && c.at < d.constant + 4u * d.lanes) return false;
+    }
+    return true;
+}
+static_assert(dt_loads_apart(), "a redirected constant is not also rewritten in place (kConstants)");
+
 // The cloth above 60 (tools/fps_sites.py, from Kyo's "90 FPS++"). With one
 // substep a frame (0xb6e67a above) the hcl solver runs at the frame rate,
 // against the 60 the part files were authored for (30 fps, 2 substeps), and
@@ -580,6 +540,25 @@ bool kyo_camera_constant(std::uint32_t at) { return at >= kKyoCameraFirst && at 
 constexpr Site kClothSites[] = {
 #include "engine/ninety_fps_sites.inc"
 };
+
+// No redirected load is an instruction another table rewrites (the 60 FPS++
+// list points some loads at the frame-time slot; those constants are dead).
+constexpr std::size_t hex_len(const char* h) {
+    std::size_t n = 0;
+    while (h[n]) ++n;
+    return n / 2;
+}
+template <std::size_t N>
+constexpr bool dt_loads_clear_of(const Site (&sites)[N]) {
+    for (const DtLoad& d : kDtLoads) {
+        for (const Site& site : sites) {
+            if (d.insn < site.at + hex_len(site.was) && site.at < d.insn + d.len) return false;
+        }
+    }
+    return true;
+}
+static_assert(dt_loads_clear_of(kSixtySites) && dt_loads_clear_of(kFrameTimeSites) && dt_loads_clear_of(kClothSites),
+              "a redirected load is not rewritten by another table");
 constexpr std::uint32_t kClothScalars = 0x4d3bd00;  // 4 x the stiffness scale
 constexpr std::uint8_t kClothScalarsWas[16] = {'D', 'L', 'L', 'i', 'g', 'h', 't', 'M', 'u', 't', 'e', 'x', '.', 'c', 'p', 'p'};
 
@@ -692,6 +671,16 @@ double g_play_ms_carry = 0.0;
 // scale scales the step, not the frames' pace.
 std::uint64_t g_step_va = 0;
 std::atomic<bool> g_scale_by_step{false};
+// The redirected loads' slots (kDtLoads): one per constant, kind and width,
+// 16 bytes each in the image's tail, rewritten every frame from the constant
+// as it is then (a .data tunable the debug menu edits keeps working).
+struct DtSlot {
+    std::uint64_t va, src;
+    Kind kind;
+    std::uint8_t lanes;
+};
+std::vector<DtSlot> g_dt_slots;
+std::size_t g_dt_loads_applied = 0;
 
 template <typename T>
 void put(std::uint64_t a, T v) {
@@ -1262,6 +1251,9 @@ void each_frame(const SprjFlipper* f) {
     frame_rate_step::g_frame_seconds.store(dt, std::memory_order_relaxed);
     const double fps = 1.0 / static_cast<double>(dt);
     for (const EachFrame& e : g_each) put<float>(e.va, rated_value(e.kind, e.was, fps));
+    for (const DtSlot& d : g_dt_slots) {
+        for (std::uint8_t k = 0; k < d.lanes; ++k) put<float>(d.va + 4u * k, rated_value(d.kind, get<float>(d.src + 4u * k), fps));
+    }
     g_cloth_dt += (dt - g_cloth_dt) * 0.1f;
     const float cloth = std::min(1.0f, 60.0f * g_cloth_dt);
     if (g_cloth_va) {
@@ -1527,6 +1519,57 @@ int apply_rate(ElfImage* image, int want) {
                 host_log("frame rate: 0x%x does not hold the play time's add; the game's stays", kPlayTimeAdd);
             }
         }
+        // The redirected loads (kDtLoads): every instruction checked, then
+        // the slots placed and the displacements pointed at them.
+        bool dt_ok = sizeof(kDtLoads) > 0;
+        for (const DtLoad& d : kDtLoads) {
+            const std::vector<std::uint8_t> was = hex_bytes(d.bytes);
+            const auto* p = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(va(d.insn)));
+            std::int32_t disp;
+            std::memcpy(&disp, p + d.disp, 4);
+            if (was.size() != d.len || std::memcmp(p, was.data(), was.size()) != 0 ||
+                static_cast<std::int64_t>(d.insn) + d.len + disp != static_cast<std::int64_t>(d.constant)) {
+                host_log("frame rate: 0x%x is not the load of 0x%x the redirected loads expect; the %zu are left out", d.insn,
+                         d.constant, sizeof(kDtLoads) / sizeof(kDtLoads[0]));
+                dt_ok = false;
+                break;
+            }
+        }
+        if (dt_ok) {
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> keys;  // (constant | kind | lanes, slot BN address)
+            const auto key_of = [](const DtLoad& d) {
+                return static_cast<std::uint64_t>(d.constant) << 16 | static_cast<std::uint64_t>(d.kind) << 8 | d.lanes;
+            };
+            for (const DtLoad& d : kDtLoads) {
+                if (std::none_of(keys.begin(), keys.end(), [&](const auto& k) { return k.first == key_of(d); })) keys.push_back({key_of(d), 0});
+            }
+            const std::uint64_t start = (image->tail_used + 15) & ~std::uint64_t(15);
+            if (start + 16 * keys.size() > image->tail_size) {
+                host_log("frame rate: no room in the image's tail for %zu redirected loads' slots; left out", keys.size());
+            } else {
+                image->tail_used = start + 16 * keys.size();
+                for (std::size_t i = 0; i < keys.size(); ++i) {
+                    keys[i].second = image->tail_va + start + 16 * i + kPreferredGuestSlide;  // as a BN address
+                    DtSlot slot{};
+                    slot.va = va(static_cast<std::uint32_t>(keys[i].second));
+                    const auto constant = static_cast<std::uint32_t>(keys[i].first >> 16);
+                    slot.kind = static_cast<Kind>((keys[i].first >> 8) & 0xff);
+                    slot.lanes = static_cast<std::uint8_t>(keys[i].first & 0xff);
+                    slot.src = va(constant);
+                    for (std::uint8_t k = 0; k < slot.lanes; ++k)
+                        put<float>(slot.va + 4u * k, rated_value(slot.kind, get<float>(slot.src + 4u * k), fps));
+                    g_dt_slots.push_back(slot);
+                }
+                for (const DtLoad& d : kDtLoads) {
+                    const auto it = std::find_if(keys.begin(), keys.end(), [&](const auto& k) { return k.first == key_of(d); });
+                    const std::int64_t nd = static_cast<std::int64_t>(it->second) - (static_cast<std::int64_t>(d.insn) + d.len);
+                    if (nd < INT32_MIN || nd > INT32_MAX) continue;  // the tail is within reach of all of the code
+                    const auto d32 = static_cast<std::int32_t>(nd);
+                    write(d.insn + d.disp, &d32, 4);
+                    ++g_dt_loads_applied;
+                }
+            }
+        }
     }
     // The camera's weights hold Kyo's 60 fps values (kConstants' defaults,
     // and his stores with the sites) or, with Original, the game's 30 fps
@@ -1569,9 +1612,11 @@ int apply_rate(ElfImage* image, int want) {
     for (const std::uint64_t p : pages) {
         if (p < va(kCodeEnd)) guest_keep_writable(&image->mem, p);  // .data pages are writable already
     }
-    host_log("frame rate: %zu values%s follow the frame time every frame (%zu pages of .rodata kept writable); %zu other "
-             "constants follow the rate (code immediates and counts at %d's values), the rest at their 60 values",
-             g_each.size(), g_cloth_va ? " and the cloth's stiffness scale" : "", pages.size(), rated_fixed, fps);
+    host_log("frame rate: %zu values%s follow the frame time every frame (%zu pages of .rodata kept writable), and %zu loads "
+             "read %zu slots of ours that do; %zu other constants follow the rate (code immediates and counts at %d's values), "
+             "the rest at their 60 values",
+             g_each.size(), g_cloth_va ? " and the cloth's stiffness scale" : "", pages.size(), g_dt_loads_applied, g_dt_slots.size(),
+             rated_fixed, fps);
     return mode;
 }
 
