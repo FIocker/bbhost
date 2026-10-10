@@ -369,6 +369,10 @@ struct Gpu {
     std::uint32_t vendor_id = 0;  // VkPhysicalDeviceProperties::vendorID (0x10de NVIDIA, 0x1002 AMD)
     bool integrated = false;      // VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: its device-local memory is system RAM
     bool tight = false;           // little memory in all its heaps (gpu.cpp, memory_tight)
+    // A discrete GPU with under 7.5 GiB of video memory free at the start
+    // (gpu.cpp, small_vram): fewer spares, less scratch, a tessellation ring
+    // that grows as it is needed, display buffers no larger than the start.
+    bool small_vram = false;
     bool has_push_descriptor = false;       // VK_KHR_push_descriptor enabled
     PFN_vkCmdPushDescriptorSetKHR cmd_push_descriptor_set = nullptr;
     // VK_EXT_extended_dynamic_state3's depth clamp (BBHOST_DYNAMIC_DEPTH_CLAMP=0

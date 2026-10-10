@@ -10080,6 +10080,10 @@ constexpr std::uint64_t kTessRingBytes = kTessRegions * kTessRegionBytes;
 // while the renderer's is held.
 std::mutex g_tess_lds_mu;
 std::uint64_t g_tess_ring_address = 0;
+// A ring that grows (tess_ring_grows): each region a buffer of its own, made
+// when no region made so far is free; their addresses, for the same report.
+std::uint64_t g_tess_region_address[kTessRegions] = {};
+std::uint32_t g_tess_regions_made = 0;
 constexpr std::size_t kTessLdsUses = 32;
 TessLdsUse g_tess_lds_uses[kTessLdsUses];
 std::uint64_t g_tess_lds_next = 0;
@@ -10769,6 +10773,14 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     // huge quads across the screen. (Regions went round with the recordings,
     // twice as many as submissions in flight, until 16 submissions in flight
     // would have made them 8 MiB.)
+    //
+    // With small video memory (gpu.cpp, small_vram) the ring grows as it is
+    // needed instead of being made whole at the first tessellated draw: each
+    // region is a buffer of its own, and a recording takes the region that
+    // has been free longest (its submission and the two after it have run),
+    // a new one while fewer than 16 are made, and only then waits for the
+    // oldest - so the ring holds as many regions as recordings in flight
+    // really use. BBHOST_TESS_RING=grow / =whole says instead.
     static DevBuffer ring;
     constexpr std::uint64_t kRingBytes = kTessRingBytes;
     constexpr std::uint64_t kRegions = kTessRegions;
@@ -10776,16 +10788,22 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     struct Region {
         std::uint64_t off = 0, serial = ~0ull;  // Gpu::record_serial of the recording it belongs to
         std::uint64_t submission = 0;           // Gpu::flushes when that recording began: its submission serial
+        DevBuffer buf;                          // its own buffer, in a ring that grows
     };
     static Region regions[kRegions];
     static std::uint64_t taken = 0;  // regions handed out
+    static Region* current = nullptr;
+    static const bool grows = [] {
+        const char* e = std::getenv("BBHOST_TESS_RING");
+        return e && *e ? std::strcmp(e, "grow") == 0 : g.small_vram;
+    }();
     // Device-local: the stages behind it read and write it all draw long - the
     // game's own hull shaders and their domain shaders, at up to 16 cells a
     // side, cost 26 ms of GPU a frame in the Forbidden Woods with it in host
     // memory. Host-visible only for BBHOST_TESS_DEBUG and
     // BBHOST_DUMP_ON_BRIGHT, which read it back.
     static const bool ring_read_back = std::getenv("BBHOST_TESS_DEBUG") || std::getenv("BBHOST_DUMP_ON_BRIGHT");
-    if (!ring.buffer) {
+    if (!grows && !ring.buffer) {
         if (!create_dev_buffer(ring, kRingBytes, ring_read_back, ring_read_back)) return false;
         std::lock_guard<std::mutex> lk(g_tess_lds_mu);
         g_tess_ring_address = ring.address;
@@ -10799,15 +10817,59 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
         return false;
     }
     begin_recording_locked();  // this recording's serial is the one the region belongs to
-    Region* region = taken ? &regions[(taken - 1) % kRegions] : nullptr;
+    Region* region = current;
     if (region && region->serial == g.record_serial && region->off + bytes > kRegionBytes) {
         submit_locked();  // the next recording, with a region of its own
         begin_recording_locked();
     }
     if (!region || region->serial != g.record_serial) {
-        region = &regions[taken++ % kRegions];
-        if (region->serial != ~0ull) wait_submission_locked(region->submission + 2);
-        *region = {0, g.record_serial, g.flushes};
+        if (!grows) {
+            region = &regions[taken++ % kRegions];
+            if (region->serial != ~0ull) wait_submission_locked(region->submission + 2);
+        } else {
+            Region* idle = nullptr;
+            Region* unmade = nullptr;
+            Region* oldest = nullptr;
+            for (Region& r : regions) {
+                if (!r.buf.buffer) {
+                    if (!unmade) unmade = &r;
+                    continue;
+                }
+                if ((r.serial == ~0ull || g.completed_submits > r.submission + 2) && (!idle || r.submission < idle->submission)) idle = &r;
+                if (!oldest || r.submission < oldest->submission) oldest = &r;
+            }
+            region = idle;
+            if (!region && unmade && create_dev_buffer(unmade->buf, kRegionBytes, ring_read_back, ring_read_back)) {
+                region = unmade;
+                std::lock_guard<std::mutex> lk(g_tess_lds_mu);
+                g_tess_region_address[region - regions] = region->buf.address;
+                ++g_tess_regions_made;
+                host_log("render: tessellation LDS ring: region %u made (%llu MiB each)%s", g_tess_regions_made,
+                         static_cast<unsigned long long>(kRegionBytes >> 20), region->buf.in_host ? ", in host memory" : "");
+            }
+            if (!region) {
+                if (!oldest) return false;
+                wait_submission_locked(oldest->submission + 2);
+                region = oldest;
+            }
+            // One a shortage put in host memory is made again in video memory
+            // once there is room (it is free: nothing in flight reads it).
+            if (region->buf.in_host && vram_return_on() && vram_room_for(kRegionBytes)) {
+                DevBuffer nb;
+                if (create_dev_buffer(nb, kRegionBytes, ring_read_back, ring_read_back) && !nb.in_host) {
+                    defer_destroy(region->buf);
+                    region->buf = nb;
+                    std::lock_guard<std::mutex> lk(g_tess_lds_mu);
+                    g_tess_region_address[region - regions] = region->buf.address;
+                } else if (nb.buffer) {
+                    defer_destroy(nb);
+                }
+            }
+        }
+        region->off = 0;
+        region->serial = g.record_serial;
+        region->submission = g.flushes;
+        current = region;
     }
     t.patch_stride = static_cast<std::uint32_t>(stride);
     t.patch_base = static_cast<std::uint32_t>(base);
@@ -10819,7 +10881,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
             std::memcpy(t.cull_w, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cb + 48)), sizeof(t.cull_w));
         }
     }
-    t.lds_address = ring.address + static_cast<std::uint64_t>(region - regions) * kRegionBytes + region->off;
+    t.lds_address = (grows ? region->buf.address : ring.address + static_cast<std::uint64_t>(region - regions) * kRegionBytes) + region->off;
     t.lds_bytes = static_cast<std::uint32_t>(bytes);  // at most a region (checked above)
     region->off = (region->off + bytes + 255) & ~255ull;
     {
@@ -13929,10 +13991,27 @@ bool dump_rt_locked(RtImage& r, const char* path);
 namespace gpu {
 std::string tess_lds_describe(std::uint64_t addr, std::uint64_t precision) {
     std::lock_guard<std::mutex> lk(g_tess_lds_mu);
-    if (!g_tess_ring_address) return {};
+    if (!g_tess_ring_address && !g_tess_regions_made) return {};
     TessLdsUse uses[kTessLdsUses];
     const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>(g_tess_lds_next, kTessLdsUses));
     for (std::size_t k = 0; k < n; ++k) uses[k] = g_tess_lds_uses[(g_tess_lds_next - 1 - k) % kTessLdsUses];  // newest first
+    if (!g_tess_ring_address) {
+        // A ring that grows: against the region holding the address, else the
+        // nearest one below it (the first made when none is).
+        std::uint64_t region = 0;
+        for (std::uint64_t a : g_tess_region_address) {
+            if (a && a <= addr && a > region) region = a;
+        }
+        if (!region) {
+            for (std::uint64_t a : g_tess_region_address) {
+                if (a) {
+                    region = a;
+                    break;
+                }
+            }
+        }
+        return tess_lds_where(region, kTessRegionBytes, kTessRegionBytes, uses, n, addr, precision);
+    }
     return tess_lds_where(g_tess_ring_address, kTessRingBytes, kTessRegionBytes, uses, n, addr, precision);
 }
 

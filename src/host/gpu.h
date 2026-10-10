@@ -235,6 +235,11 @@ bool host_gpu_device_lost();
 // memory_tight; a Steam Deck does). Callable before host_gpu_init: the guest
 // patches size the render targets' heap by it.
 bool host_gpu_memory_tight();
+// Whether the GPU run on is a discrete one with little video memory free -
+// under 7.5 GiB at the start (BBHOST_SMALL_VRAM=0/1 says otherwise) - so the
+// small-video-memory settings apply. Before the device exists, as
+// host_gpu_memory_tight.
+bool host_gpu_small_vram();
 // Queues one compute dispatch. Returns false when the shader could not be
 // translated or queued (the caller logs and continues). Queued work runs at
 // the next host_gpu_flush().

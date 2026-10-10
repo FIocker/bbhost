@@ -1419,6 +1419,10 @@ struct Candidate {
     int type_rank = 0;
     VkDeviceSize local = 0;
     VkDeviceSize heaps = 0;  // every heap, device-local or not (memory_tight)
+    // What the heap of its first device-local type has free for this process
+    // now: the driver's budget less its usage (VK_EXT_memory_budget), else the
+    // heap's size (small_vram).
+    VkDeviceSize local_free = 0;
 };
 
 // The usable devices of `instance` and the index of the one to run on in
@@ -1439,9 +1443,10 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
         vkEnumerateDeviceExtensionProperties(d, nullptr, &next, exts.data());
         Candidate c;
         c.device = d;
-        bool host_import = false;
+        bool host_import = false, memory_budget = false;
         for (const VkExtensionProperties& e : exts) {
             if (std::strcmp(e.extensionName, "VK_EXT_external_memory_host") == 0) host_import = true;
+            if (std::strcmp(e.extensionName, "VK_EXT_memory_budget") == 0) memory_budget = true;
             if (std::strcmp(e.extensionName, "VK_KHR_maintenance8") == 0) c.maint8 = true;
             if (std::strcmp(e.extensionName, "VK_KHR_push_descriptor") == 0) c.push = true;
             if (std::strcmp(e.extensionName, VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) c.swapchain = true;
@@ -1458,6 +1463,19 @@ int choose_device(VkInstance instance, bool say, std::vector<Candidate>& usable)
         for (std::uint32_t h = 0; h < mp.memoryHeapCount; ++h) {
             if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) c.local += mp.memoryHeaps[h].size;
             c.heaps += mp.memoryHeaps[h].size;
+        }
+        for (std::uint32_t t = 0; t < mp.memoryTypeCount; ++t) {
+            if (!(mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) continue;
+            const std::uint32_t h = mp.memoryTypes[t].heapIndex;
+            c.local_free = mp.memoryHeaps[h].size;
+            if (memory_budget) {
+                VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+                VkPhysicalDeviceMemoryProperties2 mp2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+                mp2.pNext = &mb;
+                vkGetPhysicalDeviceMemoryProperties2(d, &mp2);
+                if (mb.heapBudget[h]) c.local_free = std::min(c.local_free, mb.heapBudget[h] - std::min(mb.heapBudget[h], mb.heapUsage[h]));
+            }
+            break;
         }
         c.type_rank = dp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU     ? 4
                       : dp.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 3
@@ -1523,6 +1541,28 @@ bool memory_tight(const Candidate& c) {
     return c.heaps < (12ull << 30);
 }
 std::atomic<int> g_tight{-1};  // memory_tight of the device run on, -1 until known
+
+// Whether the device is a discrete GPU with little video memory free for us:
+// under 7.5 GiB at the start (BBHOST_TEST_VRAM_MB's limit when a smaller card
+// is acted out). Then the settings that hold memory ahead are cut - spare
+// image heap blocks, kept untile scratch, a tessellation ring made whole,
+// display buffers for sizes the run may never use - on top of the reserve
+// and the live mirror share. Not on an integrated GPU or with tight memory,
+// which have settings of their own (a Steam Deck). BBHOST_SMALL_VRAM=0/1
+// says instead.
+std::uint64_t start_vram_free(const Candidate& c) {
+    std::uint64_t free = c.local_free;
+    if (const char* t = std::getenv("BBHOST_TEST_VRAM_MB"); t && std::strtoull(t, nullptr, 10))
+        free = std::min<std::uint64_t>(free, std::strtoull(t, nullptr, 10) << 20);
+    return free;
+}
+bool small_vram(const Candidate& c) {
+    const char* e = std::getenv("BBHOST_SMALL_VRAM");
+    if (e && *e) return e[0] != '0';
+    if (c.type_rank == 3 || memory_tight(c)) return false;
+    return start_vram_free(c) < (7680ull << 20);
+}
+std::atomic<int> g_small{-1};  // small_vram of the device run on, -1 until known (the first answer holds)
 
 // OBS's game capture for Vulkan is an implicit layer (in graphics-hook64.dll)
 // that the loader puts into every Vulkan program while OBS is installed,
@@ -1655,6 +1695,15 @@ bool init_locked() {
         g.has_device_fault = c.fault;
         g.integrated = c.type_rank == 3;
         g.tight = memory_tight(c);
+        {
+            int unknown = -1;
+            g_small.compare_exchange_strong(unknown, small_vram(c) ? 1 : 0);
+            g.small_vram = g_small.load() == 1;
+            if (g.small_vram)
+                host_log("gpu: %llu MiB of video memory free at the start: small video memory (BBHOST_SMALL_VRAM=0 says otherwise) - no "
+                         "spare image heap blocks in play, less untile scratch kept, a tessellation ring that grows as it is needed",
+                         static_cast<unsigned long long>(start_vram_free(c) >> 20));
+        }
         if (g_tight.exchange(g.tight ? 1 : 0) == (g.tight ? 0 : 1))
             host_log("gpu: the device chosen has %s memory than the one the guest patches were sized for", g.tight ? "less" : "more");
         if (g.tight) host_log("gpu: %llu MiB in all heaps: tight memory (BBHOST_TIGHT_MEMORY=0 says otherwise) - no buffer shadow, fewer spares during loads, live resolution up to 1080p's pixels",
@@ -3962,8 +4011,10 @@ std::atomic<std::uint64_t> g_scratch_refusals{0};  // chunks not made for want o
 void scratch_let_go_locked(const DevBuffer& b) {
     // Not kept while video memory is down to the reserve, nor one in host
     // memory (made while video memory was full): the next chunk is made in
-    // video memory if there is room by then (vram_return_on).
-    if (g.scratch_free_bytes + b.size <= kScratchKeepBytes && !vram_within_reserve() && !(b.in_host && vram_return_on())) {
+    // video memory if there is room by then (vram_return_on). With small
+    // video memory (small_vram) one chunk is kept, not four.
+    const std::uint64_t keep = g.small_vram ? kScratchChunkBytes : kScratchKeepBytes;
+    if (g.scratch_free_bytes + b.size <= keep && !vram_within_reserve() && !(b.in_host && vram_return_on())) {
         g.scratch_free.push_back(b);
         g.scratch_free_bytes += b.size;
     } else {
@@ -4365,8 +4416,11 @@ void start_memory_reserve() {
     // what a Steam Deck's world ran out of.
     const std::uint64_t reserve = env("BBHOST_STAGING_RESERVE_MB", g.tight ? 256 : 768) << 20;
     const std::uint64_t floor = std::min(env("BBHOST_STAGING_FLOOR_MB", 256) << 20, reserve);
-    const std::uint64_t spare_play = env("BBHOST_IMAGE_HEAP_SPARE", g.tight ? 0 : 1);
-    const std::uint64_t spare_load = std::max(env("BBHOST_IMAGE_HEAP_SPARE_LOADING", g.tight ? 1 : 4), spare_play);
+    // Small video memory (small_vram) too: a spare block is 256 MiB of it
+    // the targets cannot have.
+    const bool few = g.tight || g.small_vram;
+    const std::uint64_t spare_play = env("BBHOST_IMAGE_HEAP_SPARE", few ? 0 : 1);
+    const std::uint64_t spare_load = std::max(env("BBHOST_IMAGE_HEAP_SPARE_LOADING", few ? 1 : 4), spare_play);
     const bool keeper = env("BBHOST_MEMORY_KEEPER", 1) != 0;
     std::thread([=] {
         host_thread_set_name("bb-reserve");
@@ -4922,6 +4976,29 @@ bool host_gpu_memory_tight() {
     int unknown = -1;
     g_tight.compare_exchange_strong(unknown, tight ? 1 : 0);
     return g_tight.load() == 1;
+}
+
+bool host_gpu_small_vram() {
+    if (const int s = g_small.load(); s >= 0) return s == 1;
+    bool small = false;
+    if (g_enabled) {
+        obs_capture_policy();  // before the first instance
+        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+        app.pApplicationName = "bbhost";
+        app.apiVersion = VK_API_VERSION_1_3;
+        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+        ici.pApplicationInfo = &app;
+        VkInstance instance = VK_NULL_HANDLE;
+        if (vkCreateInstance(&ici, nullptr, &instance) == VK_SUCCESS) {
+            std::vector<Candidate> usable;
+            const int chosen = choose_device(instance, false, usable);
+            if (chosen >= 0) small = small_vram(usable[static_cast<std::size_t>(chosen)]);
+            vkDestroyInstance(instance, nullptr);
+        }
+    }
+    int unknown = -1;
+    g_small.compare_exchange_strong(unknown, small ? 1 : 0);
+    return g_small.load() == 1;
 }
 
 bool host_gpu_available() {
