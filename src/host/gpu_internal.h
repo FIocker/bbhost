@@ -160,6 +160,7 @@ struct ComputePipeline {
     int fill_dst_sgpr = -1;   // user SGPR of the destination V#
     int fill_cb_sgpr = -1;    // user SGPR of the constant buffer V#
     std::uint32_t fill_cb_dw = 0;  // dword offset of the value in it
+    bool fill_format = false;      // it stores with buffer_store_format_xyzw (through the V#'s format and select)
     // A "copy" shader: buffer_load_format_x from one user-data V# and
     // buffer_store_format_x to another, nothing else. A copy out of a
     // render target becomes an image copy into a snapshot image.

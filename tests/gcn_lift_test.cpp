@@ -2192,6 +2192,11 @@ struct Asm {
     void smrd_reg(std::uint32_t op, std::uint32_t sdst, std::uint32_t sbase, std::uint32_t soff) {
         w.push_back(0xc0000000u | op << 22 | sdst << 15 | (sbase / 2) << 9 | soff);
     }
+    // tbuffer_load_format_* (op 0-3) vdata, vaddr (an index, idxen), s[srsrc..+3], soffset 0, format dfmt/nfmt.
+    void tbuffer_load(std::uint32_t op, std::uint32_t vdata, std::uint32_t vaddr, std::uint32_t srsrc, std::uint32_t dfmt, std::uint32_t nfmt) {
+        w.push_back(0xe8000000u | nfmt << 23 | dfmt << 19 | op << 16 | 1u << 13);
+        w.push_back(vaddr | vdata << 8 | (srsrc / 4) << 16 | 128u << 24);
+    }
     void vop1(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0) { w.push_back(0x7e000000u | vdst << 17 | op << 9 | src0); }
     // `vsrc1` is the 8-bit field: a VGPR index, or for v_readlane/v_writelane_b32 the lane's scalar code.
     void vop2(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0, std::uint32_t vsrc1) { w.push_back(op << 25 | vdst << 17 | vsrc1 << 9 | src0); }
@@ -2510,6 +2515,7 @@ ScalarRun run_scalar_ps(const std::vector<std::uint32_t>& spv, const std::array<
         case 43: constants[a[1]] = a[2]; continue;
         case 41: constants[a[1]] = 1; continue;
         case 42: constants[a[1]] = 0; continue;
+        case 50: constants[a[1]] = a[2]; continue;  // OpSpecConstant: its default
         case 248: in_body = true; continue;
         default: break;
         }
@@ -2527,6 +2533,9 @@ ScalarRun run_scalar_ps(const std::vector<std::uint32_t>& spv, const std::array<
             chains[a[1]] = c;
             break;
         }
+        case 132: set(a[1], g0(a[2]) * g0(a[3])); break;   // OpIMul
+        case 170: set(a[1], g0(a[2]) == g0(a[3])); break;  // OpIEqual
+        case 171: set(a[1], g0(a[2]) != g0(a[3])); break;  // OpINotEqual
         case 61: {  // OpLoad
             const auto c = chains.find(a[2]);
             if (c == chains.end()) return fail("a load of something other than the params or a storage buffer");
@@ -2627,6 +2636,51 @@ void ranged_loads() {
     // words are data the lift does not have.
     CHECK(rejected_with(lift_words(program(), nullptr, nullptr, {"user_sgpr[2]->load(+16)"}),
                         "data from a scalar load the reference walks the page table for"));
+}
+
+// tbuffer_load_format_* by index from a V# in a table: the instruction's
+// format with the identity select (gcn::tbuffer_dst_sel), whatever the V#'s
+// DST_SEL - the lifted module reads the element and never the params' word 3
+// (the interpreter refuses a load of it), and a VGPR past the format's
+// components reads 0.
+void typed_loads() {
+    const auto program = [&](std::uint32_t op, std::uint32_t dfmt) {
+        Asm a;
+        a.smrd(kLoadX4, 8, 2, 4);  // s_load_dwordx4 s[8:11], s[2:3], 0x4: the V#
+        a.sopp(kWaitcnt, 0);
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop1(kVMov, k, kC0 + 9);  // v0..v3 = 9, to see what a load leaves
+        a.vop1(kVMov, 4, 1);       // v4 = s1: the element's index
+        a.tbuffer_load(op, 0, 4, 8, dfmt, 7);
+        a.sopp(kWaitcnt, 0);
+        a.exp_mrt0(0, 1, 2, 3);
+        a.endpgm();
+        return a.w;
+    };
+    std::vector<std::uint32_t> data(64);
+    for (std::uint32_t k = 0; k < 64; ++k) data[k] = 0x2000u + k;
+    for (const auto& [op, dfmt, comps] : {std::array<std::uint32_t, 3>{3, 14, 4}, {3, 13, 3}, {2, 11, 2}, {0, 4, 1}, {1, 14, 4}}) {
+        gcn::TranslateResult ref;
+        const gcn::LiftResult l = lift_words(program(op, dfmt), nullptr, &ref);
+        CHECK(lifted_valid(l));
+        CHECK(ref.buffers.size() == 2 && ref.buffers[1].indexed && !ref.buffers[1].ranged);
+        if (!l.ok() || ref.buffers.size() != 2) continue;
+        for (const std::uint32_t index : {0u, 3u}) {
+            std::array<std::uint32_t, 16> user{}, bias{}, stride{};
+            user[1] = index;
+            bias[1] = 2;
+            stride[1] = 16;  // StageParams::cb_stride: the V#'s stride in bytes
+            const ScalarRun r = run_scalar_ps(l.spirv, user, bias, stride, {{ref.buffers[0].binding, std::vector<std::uint32_t>(16, 0)}, {ref.buffers[1].binding, data}});
+            if (!r.ok) std::fprintf(stderr, "typed load dfmt %u: %s\n", dfmt, r.error.c_str());
+            CHECK(r.ok);
+            for (std::uint32_t k = 0; k < 4 && r.ok; ++k) {
+                const std::uint32_t want = k > op ? 9u : k < comps ? data[2 + index * 4 + k] : 0u;
+                if (r.mrt0[k] != want) {
+                    std::fprintf(stderr, "typed load op %u dfmt %u, element %u: component %u read %08x, expected %08x\n", op, dfmt, index, k, r.mrt0[k], want);
+                    ++g_failures;
+                }
+            }
+        }
+    }
 }
 
 // Copies of a V#: a spill to lanes of a VGPR and back (v_writelane_b32 /
@@ -2818,6 +2872,7 @@ void run() {
     spills();
     descriptor_loads();
     ranged_loads();
+    typed_loads();
     copies();
     cselect();
     lshl_b64();

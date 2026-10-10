@@ -20,6 +20,14 @@ std::atomic<bool> g_runtime_sample_offsets{false};
 void set_runtime_sample_offsets(bool on) { g_runtime_sample_offsets.store(on, std::memory_order_relaxed); }
 bool runtime_sample_offsets() { return g_runtime_sample_offsets.load(std::memory_order_relaxed); }
 
+bool tbuffer_dst_sel() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_TBUFFER_DST_SEL");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
 std::string translation_switches() {
     // The variables as given rather than what each decides: two spellings of
     // one setting only cost a second entry.
@@ -29,7 +37,8 @@ std::string translation_switches() {
     };
     std::string s = std::string("offsets=") + (runtime_sample_offsets() ? "1" : "0") + ";half_rtz=" + (native_half_rtz() ? "1" : "0") +
                     ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_min_form() ? "min" : "select") + ";";
-    for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS", "BBHOST_CB_RANGED"}) {
+    for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS", "BBHOST_CB_RANGED",
+                             "BBHOST_TBUFFER_DST_SEL"}) {
         s += env(name);
     }
     return s;
@@ -2517,13 +2526,12 @@ struct Translator {
     // TranslateOptions::cb_ssbo: a typed load indexed into a V# traced to user
     // data or a table (tbuffer_load_format_* with idxen: arrays of constants)
     // reads the V#'s storage buffer at dword (offset12 + soffset) / 4 + index *
-    // stride / 4, with the stride and word 3 the host passes. The host binds
-    // the V#'s records and leaves the binding unbound when the stride is not in
-    // dwords. False when the load has another shape.
+    // stride / 4, with the stride the host passes. The host binds the V#'s
+    // records and leaves the binding unbound when the stride is not in dwords.
+    // False when the load has another shape.
     const char* indexed_reject = "";  // why indexed_buffer_load declined the last load, for TranslateResult::walks
-    Id cb_w3_spec[kMaxBuffers] = {};   // the specialization constant of each buffer's word 3, once used
-    Id cb_stride_spec[kMaxBuffers] = {};  // and of its stride (kCbStrideSpecId)
-    bool indexed_buffer_load(const Inst& in, std::vector<Id>& comps, Id& w3) {
+    Id cb_stride_spec[kMaxBuffers] = {};  // the specialization constant of each buffer's stride (kCbStrideSpecId)
+    bool indexed_buffer_load(const Inst& in, std::vector<Id>& comps) {
         int count = 0, bits[4] = {};
         const auto reject = [&](const char* why) {
             indexed_reject = why;
@@ -2560,13 +2568,6 @@ struct Translator {
         // The element's guest address feeds only the fallback walk.
         const Id guest = opt.cb_no_fallback ? m.const_u64(0) : buffer_address(in).addr;
         comps = format_decode(read_bound(index, in.srsrc, first, nwords, guest), in.dfmt, in.nfmt, 4);
-        if (opt.cb_no_fallback) {
-            Id& spec = cb_w3_spec[index];  // translate.h kCbW3SpecId
-            if (!spec) spec = m.spec_const_u32(0, kCbW3SpecId + static_cast<std::uint32_t>(index));
-            w3 = sel(ine(spec, c_zero_u), spec, params_u32(6, index));
-        } else {
-            w3 = sel(buffer_bound(index), params_u32(6, index), read_s(in.srsrc + 3, in));
-        }
         return true;
     }
     // A static format's `want` components from the dwords holding one element.
@@ -2757,15 +2758,23 @@ struct Translator {
     void mtbuf(const Inst& in) {
         const int n = (in.op & 3) + 1;
         if (in.op < 4) {
+            // A typed load takes its format from the instruction and the
+            // identity select, whatever the V#'s DST_SEL says (the Sea Islands
+            // ISA's table 8.4: X000, XY00, XYZ0 or XYZW by the format's
+            // components, so a VGPR past them reads 0). BBHOST_TBUFFER_DST_SEL=1
+            // applies the V#'s select instead, as before.
             std::vector<Id> comps;
-            Id w3 = 0;
-            if (!indexed_buffer_load(in, comps, w3)) {
+            if (!indexed_buffer_load(in, comps)) {
                 note_walk(mnemonic(in) + buffer_walk_form(in) + indexed_reject);
                 comps = format_load(buffer_address(in).addr, in.dfmt, in.nfmt, 4);
-                w3 = read_s(in.srsrc + 3, in);
             }
-            const Id is_int = m.const_bool(in.nfmt == 4 || in.nfmt == 5);
-            write_swizzled(in.vdata, n, comps, w3, is_int);
+            if (tbuffer_dst_sel()) {
+                write_swizzled(in.vdata, n, comps, read_s(in.srsrc + 3, in), m.const_bool(in.nfmt == 4 || in.nfmt == 5));
+            } else {
+                int count = 0, bits[4] = {};
+                format_layout(in.dfmt, count, bits);
+                for (int k = 0; k < n; ++k) write_v(in.vdata + k, k < count ? comps[static_cast<std::size_t>(k)] : c_zero_u);
+            }
         } else {
             note_walk(mnemonic(in) + buffer_walk_form(in));
             note_store(in);

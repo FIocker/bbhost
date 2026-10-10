@@ -1923,6 +1923,15 @@ int draw_ps_kind(const GfxPipeline& p) {
     if (!p.ps.module && p.ps.meta().spirv.empty()) return kDrawPsNone;
     return p.lean ? kDrawPsTranslated : kDrawPsFallback;
 }
+// Typed-load V#s (BufferBinding::indexed) whose DST_SEL is not X Y Z W: how
+// many bindings, and the first selects seen with their paths. Under g.mu.
+std::uint64_t g_typed_selects = 0;
+std::map<std::uint32_t, std::string> g_typed_select_seen;
+void note_typed_select(std::uint32_t w3, const gcn::ResourcePath& path) {
+    ++g_typed_selects;
+    if (g_typed_select_seen.size() < 16) g_typed_select_seen.emplace(w3 & 0xfff, path.str());
+}
+
 // The draws whose vertex shader the lifter does not take (kDrawVsOther), by
 // program and why (DrawVsWhy), for render_report: what the rest of the vertex
 // side is made of. Under g.mu.
@@ -7124,6 +7133,16 @@ void render_report() {
                  static_cast<unsigned long long>(g_plans_used), checked.c_str());
     }
     report_gx_state_compare();
+    {
+        std::string seen;
+        for (const auto& [sel, path] : g_typed_select_seen) {
+            char b[24];
+            std::snprintf(b, sizeof(b), "%s%03x ", seen.empty() ? "" : ", ", sel);
+            seen += b + path;
+        }
+        host_log("render: typed loads through a V# whose DST_SEL is not X Y Z W (ignored, as the ISA's identity rule says): %llu bindings%s%s",
+                 static_cast<unsigned long long>(g_typed_selects), seen.empty() ? "" : "; selects ", seen.c_str());
+    }
     if (!g_vs_other.empty()) {
         // The vertex shaders the lifter does not take, by draws: the 40 most
         // drawn, each with its draws by why.
@@ -8418,6 +8437,10 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                                               : std::max<VkDeviceSize>(bytes, static_cast<VkDeviceSize>(words[2]) * stride);
             params.cb_stride[i] = stride;
             params.cb_w3[i] = words[3];
+            // A typed load takes the identity select whatever the V#'s DST_SEL
+            // (gcn::tbuffer_dst_sel): the V#s whose own select is another, for
+            // render_report - where the old rule and the ISA's part.
+            if (resolved && (words[3] & 0xfff) != 0xfac) note_typed_select(words[3], b.path);
         }
         // A V# read at a run-time offset is read anywhere in its range, which
         // the shader checks each dword against (gcn::vsharp_range_dwords).

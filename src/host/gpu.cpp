@@ -2658,7 +2658,7 @@ void detect_fill(const gcn::Program& prog, ComputePipeline& pl) {
     int load_dst = -1, load_base = -1;
     std::uint32_t load_off = 0;
     int store_srsrc = -1;
-    bool other_memory = false;
+    bool other_memory = false, format_store = false;
     int stores = 0;
     for (const gcn::Inst& in : prog.insts) {
         switch (in.enc) {
@@ -2674,6 +2674,7 @@ void detect_fill(const gcn::Program& prog, ComputePipeline& pl) {
             case gcn::Enc::MUBUF:
                 if ((in.op == 7 || in.op == 30) && (store_srsrc < 0 || store_srsrc == in.srsrc)) {
                     store_srsrc = in.srsrc;
+                    format_store = format_store || in.op == 7;
                     ++stores;
                 } else {
                     other_memory = true;
@@ -2694,6 +2695,7 @@ void detect_fill(const gcn::Program& prog, ComputePipeline& pl) {
     pl.fill_dst_sgpr = store_srsrc;
     pl.fill_cb_sgpr = load_base;
     pl.fill_cb_dw = load_off;
+    pl.fill_format = format_store;
 }
 
 void detect_copy(const gcn::Program& prog, ComputePipeline& pl) {
@@ -5584,6 +5586,19 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         const std::uint32_t* c = &d.user_data[pl.fill_cb_sgpr];
         const std::uint64_t cb = (static_cast<std::uint64_t>(c[0]) | (static_cast<std::uint64_t>(c[1] & 0xff) << 32)) + pl.fill_cb_dw * 4;
         float rgba[4] = {};
+        // The fill takes the value as given: what a buffer_store_format_xyzw
+        // through a V# of 32_32_32_32 with the select X Y Z W writes. Another
+        // format or select would convert it and put each component through the
+        // select's inverse on the console (GX's own fill, gx_fill_resource,
+        // builds its V# so: 0xfac40e); logged once if one is ever seen.
+        if (pl.fill_format && (((v[3] >> 15) & 0xf) != 14 || (v[3] & 0xfff) != 0xfac)) {
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true)) {
+                host_log("gpu: fill dispatch %s stores through a V# whose format or select is not 32_32_32_32 X Y Z W (word 3 %08x): the value "
+                         "is filled as given",
+                         pl.name.c_str(), v[3]);
+            }
+        }
         if (hle_kernel_va_mapped(cb, 16)) {
             std::memcpy(rgba, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cb)), 16);
             static std::set<std::uint64_t> seen_bases;

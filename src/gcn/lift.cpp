@@ -252,7 +252,7 @@ private:
     std::map<std::uint32_t, Id> in_location_vars;  // PS: location -> the Input vec4 there (attr)
     Id in_frag_coord = 0, in_front_facing = 0, in_vertex_index = 0, in_instance_index = 0, out_pos = 0, in_helper = 0;
     std::map<std::uint32_t, Id> vertex_in_vars;  // TranslateOptions::vertex_input locations
-    std::map<std::uint32_t, Id> bias_loads, stride_loads, w3_loads;  // StageParams cb_bias_dw / cb_stride / cb_w3 per buffer
+    std::map<std::uint32_t, Id> bias_loads, stride_loads;  // StageParams cb_bias_dw / cb_stride per buffer
     struct PackedPair {
         Id lo, hi;
         std::uint32_t block;  // Module::blocks() when packed
@@ -1973,14 +1973,11 @@ private:
         ++ranged_loads;
     }
 
-    // A typed load's V# word 3 (StageParams::cb_w3), as translate.cpp
+    // A typed load's stride (StageParams::cb_stride), as translate.cpp
     // indexed_buffer_load reads it: also specialization constant
-    // kCbW3SpecId + index (0, the default, reads the params), which an
-    // optimized relink gives the draw's (render.cpp queue_library_relink) so
-    // the driver folds the DST_SEL selects away.
-    std::map<std::uint32_t, Id> w3_values, stride_values;
-    Id w3_value(std::uint32_t index) { return spec_or_params(w3_values, w3_loads, 6, kCbW3SpecId, index); }
-    // Its stride likewise (kCbStrideSpecId).
+    // kCbStrideSpecId + index (0, the default, reads the params), which an
+    // optimized relink gives the draw's (render.cpp queue_library_relink).
+    std::map<std::uint32_t, Id> stride_values;
     Id stride_value(std::uint32_t index) { return spec_or_params(stride_values, stride_loads, 5, kCbStrideSpecId, index); }
     Id spec_or_params(std::map<std::uint32_t, Id>& values, std::map<std::uint32_t, Id>& loads, std::uint32_t member, std::uint32_t spec_id,
                       std::uint32_t index) {
@@ -2046,7 +2043,7 @@ private:
     // tbuffer_load_format_* read by index from a storage buffer the reference
     // binds (translate.cpp indexed_buffer_load with cb_no_fallback): the
     // element at dword (offset12 + soffset) / 4 + index * stride / 4, decoded
-    // by its static format and selected per component by the V#'s word 3.
+    // by its static format, with the identity select (gcn::tbuffer_dst_sel).
     void mtbuf(const Inst& in) {
         if (in.op >= 4) {
             reject(std::string(mnemonic(in)) + " is not lifted");
@@ -2084,13 +2081,20 @@ private:
             const Id raw = bits[k] == 32 ? w : m.emit(spv::OpBitFieldUExtract, t_u32, {w, cu(static_cast<std::uint32_t>(bit % 32)), cu(static_cast<std::uint32_t>(bits[k]))});
             comps[static_cast<std::size_t>(k)] = convert_component(raw, bits[k], in.nfmt);
         }
-        if (count < 4) comps[3] = one;  // missing components are 0, 0, 0, 1
-        const Id w3 = w3_value(index);
         std::vector<Val> out;
-        for (int k = 0; k < (in.op & 3) + 1; ++k) {  // DST_SEL: 4-7 a component, 1 one, else zero
-            const Id s3 = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(3u * static_cast<std::uint32_t>(k)), cu(3)});
-            const auto pick = [&](std::uint32_t code, Id then_v, Id else_v) { return m.emit(spv::OpSelect, t_u32, {ieq(s3, cu(code)), then_v, else_v}); };
-            out.push_back(word(pick(4, comps[0], pick(5, comps[1], pick(6, comps[2], pick(7, comps[3], pick(1, one, cu(0))))))));
+        if (tbuffer_dst_sel()) {
+            // BBHOST_TBUFFER_DST_SEL=1, as the translator then reads it: the
+            // V#'s select over the components with 0, 0, 0, 1 past them.
+            if (count < 4) comps[3] = one;
+            const Id w3 = as_u(read(static_cast<std::uint16_t>(in.srsrc + 3), in));
+            for (int k = 0; k < (in.op & 3) + 1; ++k) {  // DST_SEL: 4-7 a component, 1 one, else zero
+                const Id s3 = m.emit(spv::OpBitFieldUExtract, t_u32, {w3, cu(3u * static_cast<std::uint32_t>(k)), cu(3)});
+                const auto pick = [&](std::uint32_t code, Id then_v, Id else_v) { return m.emit(spv::OpSelect, t_u32, {ieq(s3, cu(code)), then_v, else_v}); };
+                out.push_back(word(pick(4, comps[0], pick(5, comps[1], pick(6, comps[2], pick(7, comps[3], pick(1, one, cu(0))))))));
+            }
+        } else {
+            // The identity select: the format's components in order, 0 past them.
+            for (int k = 0; k < (in.op & 3) + 1; ++k) out.push_back(word(k < count ? comps[static_cast<std::size_t>(k)] : cu(0)));
         }
         for (std::size_t k = 0; k < out.size(); ++k) write_v(in.vdata + static_cast<int>(k), out[k]);
         ++buffer_loads;

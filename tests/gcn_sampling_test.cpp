@@ -296,6 +296,63 @@ struct Fixture {
         return ok;
     }
 
+    // tbuffer_load_format_* takes the instruction's format and the identity
+    // select - X000, XY00, XYZ0 or XYZW by the format's components - whatever
+    // the V#'s DST_SEL holds (the ISA's buffer instruction table); its VGPRs
+    // go to the destination texel. Elements of four floats (1, 2, 3, 4) + 4i
+    // at the guest page; the V# in s[12:15] with stride 16; v0 the index.
+    // Walked (`cb` 0) or through the storage-buffer binding (`cb` 2).
+    bool run_typed_load(int cb, std::uint32_t dfmt, int vgprs, std::uint32_t v_w3, const float (&want)[4], const char* what) {
+        auto* params = static_cast<gcn::StageParams*>(mapped);
+        params->user_sgpr[3] = 0xfac; params->user_sgpr[8] = 0;
+        float* mem = reinterpret_cast<float*>(guest_map + (kGuestData & 0xffff));
+        for (int k = 0; k < 64; ++k) mem[k] = reinterpret_cast<float*>(cb_map)[k] = float(k + 1);
+        params->user_sgpr[12] = static_cast<std::uint32_t>(kGuestData);
+        params->user_sgpr[13] = static_cast<std::uint32_t>(kGuestData >> 32) | 16u << 16;
+        params->user_sgpr[14] = 4;
+        params->user_sgpr[15] = v_w3;
+        params->cb_valid = cb ? 1u : 0u;
+        params->cb_bias_dw[0] = 0;
+        params->cb_stride[0] = 16;
+        params->cb_w3[0] = v_w3;
+        std::vector<gcn::Inst> body;
+        body.push_back(vmov(0, 1));  // element 1: (5, 6, 7, 8)
+        for (int k = 0; k < 4; ++k) body.push_back(vmov(16 + k, std::bit_cast<std::uint32_t>(-1.0f)));
+        gcn::Inst load; load.enc = gcn::Enc::MTBUF; load.op = static_cast<std::uint16_t>(vgprs - 1);  // tbuffer_load_format_x..xyzw
+        load.vaddr = 0; load.vdata = 16; load.srsrc = 12; load.soffset = 128; load.idxen = true; load.dfmt = static_cast<std::uint8_t>(dfmt); load.nfmt = 7;
+        body.push_back(load);
+        image_store_body(body);
+        const auto got = dispatch_compute(body, 16, cb);
+        params->cb_valid = 0;
+        const bool ok = near4(got, want);
+        std::printf("%s tbuffer_load_format (%s), dfmt %u into %d VGPRs, V# select %03x (%s): got (%g,%g,%g,%g), expected (%g,%g,%g,%g)\n",
+                    ok ? "PASS" : "FAIL", cb ? "bound" : "walked", dfmt, vgprs, v_w3 & 0xfff, what, got[0], got[1], got[2], got[3], want[0], want[1],
+                    want[2], want[3]);
+        return ok;
+    }
+    // buffer_load_format_* takes the V#'s format and its select: the same
+    // element read through 32_32_32_32 float with Z Y X W.
+    bool run_format_load_select() {
+        auto* params = static_cast<gcn::StageParams*>(mapped);
+        params->user_sgpr[3] = 0xfac; params->user_sgpr[8] = 0;
+        float* mem = reinterpret_cast<float*>(guest_map + (kGuestData & 0xffff));
+        for (int k = 0; k < 64; ++k) mem[k] = float(k + 1);
+        params->user_sgpr[12] = static_cast<std::uint32_t>(kGuestData);
+        params->user_sgpr[13] = static_cast<std::uint32_t>(kGuestData >> 32) | 16u << 16;
+        params->user_sgpr[14] = 4;
+        params->user_sgpr[15] = 14u << 15 | 7u << 12 | 0xf2eu;  // 32_32_32_32 float, Z Y X W
+        std::vector<gcn::Inst> body;
+        body.push_back(vmov(0, 1));
+        gcn::Inst load; load.enc = gcn::Enc::MUBUF; load.op = 3;  // buffer_load_format_xyzw
+        load.vaddr = 0; load.vdata = 16; load.srsrc = 12; load.soffset = 128; load.idxen = true; body.push_back(load);
+        image_store_body(body);
+        const auto got = dispatch_compute(body, 16);
+        const float want[4] = {7, 6, 5, 8};
+        const bool ok = near4(got, want);
+        std::printf("%s buffer_load_format_xyzw through the V#'s Z Y X W: got (%g,%g,%g,%g), expected (7,6,5,8)\n", ok ? "PASS" : "FAIL", got[0], got[1],
+                    got[2], got[3]);
+        return ok;
+    }
     void bind_sampled(VkImageView view) {
         VkDescriptorImageInfo info{{}, view, VK_IMAGE_LAYOUT_GENERAL};
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -615,6 +672,18 @@ int main() try {
     f.init_guest();
     ok &= f.run_upload_copy();
     ok &= f.run_buffer_store_select();
+    // Typed loads: the identity select, whatever the V#'s (32_32_32_32 float
+    // element (5, 6, 7, 8) read through four formats, walked and bound).
+    for (const int cb : {0, 2}) {
+        const std::uint32_t xyzw = 14u << 15 | 7u << 12 | 0xfac, zyxw = 14u << 15 | 7u << 12 | 0xf2e, zero = 14u << 15 | 7u << 12;
+        ok &= f.run_typed_load(cb, 14, 4, xyzw, {5, 6, 7, 8}, "X Y Z W");
+        ok &= f.run_typed_load(cb, 14, 4, zyxw, {5, 6, 7, 8}, "Z Y X W, ignored");
+        ok &= f.run_typed_load(cb, 14, 4, zero, {5, 6, 7, 8}, "0 0 0 0, ignored");
+        ok &= f.run_typed_load(cb, 13, 4, xyzw, {5, 6, 7, 0}, "a three-component format into four VGPRs: XYZ0");
+        ok &= f.run_typed_load(cb, 11, 3, xyzw, {5, 6, 0, -1}, "two components into three: XY0");
+        ok &= f.run_typed_load(cb, 4, 1, zyxw, {5, -1, -1, -1}, "one component");
+    }
+    ok &= f.run_format_load_select();
     // Ranged scalar loads: ten dwords of range (40 bytes, stride 0; 2 records
     // of 20 bytes); the offset's two low bits ignored; past the range 0.
     for (const int cb : {1, 2}) {

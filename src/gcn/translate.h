@@ -483,6 +483,13 @@ TranslateResult translate(const Program& program, const TranslateOptions& option
 void set_runtime_sample_offsets(bool on);
 bool runtime_sample_offsets();
 
+// Typed buffer loads (tbuffer_load_format_*) take the identity select - X000,
+// XY00, XYZ0 or XYZW by the format's components - whatever the V#'s DST_SEL
+// holds, as the ISA's buffer instruction table says. BBHOST_TBUFFER_DST_SEL=1
+// applies the V#'s select instead, as the translator did before (an A/B
+// switch, part of translation_switches()).
+bool tbuffer_dst_sel();
+
 // Every process-wide switch a translation reads besides its TranslateOptions -
 // the device features the host sets above (half.h's too) and the BBHOST_*
 // variables the translator looks at - as one string. The host's translation
