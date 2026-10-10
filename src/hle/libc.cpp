@@ -326,116 +326,48 @@ GUEST_ABI std::int64_t hle_clock() {
 GUEST_ABI double hle_difftime(std::int64_t a, std::int64_t b) {
     return std::difftime(static_cast<std::time_t>(a), static_cast<std::time_t>(b));
 }
-// The guest's struct tm is FreeBSD's: the nine ints, then tm_gmtoff (long)
-// and tm_zone (char*), 56 bytes. glibc's is the same; mingw's stops after
-// the ints (36 bytes), so on Windows the guest layout is written by hand
-// from the CRT's fields, the offset and the zone name from the CRT's
-// timezone state, and never a CRT struct handed to the guest as-is (the
-// gettimeofday lesson).
-struct GuestTm {
-    int sec, min, hour, mday, mon, year, wday, yday, isdst;
-    int pad;
-    std::int64_t gmtoff;
-    const char* zone;
-};
-static_assert(sizeof(GuestTm) == 56);
-#if defined(_WIN32)
-void guest_tm_from(const std::tm& src, GuestTm* dst, bool utc) {
-    dst->sec = src.tm_sec;
-    dst->min = src.tm_min;
-    dst->hour = src.tm_hour;
-    dst->mday = src.tm_mday;
-    dst->mon = src.tm_mon;
-    dst->year = src.tm_year;
-    dst->wday = src.tm_wday;
-    dst->yday = src.tm_yday;
-    dst->isdst = src.tm_isdst;
-    dst->pad = 0;
-    if (utc) {
-        dst->gmtoff = 0;
-        dst->zone = "UTC";
-        return;
-    }
-    long tz = 0, dst_bias = 0;
-    _get_timezone(&tz);  // seconds west of UTC, standard time
-    _get_dstbias(&dst_bias);
-    dst->gmtoff = -(tz + (src.tm_isdst > 0 ? dst_bias : 0));
-    static thread_local char zone[64];
-    std::size_t n = 0;
-    if (_get_tzname(&n, zone, sizeof(zone), src.tm_isdst > 0 ? 1 : 0) != 0 || n == 0) std::strcpy(zone, "");
-    dst->zone = zone;
-}
+// Dinkumware tm is nine ints (36 bytes), NOT FreeBSD's 56-byte tm. The
+// guest's localtime_s callers put a stack cookie directly after this buffer.
+// Always translate, including on Linux; handing glibc a guest buffer writes
+// tm_gmtoff/tm_zone over the cookie and saved registers.
+using GuestTm = bb::libc::Tm;
 thread_local GuestTm t_guest_tm;
-#endif
 GUEST_ABI void* hle_gmtime(const std::int64_t* t) {
-    std::time_t tt = t ? static_cast<std::time_t>(*t) : 0;
-#if defined(_WIN32)
+    if (!t) return nullptr;
+    const std::time_t tt = static_cast<std::time_t>(*t);
     std::tm tmp{};
+#if defined(_WIN32)
     if (gmtime_s(&tmp, &tt) != 0) return nullptr;
-    guest_tm_from(tmp, &t_guest_tm, true);
-    return &t_guest_tm;
 #else
-    return std::gmtime(&tt);
+    if (!gmtime_r(&tt, &tmp)) return nullptr;
 #endif
-}
-GUEST_ABI void* hle_localtime(const std::int64_t* t) {
-    std::time_t tt = t ? static_cast<std::time_t>(*t) : 0;
-#if defined(_WIN32)
-    std::tm tmp{};
-    if (localtime_s(&tmp, &tt) != 0) return nullptr;
-    guest_tm_from(tmp, &t_guest_tm, false);
+    bb::libc::tm_from_host(tmp, &t_guest_tm);
     return &t_guest_tm;
-#else
-    return std::localtime(&tt);
-#endif
 }
 GUEST_ABI void* hle_localtime_s(const std::int64_t* t, GuestTm* buf) {
-    std::time_t tt = t ? static_cast<std::time_t>(*t) : 0;
-    if (!buf) {
-        return nullptr;
-    }
-#if defined(_WIN32)
+    if (!t || !buf) return nullptr;
+    const std::time_t tt = static_cast<std::time_t>(*t);
     std::tm tmp{};
+#if defined(_WIN32)
     if (localtime_s(&tmp, &tt) != 0) return nullptr;
-    guest_tm_from(tmp, buf, false);
-    return buf;
 #else
-    return localtime_r(&tt, reinterpret_cast<std::tm*>(buf));
+    if (!localtime_r(&tt, &tmp)) return nullptr;
 #endif
+    bb::libc::tm_from_host(tmp, buf);
+    return buf;  // native returns the destination, not Microsoft's errno_t
 }
-#if defined(_WIN32)
-// The CRT's tm from the guest's: the nine ints lead both layouts.
-std::tm crt_tm_from(const GuestTm* g) {
-    std::tm t{};
-    t.tm_sec = g->sec;
-    t.tm_min = g->min;
-    t.tm_hour = g->hour;
-    t.tm_mday = g->mday;
-    t.tm_mon = g->mon;
-    t.tm_year = g->year;
-    t.tm_wday = g->wday;
-    t.tm_yday = g->yday;
-    t.tm_isdst = g->isdst;
-    return t;
+GUEST_ABI void* hle_localtime(const std::int64_t* t) {
+    return hle_localtime_s(t, &t_guest_tm);
 }
-#endif
 GUEST_ABI std::int64_t hle_mktime(GuestTm* t) {
-#if defined(_WIN32)
-    std::tm c = crt_tm_from(t);
+    std::tm c = bb::libc::tm_to_host(t);
     const std::time_t r = std::mktime(&c);
-    guest_tm_from(c, t, false);  // mktime normalizes its argument
+    bb::libc::tm_from_host(c, t);  // mktime normalizes its argument
     return static_cast<std::int64_t>(r);
-#else
-    return static_cast<std::int64_t>(std::mktime(reinterpret_cast<std::tm*>(t)));
-#endif
 }
 GUEST_ABI std::uint64_t hle_strftime(char* s, std::uint64_t n, const char* fmt, const GuestTm* t) {
-#if defined(_WIN32)
-    const std::tm c = crt_tm_from(t);
+    const std::tm c = bb::libc::tm_to_host(t);
     return std::strftime(s, static_cast<std::size_t>(n), fmt, &c);
-#else
-    return std::strftime(s, static_cast<std::size_t>(n), fmt, reinterpret_cast<const std::tm*>(t));
-#endif
 }
 
 
