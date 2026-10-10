@@ -113,6 +113,15 @@ STAND_REACH = 50.0
 # comes - a new build's first start compiles its shader caches before it.
 TITLE_TAP_FIRST_S = 5.0
 TITLE_TAP_EVERY_S = 2.0
+# Each press is held TITLE_TAP_SEARCH_MS until the game has read one
+# (BBHOST_TRACE_PAD's `pad: buttons` lines), 200 ms after. A pad the game
+# finds disconnected - a headless one before bbhost plugged it in from the
+# start (hle/system.cpp test_pad_plugged) - it reads only once a second, and
+# a 200 ms press landed in one of those reads only when the two clocks lined
+# up: 1-3 minutes on a Steam Deck's cold start. A hold longer than the second
+# meets the next read; the half second released before the next press keeps
+# each press its own.
+TITLE_TAP_SEARCH_MS = 1500
 # Where the player must stay for a place's numbers to count: within STAY_ACROSS
 # metres (and STAY_UP up or down) of where it stood at the arrival, through the
 # window, and within VIEW_REACH of a view's standpoint. A player held still
@@ -291,6 +300,7 @@ def pass_settings(pass_dir, areas, opts, kind):
         "BBHOST_CONFIG_DIR": str(pass_dir / "cfg"), "BBHOST_OPTIONS_PATH": str(pass_dir / "cfg" / "bbhost-options.toml"),
         "BBHOST_PIPELINE_CACHE": "1" if opts["pipeline_cache"] else "0",
         "BBHOST_GAME_FPS": str(opts["fps"]), "BBHOST_FRAME_STATS": "1", "BBHOST_FRAME_DETAIL": "1", "BBHOST_STALL_MS": "40",
+        "BBHOST_TRACE_PAD": "1",
         "BBHOST_TEST_WARP": "1", "BBHOST_TEST_REQUESTS": str(pass_dir / "requests"),
         "BBHOST_MAPVAL_TOUR": str(pass_dir / "tour.txt"), "BBHOST_MAPVAL_START": "%g" % opts["start"],
         "BBHOST_MAPVAL_DUMPS": str(pass_dir / "frames"), "BBHOST_MAPVAL_CAPTURES": str(pass_dir / "captures"),
@@ -360,6 +370,11 @@ DUMP_DONE = re.compile(r"\] test: frame dump at flip (\d+) to (\S+?)( failed)?\s
 CAPTURE_WROTE = re.compile(r"\] capture: wrote (\S+)/manifest\.json \((\S+), flip (\d+)")
 CAPTURE_REJECTED = re.compile(r"\] capture: (\S+) draw \d+ \(flip \d+\) not captured: (.*?)\s*$")
 LOADING = re.compile(r"\] loading: ([\d.]+) s \(flips")
+# The way through the title: the host's answers to the menutap requests, and
+# (BBHOST_TRACE_PAD=1) each change in the buttons the game read.
+TAP_PRESSED = re.compile(r"\] test: menutap (\S+) \(0x[0-9a-f]+\) for (\d+) ms at flip (\d+)")
+TAP_REFUSED = re.compile(r"\] test: menutap (\S+) at flip (\d+): no menu has the input")
+PAD_READ = re.compile(r"\] pad: buttons 0x([0-9a-f]+) -> 0x([0-9a-f]+) at flip (\d+)")
 LOAD_BEGINS = re.compile(r"\] loading: begins, flip (\d+)")
 # The 5-second report's memory lines (host/gpu.cpp, host/render.cpp).
 MEMORY = re.compile(r"\] +gpu: memory by heap: (.*?)\s*$")
@@ -494,7 +509,8 @@ class Log:
                          ("loading", LOADING), ("load_begins", LOAD_BEGINS), ("slow_pipeline", SLOW_PIPELINE),
                          ("slow_library", SLOW_LIBRARY), ("stall", STALL), ("long_frame", LONG_FRAME), ("ps_lifted", PS_LIFTED),
                          ("ps_not_lifted", PS_NOT_LIFTED), ("pipeline_failed", PIPELINE_FAILED), ("world", WORLD),
-                         ("memory", MEMORY), ("image_heap", IMAGE_HEAP), ("memory_total", MEMORY_TOTAL)):
+                         ("memory", MEMORY), ("image_heap", IMAGE_HEAP), ("memory_total", MEMORY_TOTAL),
+                         ("tap_pressed", TAP_PRESSED), ("tap_refused", TAP_REFUSED), ("pad_read", PAD_READ)):
             m = rx.search(line)
             if not m:
                 continue
@@ -528,6 +544,12 @@ class Log:
                 self._ev(i, kind, blocks=int(m.group(1)), mib=int(m.group(2)))
             elif kind == "memory_total":
                 self._ev(i, kind, mib=int(m.group(1)))
+            elif kind == "tap_pressed":
+                self._ev(i, kind, hold_ms=int(m.group(2)), flip=int(m.group(3)))
+            elif kind == "tap_refused":
+                self._ev(i, kind, flip=int(m.group(2)))
+            elif kind == "pad_read":
+                self._ev(i, kind, buttons=int(m.group(2), 16), flip=int(m.group(3)))
             return
         m = VERSION.search(line)
         if m and not self.version:
@@ -843,12 +865,26 @@ def area_report(log, area, seg, kind):
     return rep
 
 
+def title_report(log):
+    """The way through the title, up to the world's first frame: the confirm
+    presses asked for, those pressed in a menu and those that met none, and
+    the first press the game read (BBHOST_TRACE_PAD=1; None from a build
+    without the trace or a run that never read one)."""
+    world_i = next((i for i, l in enumerate(log.lines) if WORLD.search(l)), len(log.lines))
+    evs = [(i, k, d) for i, k, d in log.events if i < world_i and k in ("tap_pressed", "tap_refused", "pad_read")]
+    pressed = [d for _, k, d in evs if k == "tap_pressed"]
+    first = next((d for _, k, d in evs if k == "pad_read" and d["buttons"]), None)
+    return {"pressed": len(pressed), "refused": sum(1 for _, k, _ in evs if k == "tap_refused"),
+            "held_ms": sorted({d["hold_ms"] for d in pressed}), "first_read_flip": first["flip"] if first else None,
+            "traced": any(k == "pad_read" for _, k, _ in evs)}
+
+
 def pass_report(lines, areas, kind):
     """A pass's report from its log lines."""
     log = Log(lines)
     segs = area_segments(log, {a.id for a in areas})
     out = {"kind": kind, "version": log.version, "world": log.world, "tour_done": log.tour_done, "fatal": log.fatal[:20],
-           "rendering": log.rendering, "areas": {}}
+           "rendering": log.rendering, "title": title_report(log), "areas": {}}
     for a in areas:
         if a.id in segs:
             out["areas"][a.id] = area_report(log, a, segs[a.id], kind)
@@ -1366,6 +1402,13 @@ def summary_text(report):
                 "done" if p.get("tour_done") else "NOT done",
                 (", rendering %dx%d" % tuple(p["rendering"])) if p.get("rendering") else "",
                 ("; FATAL: " + p["fatal"][0]) if p.get("fatal") else ""))
+            ti = p.get("title")
+            if ti:
+                out.append("  title: %d confirm presses in a menu (held %s ms), %d with none open; %s%s" % (
+                    ti["pressed"], "/".join(str(h) for h in ti["held_ms"]) or "-", ti["refused"],
+                    ("the game read the first at flip %d" % ti["first_read_flip"]) if ti.get("first_read_flip") is not None else
+                    ("the game read none" if ti.get("traced") else "no pad trace in this build"),
+                    ("; the world at %.1f s" % p["world"]["seconds"]) if p.get("world") else ""))
             files = p.get("build_files") or []
             if files:
                 out.append("  written under %s/build: %s%s" % (kind, ", ".join(Path(f).name for f in files[:6]),
@@ -1617,17 +1660,22 @@ def game_env(settings):
     return env
 
 
-def title_tap(requests, n):
+def title_tap(requests, n, hold_ms=None):
     """The n-th press of the menus' confirm button on the way through the
     title, as a request file the host carries out on a flip (after the probe's
-    numbered ones, which sort first)."""
-    (requests / ("title-%03d.req" % n)).write_text("menutap confirm\n")
+    numbered ones, which sort first) - written beside and renamed into place,
+    as the probe writes its own, so the host never reads half of one. hold_ms:
+    how long it is held (the host's 200 ms when None)."""
+    tmp = requests / ("title-%03d.tmp" % n)
+    tmp.write_text("menutap confirm%s\n" % (" %d" % hold_ms if hold_ms else ""))
+    os.replace(tmp, requests / ("title-%03d.req" % n))
 
 
 def launch(pass_dir, plan, say):
     """Runs the game until the tour is done (or it dies, or the budget is out),
     with its log in run.log. Until the world's first frame it presses confirm
-    in the title's menus (TITLE_TAP_EVERY_S)."""
+    in the title's menus (TITLE_TAP_EVERY_S), each press held
+    TITLE_TAP_SEARCH_MS until the game has read one."""
     env = game_env(plan["settings"])
     requests = Path(plan["settings"]["BBHOST_TEST_REQUESTS"])
     started = time.monotonic()
@@ -1635,7 +1683,7 @@ def launch(pass_dir, plan, say):
     world_deadline = started + 300
     next_tap, taps = started + TITLE_TAP_FIRST_S, 0
     stop_reason, term_at, pending = None, None, b""
-    world = done = False
+    world = done = read_one = False
     with (pass_dir / "run.log").open("wb") as log:
         with subprocess.Popen(plan["argv"], cwd=pass_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               start_new_session=True) as proc:
@@ -1650,7 +1698,7 @@ def launch(pass_dir, plan, say):
                         stop_reason = "the world was not reached"
                     if not world and stop_reason is None and now >= next_tap:
                         taps += 1
-                        title_tap(requests, taps)
+                        title_tap(requests, taps, None if read_one else TITLE_TAP_SEARCH_MS)
                         next_tap = now + TITLE_TAP_EVERY_S
                     if stop_reason and term_at is None:
                         proc.send_signal(signal.SIGTERM)
@@ -1672,6 +1720,11 @@ def launch(pass_dir, plan, say):
                             if not world and WORLD.search(line):
                                 world = True
                                 say("world reached")
+                            if not read_one:
+                                m = PAD_READ.search(line)
+                                if m and int(m.group(2), 16):
+                                    read_one = True
+                                    say("the game read a press at flip %s" % m.group(3))
                             m = MARK.search(line)
                             if m:
                                 say("%s: %s" % (m.group(1), m.group(2)))
@@ -1916,7 +1969,7 @@ def do_run(args, bbhost=None, out=None, captures=True, say=print):
         launched = launch(out / k, plans[k], say_t)
         passes[k] = finish_pass(out / k, areas, k, launched, opts)
         report["passes"][k] = {x: passes[k].get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version",
-                                                             "rendering", "build_files")}
+                                                             "rendering", "build_files", "title")}
         say_t("%s after %.0f s" % (launched["stop_reason"], launched["elapsed_s"]))
         if k == "capture":
             lifts = verify_lifts(out / k, areas, opts, say_t)
@@ -1955,7 +2008,7 @@ def do_report(args):
             lifts[a.id] = json.loads(p.read_text())
     report = {"schema": SCHEMA, "version": 1, "dir": str(run), "run": old.get("run", {}), "passes": {
         k: {x: v.get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version", "rendering",
-                                  "build_files")}
+                                  "build_files", "title")}
         for k, v in passes.items()}}
     report["areas"] = merge(passes.get("perf"), passes.get("capture"), lifts, areas)
     report["problems"] = problems_of(report)

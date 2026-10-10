@@ -46,7 +46,15 @@ moving the player. It gets through the title by asking the game for the menus'
 confirm button every 2 s until the world's first frame (the test request
 `menutap confirm`, which bbhost carries out only while one of the game's menus
 has the input), so it reaches the title whenever the title comes: a build's
-first start compiles its shader caches before it. At each place the probe travels to a lamp the way the
+first start compiles its shader caches before it. Each press is held 1.5 s
+until the game has read one (`BBHOST_TRACE_PAD`), 200 ms after: a pad the game
+finds disconnected it reads only once a second, and a short press then met one
+of those reads only by chance - one to three minutes of ignored presses on a
+Steam Deck's cold start, before bbhost plugged a harness's pad in from the
+start. The report says how many presses it took and at which flip the game
+read the first.
+
+At each place the probe travels to a lamp the way the
 Hunter's Dream headstones do - done once the player stands still in the
 place's map with the loading screen gone -, moves to the place's view,
 switches off the ordinary enemies within 40 m, puts the camera behind the

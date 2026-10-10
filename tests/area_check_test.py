@@ -204,8 +204,10 @@ class TourTest(unittest.TestCase):
 
     def test_title_taps_until_the_world(self):
         """launch() asks for the menus' confirm button until the world's first
-        frame, and no more after it: a stand-in game answers two requests, then
-        logs the world and the end of the tour."""
+        frame, and no more after it, each press held long until the game has
+        read one (a pad the game finds disconnected it reads once a second):
+        a stand-in game answers three requests - reading the first press -,
+        then logs the world and the end of the tour."""
         game = textwrap.dedent("""
             import os, sys, time
             req = sys.argv[1]
@@ -213,11 +215,15 @@ class TourTest(unittest.TestCase):
             t0 = time.monotonic()
             while time.monotonic() - t0 < 20:
                 for name in sorted(os.listdir(req)):
+                    if not name.endswith(".req"):
+                        continue
                     path = os.path.join(req, name)
                     print("[bbhost] test: " + open(path).read().strip() + " from " + name, flush=True)
                     os.remove(path)
                     seen += 1
-                if seen >= 2:
+                    if seen == 1:
+                        print("[bbhost] pad: buttons 0x00000 -> 0x04000 at flip 60 (read 1, 0 reads since that flip, ts 1 us)", flush=True)
+                if seen >= 3:
                     print("[bbhost] world: the first in-game frame, flip 1200, 31.0 s after start", flush=True)
                     time.sleep(0.5)
                     leftover = sorted(os.listdir(req))
@@ -234,15 +240,40 @@ class TourTest(unittest.TestCase):
             (d / "game.py").write_text(game)
             plan = {"argv": [sys.executable, str(d / "game.py"), str(d / "requests")], "budget_s": 30,
                     "settings": {"BBHOST_TEST_REQUESTS": str(d / "requests")}}
+            said = []
             with mock.patch.object(ac, "TITLE_TAP_FIRST_S", 0.1), mock.patch.object(ac, "TITLE_TAP_EVERY_S", 0.5):
-                out = ac.launch(d, plan, lambda *_: None)
+                out = ac.launch(d, plan, said.append)
             log = (d / "run.log").read_text()
         self.assertEqual(out["stop_reason"], "tour done")
-        self.assertIn("test: menutap confirm from title-001.req", log)
+        # Held until the game read one, the host's 200 ms after.
+        self.assertIn("test: menutap confirm %d from title-001.req" % ac.TITLE_TAP_SEARCH_MS, log)
         self.assertIn("test: menutap confirm from title-002.req", log)
+        self.assertIn("test: menutap confirm from title-003.req", log)
+        self.assertIn("the game read a press at flip 60", said)
         # Nothing asked for after the world's first frame.
         self.assertIn("leftover 0", log)
-        self.assertNotIn("title-003", log)
+        self.assertNotIn("title-004", log)
+        # The hold outlasts the game's once-a-second look and leaves a gap.
+        self.assertGreater(ac.TITLE_TAP_SEARCH_MS, 1000)
+        self.assertLess(ac.TITLE_TAP_SEARCH_MS, ac.TITLE_TAP_EVERY_S * 1000 - 300)
+
+    def test_title_from_the_log(self):
+        """The title phase in the report: presses in a menu, presses that met
+        none, and the first the game read."""
+        lines = ["[bbhost] test: menutap confirm at flip 1: no menu has the input, not pressed",
+                 "[bbhost] test: menutap confirm (0x4000) for 1500 ms at flip 35",
+                 "[bbhost] test: menutap confirm (0x4000) for 1500 ms at flip 150",
+                 "[bbhost] pad: buttons 0x00000 -> 0x04000 at flip 6226 (read 309, 0 reads since that flip, ts 9 us)",
+                 "[bbhost] pad: buttons 0x04000 -> 0x00000 at flip 6227 (read 315, 0 reads since that flip, ts 9 us)",
+                 "[bbhost] test: menutap confirm (0x4000) for 200 ms at flip 6332",
+                 "[bbhost] world: the first in-game frame, flip 7258, 117.9 s after start",
+                 "[bbhost] test: menutap confirm (0x4000) for 200 ms at flip 7300"]
+        t = ac.pass_report(lines, [], "perf")["title"]
+        self.assertEqual(t, {"pressed": 3, "refused": 1, "held_ms": [200, 1500], "first_read_flip": 6226, "traced": True})
+        self.assertIsNone(ac.pass_report(lines[:3], [], "perf")["title"]["first_read_flip"])
+        self.assertFalse(ac.pass_report(lines[:3], [], "perf")["title"]["traced"])
+        s = ac.pass_settings(Path("/r/perf"), [], dict(ac.DEFAULTS, pipeline_cache=True, env=[]), "perf")
+        self.assertEqual(s["BBHOST_TRACE_PAD"], "1")
 
     def test_run_toml(self):
         import tomllib
