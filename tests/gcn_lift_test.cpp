@@ -2748,9 +2748,36 @@ void clip_distances() {
     CHECK(!stray.ref.ok() && rejected_with(stray.lift, "the reference translation failed"));
 }
 
+// The pixel stage's half (TranslateOptions::ps_clip_discard): the translator's
+// prologue - discard where a distance at the clip location is negative -
+// before the program, and no early fragment tests.
+void clip_discard() {
+    std::vector<std::uint32_t> w;
+    push(w, {vintrp(0, 2, 0, 0, 0), vintrp(1, 2, 0, 0, 1)});  // v2 = attr0.x
+    export_mrt0(w, 2, 2, 2, 2);
+    w.push_back(kEndpgm);
+    gcn::TranslateOptions o = synthetic_options();
+    o.ps_clip_discard = 2u | 3u << 8;
+    o.early_fragment_tests = true;
+    const ::Lifted l = lift_words(w, o);
+    CHECK(lifted(l.lift));
+    CHECK(proof_says(l.lift, "clip distances (the vertex stage's, at location 3) are negative is discarded at entry"));
+    CHECK(count_op(l.lift.spirv, 252) == 1);  // OpKill
+    CHECK(count_op(l.lift.spirv, 184) == 2);  // OpFOrdLessThan, distances 0 and 1
+    bool clip_input = false, early = false;
+    for (std::size_t i = 5; i < l.lift.spirv.size();) {
+        const std::uint32_t op = l.lift.spirv[i] & 0xffff, len = l.lift.spirv[i] >> 16;
+        if (op == 71 && len == 4 && l.lift.spirv[i + 2] == 30 && l.lift.spirv[i + 3] == 3) clip_input = true;  // Location 3
+        if (op == 16 && len >= 3 && l.lift.spirv[i + 2] == 9) early = true;                                   // EarlyFragmentTests
+        i += len;
+    }
+    CHECK(clip_input && !early);
+}
+
 void run() {
     formats();
     clip_distances();
+    clip_discard();
 }
 
 }  // namespace vertex

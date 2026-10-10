@@ -4448,6 +4448,31 @@ private:
             (kept.empty() ? "" : "; back at the header unchanged: " + kept));
     }
 
+    // TranslateOptions::kVsOutCntlClipVarying, as translate.cpp's prologue: the
+    // clipper's work, per pixel. A pixel where any of the distances the vertex
+    // stage wrote at the clip location is negative is discarded before anything
+    // runs, where the clipper would have cut it out of the triangle; the others
+    // run the program as they would have.
+    bool clip_discard = false;
+    void clip_discard_prologue() {
+        const Id var = m.global_variable(p_in_v4f, spv::ScInput);
+        m.decorate(var, spv::DecLocation, {opt.ps_clip_location()});
+        m.name(var, "clip_distances");
+        interface.push_back(var);
+        const Id d = m.load(t_v4f, var);
+        Id out = m.const_bool(false);
+        for (std::uint32_t k = 0; k < std::min<std::uint32_t>(opt.ps_clip_count(), 4); ++k) {
+            out = m.emit(spv::OpLogicalOr, t_bool, {out, m.emit(spv::OpFOrdLessThan, t_bool, {extract(t_f32, d, k), cf(0.0f)})});
+        }
+        const Id l_kill = m.fresh(), l_on = m.fresh();
+        m.emit_void(spv::OpSelectionMerge, {l_on, 0u});
+        m.emit_void(spv::OpBranchConditional, {out, l_kill, l_on});
+        m.label(l_kill);
+        m.emit_void(spv::OpKill, {});
+        cur_label = m.label(l_on);
+        clip_discard = true;
+    }
+
     // ---- module ----------------------------------------------------------------------
     void emit() {
         m.capability(spv::CapShader);
@@ -4592,6 +4617,7 @@ private:
         fn_main = m.begin_function(t_void, m.type_function(t_void, {}));
         m.name(fn_main, "main");
         cur_label = m.label();
+        if (opt.stage == Stage::Pixel && opt.ps_clip_discard) clip_discard_prologue();
         lanes[kKeyExec] = lane_const(true);   // every running pixel starts with its bit set
         lanes[kKeyExec].helper_inexact = true;  // and GCN's helper lanes with theirs clear, until whole-quad mode
         lanes[kKeyExec].helpers_clear = true;
@@ -4748,7 +4774,7 @@ private:
             m.execution_mode(fn_main, spv::ExDenormPreserve, {16});
             m.execution_mode(fn_main, spv::ExRoundingModeRTZ, {16});
         }
-        if (opt.early_fragment_tests) m.execution_mode(fn_main, spv::ExEarlyFragmentTests);
+        if (opt.early_fragment_tests && !opt.ps_clip_discard) m.execution_mode(fn_main, spv::ExEarlyFragmentTests);
     }
 
     void finish_proof() {
@@ -4793,6 +4819,10 @@ private:
         head.push_back(std::to_string(exports.size()) + " colour exports with EXEC set");
         head.push_back(std::to_string(buffer_loads) + " scalar loads, every one from a storage buffer the reference binds; " +
                        std::to_string(masked_writes) + " VGPR writes under a varying EXEC become selects");
+        if (clip_discard) {
+            head.push_back("a pixel whose clip distances (the vertex stage's, at location " + std::to_string(opt.ps_clip_location()) +
+                           ") are negative is discarded at entry, by the translator's own prologue");
+        }
         if (param_format_elements) {
             head.push_back(std::to_string(param_format_elements) + " vertex elements converted by their descriptor - the relink's "
                            "specialization constant, else the params block's - with the translator's expression for each kind");
@@ -4842,11 +4872,6 @@ LiftResult lift_stage(Stage stage, const Program& program, const TranslateOption
 }  // namespace
 
 LiftResult lift_pixel_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference) {
-    if (options.ps_clip_discard) {  // TranslateOptions::kVsOutCntlClipVarying has no lifted counterpart
-        LiftResult r;
-        r.rejections.push_back("clip distances discarded per pixel");
-        return r;
-    }
     return lift_stage(Stage::Pixel, program, options, reference);
 }
 
