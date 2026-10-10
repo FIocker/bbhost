@@ -803,6 +803,74 @@ bool has_op(const std::vector<std::uint32_t>& spirv, std::uint32_t opcode) {
     return false;
 }
 
+// image_load(_mip) and image_get_resinfo, which take no sampler and no
+// derivatives, and a depth export: lifted as the translator writes them
+// (OpImageFetch, OpImageQuerySizeLod with OpImageQueryLevels; FragDepth with
+// DepthReplacing, and then no early fragment tests).
+void loads_and_sizes() {
+    const auto mode = [](const std::vector<std::uint32_t>& spirv, std::uint32_t execution_mode) {
+        for (std::size_t i = 5; i < spirv.size();) {
+            const std::uint32_t n = spirv[i] >> 16;
+            if ((spirv[i] & 0xffff) == 16 && n >= 3 && spirv[i + 2] == execution_mode) return true;  // OpExecutionMode
+            i += n ? n : 1;
+        }
+        return false;
+    };
+    const auto coords = [](Asm& a) {
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vop1(7, 2, 256 + 2);  // v_cvt_u32_f32 v2, v2
+        a.vop1(7, 3, 256 + 3);
+    };
+    {
+        Asm a;
+        coords(a);
+        a.mimg(0, 4, 2, 0xf);  // image_load v[4:7], v[2:3], s[4:11]
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        const gcn::LiftResult r = lift(a.w);
+        CHECK(lifted(r) && has_op(r.spirv, 95) && proof_says(r, "1 image loads"));  // OpImageFetch
+    }
+    {
+        Asm a;
+        coords(a);
+        a.vop1(1, 4, kZero);   // v_mov_b32 v4, 0: the level
+        a.mimg(1, 8, 2, 0xf);  // image_load_mip v[8:11], v[2:4], s[4:11]
+        a.exp_mrt0(8);
+        a.w.push_back(0xbf810000u);
+        CHECK(lifted(lift(a.w)));
+    }
+    {
+        Asm a;
+        a.vop1(1, 2, kZero);    // the level
+        a.mimg(14, 4, 2, 0xf);  // image_get_resinfo v[4:7], v2, s[4:11]
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        const gcn::LiftResult r = lift(a.w);
+        CHECK(lifted(r) && has_op(r.spirv, 103) && has_op(r.spirv, 106));  // OpImageQuerySizeLod, OpImageQueryLevels
+    }
+    {
+        Asm a;
+        a.interp(2, 0, 0);
+        a.w.push_back(0xf8000000u | 1u << 12 | 0x0fu);  // exp mrt0 v2, v2, v2, v2 vm
+        a.w.push_back(2u | 2u << 8 | 2u << 16 | 2u << 24);
+        a.w.push_back(0xf8000000u | 1u << 12 | 1u << 11 | 8u << 4 | 0x1u);  // exp mrtz v2 done vm
+        a.w.push_back(2u);
+        a.w.push_back(0xbf810000u);
+        const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+        gcn::TranslateOptions o;
+        o.stage = gcn::Stage::Pixel;
+        o.ps_input_ena = 2;
+        o.descriptor_set = 1;
+        o.cb_ssbo = true;
+        o.cb_no_fallback = true;
+        o.early_fragment_tests = true;  // asked for, and not given with a depth export
+        const gcn::TranslateResult ref = gcn::translate(p, o);
+        const gcn::LiftResult r = gcn::lift_pixel_shader(p, o, ref);
+        CHECK(ref.ok() && lifted(r) && mode(r.spirv, 12) && !mode(r.spirv, 9));  // DepthReplacing, no EarlyFragmentTests
+    }
+}
+
 void cases() {
     // A sample under a varying EXEC whose coordinates were computed for every
     // pixel: lifted for every pixel, its texel written under EXEC.
@@ -2903,6 +2971,7 @@ int main(int argc, char** argv) {
     swizzles_and_loops();
     lane_ops::run();
     lod::cases();
+    lod::loads_and_sizes();
     lod::loops();
     lod::helper_lanes();
     if (g_failures) {

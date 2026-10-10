@@ -2459,6 +2459,68 @@ private:
         lod_queries.push_back(in.offset);
     }
 
+    // The reference's image `ii` itself, for the instructions that take no
+    // sampler: its binding, or bindless its slot.
+    Id image_only(std::uint32_t ii) {
+        if (!ref.bindless) return m.load(image_types[ii], image_vars[ii]);
+        const Id slot = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(bindless_image_member), cu(ii / 4), cu(ii % 4)}));
+        return m.load(image_types[ii], m.access_chain(m.type_pointer(spv::ScUniformConstant, image_types[ii]), image_vars[ii], {slot}));
+    }
+
+    // image_load(_mip) and image_get_resinfo, as translate.cpp mimg: a texel
+    // fetched at the integer coordinates in the VGPRs (and the level), its
+    // bits as they land in the VGPRs for every texel kind; and the image's size
+    // at the level in a VGPR with its level count, a cube one face deep. Neither
+    // takes derivatives or a sampler.
+    void image_load_or_size(const Inst& in) {
+        const auto ii = ref.image_at.find(in.offset);
+        if (ii == ref.image_at.end() || ii->second >= image_vars.size()) {
+            reject(std::string("the reference has no image binding for this ") + mnemonic(in));
+            return;
+        }
+        const ImageBinding& b = ref.images[ii->second];
+        if (b.storage) {
+            reject(std::string(mnemonic(in)) + " of a storage image binding");
+            return;
+        }
+        const auto vgpr = [&](int idx) { return value(256 + idx); };
+        if (in.op == 14) {  // image_get_resinfo: vaddr = the level; w, h, d, levels by dmask
+            m.capability(spv::CapImageQuery);
+            const Id image = image_only(ii->second);
+            const int ncomp = coord_count(b.dim, b.arrayed);
+            const Id size_type = ncomp == 1 ? t_i32 : ncomp == 2 ? t_v2i : t_v3i;
+            const Id size = m.emit(spv::OpImageQuerySizeLod, size_type, {image, to_i(as_u(vgpr(in.vaddr)))});
+            const Id levels = m.emit(spv::OpImageQueryLevels, t_i32, {image});
+            Id comps[4] = {cu(0), cu(0), cu(0), from_i(levels)};
+            for (int k = 0; k < ncomp; ++k) comps[k] = from_i(ncomp == 1 ? size : extract(t_i32, size, static_cast<std::uint32_t>(k)));
+            if (b.cube) comps[2] = cu(1);
+            int out = 0;
+            for (std::uint32_t k = 0; k < 4; ++k) {
+                if ((in.dmask >> k) & 1) write_v(in.vdata + out++, word(comps[k]));
+            }
+            return;
+        }
+        const int ncoord = coord_count(b.dim, b.arrayed);
+        std::vector<Id> coords;
+        for (int k = 0; k < ncoord; ++k) coords.push_back(to_i(as_u(vgpr(in.vaddr + k))));
+        const Id coord = ncoord == 1 ? coords[0] : m.emit(spv::OpCompositeConstruct, ncoord == 2 ? t_v2i : ncoord == 3 ? t_v3i : m.type_vector(t_i32, 4), coords);
+        const Id image = image_only(ii->second);
+        std::vector<std::uint32_t> ops = {image, coord};
+        if (in.op == 1) {  // image_load_mip: the level after the coordinates
+            ops.push_back(spv::IoLod);
+            ops.push_back(to_i(as_u(vgpr(in.vaddr + ncoord))));
+        }
+        const Id texel_type = b.kind == 1 ? t_v4u : b.kind == 2 ? m.type_vector(t_i32, 4) : t_v4f;
+        Id texel = m.emit(spv::OpImageFetch, texel_type, ops);
+        if (b.kind) texel = m.emit(spv::OpBitcast, t_v4f, {texel});
+        int out = 0;
+        for (std::uint32_t k = 0; k < 4; ++k) {
+            if ((in.dmask >> k) & 1) write_v(in.vdata + out++, flt(extract(t_f32, texel, k)));
+        }
+        ++image_loads;
+    }
+    std::size_t image_loads = 0;
+
     void mimg(const Inst& in) {
         inst_uniform = false;  // texels are not tracked as uniform
         const std::uint32_t op = in.op;
@@ -2469,6 +2531,10 @@ private:
         }
         if (op == 96) {
             image_get_lod(in);
+            return;
+        }
+        if (op == 0 || op == 1 || op == 14) {
+            image_load_or_size(in);
             return;
         }
         if (!(op >= 32 && op < 64)) {
@@ -2624,7 +2690,7 @@ private:
     // with the cull bits 8-15 folded in - or, with kVsOutCntlClipVarying,
     // distances 0-3 to the clip location (a disabled one reads 1), which the
     // pixel stage discards by.
-    Id out_clip = 0, out_point_size = 0;
+    Id out_clip = 0, out_point_size = 0, out_frag_depth = 0;
     int clip_count = 0;
     bool extra_position_vector(const Inst& in, const std::vector<Id>& comps) {
         const std::uint32_t cntl = opt.vs_out_cntl;
@@ -2700,9 +2766,9 @@ private:
         if (in.tgt == 9) return;  // null export
         // Pixel shaders export colour targets 0-7; vertex shaders the position
         // (12), the vectors PA_CL_VS_OUT_CNTL packs after it (13-15) and params (32-63).
-        if (vertex ? !(in.tgt >= 12 && in.tgt < 16) && !(in.tgt >= 32 && in.tgt < 64) : in.tgt >= 8) {
+        if (vertex ? !(in.tgt >= 12 && in.tgt < 16) && !(in.tgt >= 32 && in.tgt < 64) : in.tgt > 8) {
             reject(vertex ? "only position, clip and param exports are lifted in a vertex shader, not target " + std::to_string(in.tgt)
-                          : std::string("only colour exports are lifted"));
+                          : std::string("only colour and depth exports are lifted"));
             return;
         }
         std::vector<Id> comps(4, cf(0.0f));
@@ -2775,6 +2841,17 @@ private:
                     for (const Id var : param_outputs(static_cast<int>(in.tgt) - 32)) m.store(var, value);
                 }
             }
+            exports.push_back(in.offset);
+            return;
+        }
+        if (in.tgt == 8) {  // mrtz, as translate.cpp exp: the depth from x, DepthReplacing
+            if (!out_frag_depth) {
+                out_frag_depth = m.global_variable(m.type_pointer(spv::ScOutput, t_f32), spv::ScOutput);
+                m.decorate(out_frag_depth, spv::DecBuiltIn, {static_cast<std::uint32_t>(spv::BiFragDepth)});
+                interface.push_back(out_frag_depth);
+                m.execution_mode(fn_main, spv::ExDepthReplacing);
+            }
+            if (in.dmask & 1) m.store(out_frag_depth, comps[0]);
             exports.push_back(in.offset);
             return;
         }
@@ -4774,7 +4851,7 @@ private:
             m.execution_mode(fn_main, spv::ExDenormPreserve, {16});
             m.execution_mode(fn_main, spv::ExRoundingModeRTZ, {16});
         }
-        if (opt.early_fragment_tests && !opt.ps_clip_discard) m.execution_mode(fn_main, spv::ExEarlyFragmentTests);
+        if (opt.early_fragment_tests && !opt.ps_clip_discard && !out_frag_depth) m.execution_mode(fn_main, spv::ExEarlyFragmentTests);
     }
 
     void finish_proof() {
@@ -4816,7 +4893,8 @@ private:
             head.push_back(std::to_string(divergent_samples.size()) + " of these samples inside a loop pixels leave at different iterations, "
                            "where control flow is not uniform: with explicit LOD or gradients only:" + divergent_at);
         }
-        head.push_back(std::to_string(exports.size()) + " colour exports with EXEC set");
+        head.push_back(std::to_string(exports.size()) + " exports with EXEC set");
+        if (image_loads) head.push_back(std::to_string(image_loads) + " image loads at integer coordinates, which take neither a sampler nor derivatives");
         head.push_back(std::to_string(buffer_loads) + " scalar loads, every one from a storage buffer the reference binds; " +
                        std::to_string(masked_writes) + " VGPR writes under a varying EXEC become selects");
         if (clip_discard) {
