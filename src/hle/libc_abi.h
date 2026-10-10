@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
@@ -55,6 +56,10 @@ static_assert(sizeof(Lconv) == 96 && offsetof(Lconv, decimal_point) == 0x48);
 inline char* set_c_locale(const char* name) {
     static char c[] = "C";
     return !name || !*name || (name[0] == 'C' && name[1] == '\0') ? c : nullptr;
+}
+
+template <typename Float> inline Float logarithm(Float x, int selector) {
+    return selector > 0 ? std::log10(x) : selector < 0 ? std::log2(x) : std::log(x);
 }
 
 // The narrow and UTF-16 integer helpers share the same C-locale parser. No

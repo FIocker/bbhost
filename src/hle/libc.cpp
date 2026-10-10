@@ -649,8 +649,8 @@ GUEST_ABI double hle_exp(double x) { return std::exp(x); }
 GUEST_ABI float hle_expf(float x) { return std::exp(x); }
 GUEST_ABI double hle_exp2(double x) { return std::exp2(x); }
 GUEST_ABI float hle_exp2f(float x) { return std::exp2(x); }
-GUEST_ABI double hle_log(double x) { return std::log(x); }
-GUEST_ABI float hle_logf(float x) { return std::log(x); }
+GUEST_ABI double hle_dinkum_log(double x, int selector) { return bb::libc::logarithm(x, selector); }
+GUEST_ABI float hle_dinkum_logf(float x, int selector) { return bb::libc::logarithm(x, selector); }
 GUEST_ABI double hle_pow(double x, double y) { return std::pow(x, y); }
 GUEST_ABI float hle_powf(float x, float y) { return std::pow(x, y); }
 GUEST_ABI double hle_sqrt(double x) { return std::sqrt(x); }
@@ -1131,8 +1131,8 @@ void hle_register_libc() {
     REG_RAW_GS("ldexpf", hle_ldexpf);
     REG_RAW("modf", hle_modf);
     REG_RAW("modff", hle_modff);
-    REG_RAW_GS("_Log", hle_log);
-    REG_RAW_GS("_FLog", hle_logf);
+    REG_RAW_GS("_Log", hle_dinkum_log);
+    REG_RAW_GS("_FLog", hle_dinkum_logf);
     REG_RAW_GS("_FCosh", hle_coshf);
     REG_RAW_GS("_FSinh", hle_sinhf);
     REG_RAW("ldiv", hle_ldiv);

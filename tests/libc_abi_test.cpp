@@ -14,6 +14,12 @@
 __attribute__((sysv_abi, noinline)) bb::libc::Div64 guest_div(std::int64_t n, std::int64_t d) {
     return bb::libc::divide(n, d);
 }
+__attribute__((sysv_abi, noinline)) double guest_log(double x, int selector) {
+    return bb::libc::logarithm(x, selector);
+}
+__attribute__((sysv_abi, noinline)) float guest_logf(float x, int selector) {
+    return bb::libc::logarithm(x, selector);
+}
 
 int main() {
     using namespace bb::libc;
@@ -24,6 +30,15 @@ int main() {
         CHECK(v.quot == n / d && v.rem == n % d);
         CHECK(v.quot * d + v.rem == n);
     }
+    // Dinkum selectors use EDI, independently of XMM0.
+    CHECK(std::abs(guest_log(100.0, 1) - 2.0) < 1e-14);
+    CHECK(std::abs(guest_log(8.0, -1) - 3.0) < 1e-14);
+    CHECK(std::abs(guest_log(2.0, 0) - std::log(2.0)) < 1e-14);
+    CHECK(guest_logf(100.0f, 4) == 2.0f);
+    CHECK(guest_logf(8.0f, -4) == 3.0f);
+    CHECK(std::isinf(guest_log(0.0, 0)) && guest_log(0.0, 0) < 0);
+    CHECK(std::isnan(guest_log(-1.0, 1)));
+
     // Match the eboot's 36-byte localtime_s destination followed by a cookie.
     struct GuardedTm { Tm value; unsigned char tail[20]; } g{};
     std::memset(g.tail, 0xa5, sizeof(g.tail));
