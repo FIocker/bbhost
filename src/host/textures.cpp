@@ -2895,12 +2895,30 @@ void surface_queue_writeback(std::uint64_t base) {
 // A texture created ahead of its first bind, from the T# GX
 // built for it. Resolved the way a bind resolves it (so the first bind finds
 // the surface, its upload already queued to the prep pool).
-std::atomic<std::uint64_t> g_ahead_surfaces{0}, g_ahead_already{0}, g_ahead_failed{0};
+std::atomic<std::uint64_t> g_ahead_surfaces{0}, g_ahead_already{0}, g_ahead_failed{0}, g_ahead_held{0};
+
+// While video memory is down to the reserve and a block (where the image heap
+// may no longer grow for textures, and the eviction looks for room), none is
+// made ahead: 62-64% of those are never bound, and each would take video
+// memory a bound texture wants - or go to host memory for nothing. The first
+// bind makes it, as before ahead creation. BBHOST_AHEAD_HOLD=0: always made.
+bool ahead_held_back() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_AHEAD_HOLD");
+        return !(e && e[0] == '0');
+    }();
+    return on && vram_within_reserve(256ull << 20);
+}
 
 bool textures_create_ahead_locked(const std::uint32_t* w) {
     const std::uint64_t base = tsharp_base(w);
     if (g_surfaces.count(base)) {
         g_ahead_already.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (ahead_held_back()) {
+        if (g_ahead_held.fetch_add(1, std::memory_order_relaxed) == 0)
+            host_log("texture: video memory is down to the reserve: textures are made at their first bind, not ahead, until there is room");
         return false;
     }
     bool dims_ok = true, arrayed = false;
@@ -3424,11 +3442,11 @@ void textures_return_from_host_locked() {
 }
 
 std::string textures_return_report() {
-    char buf[192];
-    std::snprintf(buf, sizeof(buf), ", textures in host memory %llu, back from it %llu (%llu MiB), evicted cold %llu (%llu MiB)",
+    char buf[224];
+    std::snprintf(buf, sizeof(buf), ", textures in host memory %llu, back from it %llu (%llu MiB), evicted cold %llu (%llu MiB), not made ahead %llu",
                   static_cast<unsigned long long>(g_host_surfaces), static_cast<unsigned long long>(g_returned_surfaces),
                   static_cast<unsigned long long>(g_returned_bytes >> 20), static_cast<unsigned long long>(g_evicted_surfaces),
-                  static_cast<unsigned long long>(g_evicted_bytes >> 20));
+                  static_cast<unsigned long long>(g_evicted_bytes >> 20), static_cast<unsigned long long>(g_ahead_held.load()));
     return buf;
 }
 
