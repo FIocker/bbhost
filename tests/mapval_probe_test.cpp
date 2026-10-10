@@ -1,8 +1,9 @@
 // tools/mapval_plugin.c on a host of our own: no game, no GPU. The probe is
 // loaded as the host loads plugins and given a tour of the steps
 // tools/area_check.py writes - a lamp travel, a view warp, quiet, camera,
-// marks, holds, a frame dump and captures - over a pretend player, camera and
-// two characters, in memory laid out as the probe reads the game's.
+// marks, holds, a frame dump and captures - over a pretend player, camera,
+// loading screen and two characters, in memory laid out as the probe reads
+// the game's.
 //
 //   mapval_probe_test <mapval.so> [tour file]
 //
@@ -67,7 +68,8 @@ std::size_t log_index(const std::string& s) {
 // user space where mmap puts things).
 std::uint8_t* g_mem = nullptr;
 constexpr std::uint64_t kWorldChrMan = 0x0000, kPlayer = 0x1000, kModules = 0x2000, kData = 0x3000, kTransform = 0x4000,
-                        kCameraRoot = 0x5000, kCameraOwner = 0x8000, kEnemy = 0x9000, kEnemyEntry = 0xa000, kFriend = 0xb000;
+                        kCameraRoot = 0x5000, kCameraOwner = 0x8000, kEnemy = 0x9000, kEnemyEntry = 0xa000, kFriend = 0xb000,
+                        kNowLoading = 0xc000, kLoadingHelper = 0xd000;
 std::uint64_t at(std::uint64_t off) { return reinterpret_cast<std::uint64_t>(g_mem + off); }
 template <typename T>
 void put(std::uint64_t off, T v) {
@@ -84,12 +86,16 @@ struct World {
     float pos[3] = {5.0f, 0.0f, 5.0f}, yaw = 0.0f;
     std::uint32_t block = 0x18010000;
     int travel_in = -1;  // frames until a requested travel lands
+    int loading_left = 0;  // frames the loading screen stays up once it has
     std::uint32_t travel_block = 0;
     std::vector<std::int32_t> travels;
     std::vector<std::uint32_t> flags;  // event flags turned on, in order
     std::vector<std::uint64_t> disabled;
     void (*frame)(void*) = nullptr;
     void* frame_user = nullptr;
+    void (*placed)(std::uint32_t, void*) = nullptr;
+    void* placed_user = nullptr;
+    std::vector<std::size_t> loading_ends;  // the log's length as each loading screen went
 } g_world;
 
 int fake_eboot_is_109() { return 1; }
@@ -97,6 +103,8 @@ int fake_read(std::uint64_t bn, void* out, std::size_t n) {
     std::uint64_t v = 0;
     if (bn == 0x593e878) v = at(kWorldChrMan);       // WorldChrMan*
     else if (bn == 0x593e860) v = at(kCameraRoot);   // the camera owner's root
+    else if (bn == 0x593e8b8) v = at(kLoadingHelper);  // CSNowLoadingHelper*
+    else if (bn == 0x596286b) v = get<std::uint8_t>(kNowLoading);  // the NowLoading request
     else return 1;
     std::memcpy(out, &v, n < 8 ? n : 8);
     return 0;
@@ -126,10 +134,18 @@ int fake_event_flag_set(std::uint32_t id, int value) {
     if (value) g_world.flags.push_back(id);
     return 0;
 }
+int fake_on_world_load(void (*fn)(std::uint32_t, void*), void* user) {
+    g_world.placed = fn;
+    g_world.placed_user = user;
+    return 0;
+}
 int fake_lamp_warp(std::int32_t rp) {
     g_world.travels.push_back(rp);
     g_world.flags.push_back(0);  // the travel, among the flags
     g_world.travel_in = 10;
+    put<std::uint8_t>(kNowLoading, 1);  // the loading screen asked for, no in-game frame since
+    put<std::uint8_t>(kLoadingHelper + 0x50, 0);
+    put<std::uint8_t>(kLoadingHelper + 0x51, 0);
     g_world.travel_block = static_cast<std::uint32_t>(rp / 100000) << 24 | static_cast<std::uint32_t>((rp / 10000) % 10) << 16;
     return 0;
 }
@@ -251,6 +267,7 @@ int main(int argc, char** argv) {
     api.chr_list = fake_chr_list;
     api.call_guest = fake_call_guest;
     api.event_flag_set = fake_event_flag_set;
+    api.on_world_load = fake_on_world_load;
     CHECK(init && image);
     CHECK(init(&api) == 0);
     CHECK(image(&api) == 0);
@@ -263,7 +280,10 @@ int main(int argc, char** argv) {
     CHECK(logged("mapval: tour of 18 steps"));
     CHECK(g_world.frame != nullptr);
 
-    // Frames, 5 ms apart, until the tour is done or 30 s pass.
+    // Frames, 5 ms apart, until the tour is done or 30 s pass. A travel puts
+    // the player in its block, still, well before the loading screen goes:
+    // 150 frames here, 0.75 s - a load's flips come fast, and the ninety
+    // still frames the probe once took for an arrival pass under it.
     const auto t0 = std::chrono::steady_clock::now();
     while (!logged("mapval tour-done") && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30)) {
         if (g_world.travel_in > 0 && --g_world.travel_in == 0) {
@@ -271,6 +291,12 @@ int main(int argc, char** argv) {
             g_world.block = g_world.travel_block;
             g_world.pos[0] = -10.0f;
             g_world.pos[2] = 20.0f;
+            g_world.loading_left = 150;
+            if (g_world.placed) g_world.placed(g_world.block, g_world.placed_user);
+        }
+        if (g_world.loading_left > 0 && --g_world.loading_left == 0) {
+            put<std::uint8_t>(kLoadingHelper + 0x50, 1);  // the in-game update ran
+            g_world.loading_ends.push_back(g_log.size());
         }
         // Something hurts the player now and then: the holds put it right.
         if (logged("mapval step 4 hold") && !logged("mapval mark central-yharnam:measure")) put<std::int32_t>(kData + 0xf8, 40);
@@ -283,12 +309,25 @@ int main(int argc, char** argv) {
     CHECK((g_world.flags == std::vector<std::uint32_t>{0, 13200040, 13200120, 0}));
     CHECK(logged("mapval travel-done central-yharnam"));
     CHECK(logged("mapval travel-done moonside-lake"));
+    // Each travel done only once its loading screen had gone, and says how
+    // long the screen was up; the screen's coming and going, and the
+    // player's placing, are lines of their own.
+    CHECK(g_world.loading_ends.size() == 2);
+    CHECK(!g_world.loading_ends.empty() && log_index("mapval travel-done central-yharnam") >= g_world.loading_ends[0]);
+    CHECK(g_world.loading_ends.size() == 2 && log_index("mapval travel-done moonside-lake") >= g_world.loading_ends[1]);
+    CHECK(log_index("mapval loading-begins") < log_index("mapval loading-ends"));
+    CHECK(log_index("mapval loading-ends") < log_index("mapval travel-done central-yharnam"));
+    CHECK(logged("s of it loading"));
+    CHECK(log_index("mapval placed") < log_index("mapval travel-done central-yharnam"));
+    CHECK(logged("mapval placed") && logged(" 18010000") && logged(" 20000000"));
     // The marks, in order, with the block and the position.
     const std::size_t a = log_index("mapval mark central-yharnam:arrived"), b = log_index("mapval mark central-yharnam:measure "),
                       c = log_index("mapval mark central-yharnam:measured"), e = log_index("mapval mark central-yharnam:end"),
                       v = log_index("mapval at moonside-lake:view"), z = log_index("mapval mark moonside-lake:arrived");
     CHECK(a < b && b < c && c < e && e < v && v < z && z < g_log.size());
     CHECK(logged("mapval mark central-yharnam:arrived") && g_log[a].find(" 18010000 -10.000 0.000 20.000 yaw ") != std::string::npos);
+    // A mark says the player's HP and whether a loading screen is up.
+    CHECK(g_log[b].find(" hp 100 loading 0") != std::string::npos);
     CHECK(g_log[z].find(" 20000000 -451.930 -174.980 392.990 yaw 1.222") != std::string::npos);
     // quiet: the enemy within 40 m off, the other character left alone.
     CHECK(g_world.disabled.size() == 1 && g_world.disabled[0] == at(kEnemy));
@@ -306,6 +345,14 @@ int main(int argc, char** argv) {
     CHECK(r2 == "capture 0\n");
     CHECK(!fs::exists(dir / "requests" / "000003.req"));
     CHECK(!fs::exists(dir / "requests" / "000000.tmp"));
+    // A death: the player's HP gone to 0 is a line of its own, once.
+    CHECK(!logged("mapval death"));
+    put<std::int32_t>(kData + 0xf8, 0);
+    for (int i = 0; i < 5; ++i) g_world.frame(g_world.frame_user);
+    CHECK(logged("mapval death") && g_log[log_index("mapval death")].find(" 20000000 ") != std::string::npos);
+    std::size_t deaths = 0;
+    for (const std::string& l : g_log) deaths += l.find("mapval death") != std::string::npos;
+    CHECK(deaths == 1);
     if (g_failures) {
         for (const std::string& l : g_log) std::fprintf(stderr, "  %s\n", l.c_str());
     }
