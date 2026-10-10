@@ -623,6 +623,12 @@ void render_return_targets_locked();
 // Textures in host memory dropped, at most 64 MiB a call, to be made again in
 // video memory at their next bind (textures.cpp).
 void textures_return_from_host_locked();
+// Textures not bound for a while evicted while video memory is down to the
+// reserve and the image heap's blocks are short of room (textures.cpp,
+// BBHOST_VRAM_EVICT_S).
+void evict_cold_surfaces_locked();
+// Free room in the image heap's blocks of video memory (gpu.cpp).
+std::uint64_t image_heap_vram_free_locked();
 std::string vram_return_report();  // the 5-second report's counts
 // Frees `m` with `image` once the recording in progress has retired.
 void defer_destroy_image(VkImage image, const ImageMemory& m);

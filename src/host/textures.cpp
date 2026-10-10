@@ -551,6 +551,10 @@ struct Surface {
     bool gx_registered = false;  // its memory is a live GX resource's
     // Created at the resource's creation, ahead of its first bind.
     bool ahead = false, ahead_used = false;
+    // When it was made or a bind last looked it up (steady ms; a bind the
+    // view memos answer stamps it once a recording, from a coarse clock):
+    // what the cold-texture eviction ranks by (evict_cold_surfaces_locked).
+    std::uint64_t used_ms = 0;
     // The last upload's untile and hashes, while the prep pool still has them
     // (TexturePrep); settle_prep() takes the hashes.
     std::shared_ptr<struct TexturePrep> prep;
@@ -1700,12 +1704,18 @@ const bool g_refresh_once = [] {
     return !e || e[0] != '0';
 }();
 
+// The clock Surface::used_ms is stamped from at a bind the view memos
+// answer: read once a submission (textures_before_submit), so a bind pays a
+// store, not a clock read.
+std::uint64_t g_coarse_ms = 0;
+
 void refresh_surface_locked(Surface& sf) {
     if (g_refresh_once) {
         const std::uint64_t stamp = g.record_serial + 1;  // 0 stays "never"
         if (sf.refreshed_serial == stamp) return;
         sf.refreshed_serial = stamp;
     }
+    sf.used_ms = g_coarse_ms;
     // A write the watch saw: upload now, whatever the hash schedule below
     // says. That schedule backs off to 2 s for a surface that sits still, so
     // a glyph drawn into a menu atlas that had been idle took up to that long
@@ -2582,6 +2592,7 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
     }
     Surface& sf = it->second;
     g_last_view_surface = &sf;
+    if (!t_force_async || !sf.used_ms) sf.used_ms = now_ms();
     if (sf.ahead && !sf.ahead_used && !t_force_async) {
         sf.ahead_used = true;
         g_ahead_used.fetch_add(1, std::memory_order_relaxed);
@@ -3298,11 +3309,80 @@ void retire_surfaces_locked() {
 }
 
 void textures_before_submit() {
+    g_coarse_ms = now_ms();
     for (const std::shared_ptr<TexturePrep>& p : g_batch_preps) PrepPool::get().wait(*p);
     g_batch_preps.clear();
     retire_surfaces_locked();
     image_reuse_sweep_locked();
+    evict_cold_surfaces_locked();
     textures_return_from_host_locked();
+}
+
+// BBHOST_VRAM_EVICT_S=<s> (20; 0: never, as before; on with the reserve):
+// when video memory is down to the reserve - the image heap may not grow, so
+// a new texture would go to host memory - and the heap's blocks have less
+// than 256 MiB free for the textures to come, textures no bind has looked up
+// for <s> seconds go, up to that room and 256 MiB a second: those made ahead
+// at their resource's creation and never bound first, then the oldest. The
+// next bind makes one again from the guest memory that holds its texels.
+// Never one a shader or a copy wrote (its image holds what guest memory does
+// not). On a 6 GB card the made-ahead textures alone were 0.16-0.59 GiB.
+std::uint64_t g_evicted_surfaces = 0, g_evicted_bytes = 0, g_evicted_ahead = 0;
+
+void evict_cold_surfaces_locked() {
+    static const std::uint64_t idle_ms = [] {
+        const char* e = std::getenv("BBHOST_VRAM_EVICT_S");
+        return (e && *e ? std::strtoull(e, nullptr, 10) : 20ull) * 1000;
+    }();
+    if (!idle_ms || !vram_reserve_bytes()) return;
+    static std::uint64_t last_ms = 0;
+    const std::uint64_t now = now_ms();
+    if (now - last_ms < 1000) return;
+    last_ms = now;
+    constexpr std::uint64_t kWant = 256ull << 20;
+    if (!vram_within_reserve(kWant)) return;
+    const std::uint64_t free_in_blocks = image_heap_vram_free_locked();
+    if (free_in_blocks >= kWant) return;
+    const std::uint64_t target = kWant - free_in_blocks;
+    struct Cold {
+        bool used;  // false: made ahead and never bound - these go first
+        std::uint64_t used_ms, base;
+        bool operator<(const Cold& o) const { return used != o.used ? !used : used_ms < o.used_ms; }
+    };
+    std::vector<Cold> cold;
+    for (const auto& [base, sf] : g_surfaces) {
+        if (!sf.image || sf.failed || sf.gpu_written || sf.copied_mips || surface_in_host(sf)) continue;
+        if (!sf.used_ms || now - sf.used_ms < idle_ms) continue;
+        cold.push_back({!(sf.ahead && !sf.ahead_used), sf.used_ms, base});
+    }
+    if (cold.empty()) return;
+    std::sort(cold.begin(), cold.end());
+    std::uint64_t freed = 0, n = 0;
+    for (const Cold& c : cold) {
+        if (freed >= target) break;
+        auto it = g_surfaces.find(c.base);
+        if (it == g_surfaces.end()) continue;
+        Surface& sf = it->second;
+        freed += sf.memory.size;
+        ++n;
+        if (!c.used) ++g_evicted_ahead;
+        for (auto& v : sf.views) defer_destroy_view(v.second);
+        defer_destroy_image(sf.image, sf.memory);
+        if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+        note_surface_erased(sf);
+        g_surfaces.erase(it);
+    }
+    if (!n) return;
+    bump_view_epoch();
+    g_evicted_surfaces += n;
+    g_evicted_bytes += freed;
+    static int logs = 0;
+    if (logs++ < 12)
+        host_log("texture: video memory down to the reserve: %llu textures not bound for %llu s evicted (%llu MiB; %llu so far, %llu MiB, "
+                 "%llu of them made ahead and never bound)",
+                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(idle_ms / 1000),
+                 static_cast<unsigned long long>(freed >> 20), static_cast<unsigned long long>(g_evicted_surfaces),
+                 static_cast<unsigned long long>(g_evicted_bytes >> 20), static_cast<unsigned long long>(g_evicted_ahead));
 }
 
 // Textures a shortage (or the reserve) put in host memory come back once
@@ -3344,10 +3424,11 @@ void textures_return_from_host_locked() {
 }
 
 std::string textures_return_report() {
-    char buf[128];
-    std::snprintf(buf, sizeof(buf), ", textures in host memory %llu, back from it %llu (%llu MiB)",
+    char buf[192];
+    std::snprintf(buf, sizeof(buf), ", textures in host memory %llu, back from it %llu (%llu MiB), evicted cold %llu (%llu MiB)",
                   static_cast<unsigned long long>(g_host_surfaces), static_cast<unsigned long long>(g_returned_surfaces),
-                  static_cast<unsigned long long>(g_returned_bytes >> 20));
+                  static_cast<unsigned long long>(g_returned_bytes >> 20), static_cast<unsigned long long>(g_evicted_surfaces),
+                  static_cast<unsigned long long>(g_evicted_bytes >> 20));
     return buf;
 }
 

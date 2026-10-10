@@ -4161,6 +4161,14 @@ std::uint64_t g_vram_reserve = 0;          // vram_reserve_init
 std::atomic<std::uint64_t> g_reserve_refusals{0};
 }  // namespace
 
+std::uint64_t image_heap_vram_free_locked() {
+    std::uint64_t free = 0;
+    for (const HeapBlock& b : g_heap) {
+        if (b.memory != VK_NULL_HANDLE && g.mem_props.memoryTypes[b.type].heapIndex == g.local_heap) free += kHeapBlock - b.used;
+    }
+    return free;
+}
+
 bool image_memory_in_vram(const ImageMemory& m) {
     return m.type >= g.mem_props.memoryTypeCount || g.mem_props.memoryTypes[m.type].heapIndex == g.local_heap;
 }
