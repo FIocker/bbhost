@@ -240,6 +240,9 @@ struct GfxPipeline {
     bool layout_only = false;  // a fallback pipeline whose stages are its no-fallback ones, until a draw creates it
     bool library = false;      // linked from pipeline libraries: cull, front face, depth and stencil state are set per draw
     bool vs_formats_from_params = false;  // the vertex shader reads its vertex formats from its params (step 6c); captures record it
+    // The pixel shader's TranslateOptions::ps_clip_discard (ps_clip_discard_count),
+    // which also gives the vertex shader its clip varying; captures record it.
+    std::uint32_t clip_discard = 0;
     std::uint32_t table_reads[2] = {~0u, ~0u};  // user-data slots the VS / PS read, or whose tables they read (table_slots_read)
     std::uint32_t user_reads[2] = {~0u, ~0u};   // user-data dwords the VS / PS touch at all, as data too (table_slots_read's `any`)
     std::uint64_t draws = 0;   // draws bound to it (under g.mu)
@@ -3834,6 +3837,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     const bool vs_formats_from_params = vertex_input && g_vertex_format_params && use_pipeline_library() &&
                                         gcn::vertex_formats_from_params_supported(vertex_input->elements);
     pl.vs_formats_from_params = vs_formats_from_params;
+    pl.clip_discard = clip_discard;
     pl.tess_hw = s.tess_hw;
     pl.tess_control_points = s.tess_control_points;
     const std::uint32_t vs_out_cntl =
@@ -13368,6 +13372,9 @@ static bool draw_impl(const GpuDraw& d) {
         cd.translate.set("link_by_register", true);  // gcnlift: identity output links, pixel-shader inputs at SPI_PS_INPUT_CNTL's registers
         cd.translate.set("vertex_input", use_vertex_input);
         cd.translate.set("vs_out_cntl", json::hex(s.vs_out_cntl));  // with the vertex_input elements, what gcnlift needs for the VS
+        // The clip varying (TranslateOptions::kVsOutCntlClipVarying): the pixel
+        // shader's discard, and from it the vertex shader's host bits.
+        cd.translate.set("ps_clip_discard", json::hex(bind_pl->clip_discard));
         cd.translate.set("vs_invariant", g_vs_invariant);
         capture_session = capture_begin_locked(std::move(cd));
     }

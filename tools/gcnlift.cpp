@@ -65,6 +65,13 @@ std::uint32_t word_at(const json::Value& list, std::size_t k, const char* what) 
     return static_cast<std::uint32_t>(json::as_u64(list.array[k], what));
 }
 
+// The draw's clip varying (TranslateOptions::kVsOutCntlClipVarying): the pixel
+// shader's ps_clip_discard, 0 in captures from before it was recorded.
+std::uint32_t clip_discard(const json::Value& tr) {
+    const json::Value* c = tr.find("ps_clip_discard");
+    return c ? static_cast<std::uint32_t>(json::as_u64(*c, "ps_clip_discard")) : 0;
+}
+
 // The pixel-stage options render.cpp's gfx_pipeline() builds, from what the
 // capture recorded about the draw.
 gcn::TranslateOptions pixel_options(const json::Value& m) {
@@ -100,6 +107,7 @@ gcn::TranslateOptions pixel_options(const json::Value& m) {
         // (render.cpp ps_input_locations); the vertex shader writes register r at r.
         o.ps_input_map.push_back(static_cast<std::uint8_t>(c & 0x1f));
     }
+    o.ps_clip_discard = clip_discard(tr);
     return o;
 }
 
@@ -114,6 +122,10 @@ gcn::TranslateOptions vertex_options(const json::Value& m) {
     o.rsrc1 = word_at(json::member(reg, "vs_pgm"), 2, "vs_pgm");
     o.rsrc2 = word_at(json::member(reg, "vs_pgm"), 3, "vs_pgm");
     if (const json::Value* cntl = tr.find("vs_out_cntl")) o.vs_out_cntl = static_cast<std::uint32_t>(json::as_u64(*cntl, "vs_out_cntl"));
+    // build_gfx_pipeline adds the clip varying's host bits to the register's.
+    if (const std::uint32_t clip = clip_discard(tr)) {
+        o.vs_out_cntl |= gcn::TranslateOptions::kVsOutCntlClipVarying | ((clip >> 8) & 31) << gcn::TranslateOptions::kVsOutCntlClipLocationShift;
+    }
     const json::Value* inv = tr.find("vs_invariant");
     o.invariant_position = inv && inv->type == json::Value::Type::Bool && inv->boolean;
     o.descriptor_set = 0;
