@@ -5771,6 +5771,51 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
                       find_render_target(tsharp_base(tw)) ? " (render target)" : "");
         }
         if (b.storage) surface_queue_writeback(tsharp_base(tw));
+        static const std::uint64_t probe = [] {
+            const char* e = std::getenv("BBHOST_TEX_PROBE");
+            return e ? std::strtoull(e, nullptr, 0) : 0ull;
+        }();
+        if (probe && tsharp_base(tw) == probe) {
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 24) {
+                std::string bufs;
+                for (const gcn::ResourcePath& path : pl.meta.store_buffers) bufs += " store " + path.str();
+                for (std::size_t j = 0; j < pl.meta.buffers.size(); ++j) {
+                    std::uint32_t v[4]{};
+                    if (!resolve_resource(pl.meta.buffers[j].path, d.user_data, 4, v)) continue;
+                    const std::uint64_t vb = v[0] | (static_cast<std::uint64_t>(v[1] & 0xff) << 32);
+                    std::uint64_t head[2] = {};
+                    if (vb && hle_kernel_va_mapped(vb, sizeof(head))) std::memcpy(head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(vb)), sizeof(head));
+                    char t[160];
+                    std::snprintf(t, sizeof(t), "; buffer %s 0x%llx: %016llx %016llx", pl.meta.buffers[j].path.str().c_str(),
+                                  static_cast<unsigned long long>(vb), static_cast<unsigned long long>(head[0]), static_cast<unsigned long long>(head[1]));
+                    bufs += t;
+                }
+                {
+                    char t[512];
+                    const std::uint32_t* u = d.user_data;
+                    const std::uint64_t vb = u[4] | (static_cast<std::uint64_t>(u[5] & 0xff) << 32);
+                    std::uint8_t src[16] = {};
+                    if (vb && hle_kernel_va_mapped(vb, sizeof(src))) std::memcpy(src, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(vb)), sizeof(src));
+                    const std::uint64_t table = u[2] | (static_cast<std::uint64_t>(u[3]) << 32);
+                    std::uint32_t cbv[4] = {}, cb[4] = {};
+                    if (table && hle_kernel_va_mapped(table, sizeof(cbv))) std::memcpy(cbv, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(table)), sizeof(cbv));
+                    const std::uint64_t cbb = cbv[0] | (static_cast<std::uint64_t>(cbv[1] & 0xff) << 32);
+                    if (cbb && hle_kernel_va_mapped(cbb, sizeof(cb))) std::memcpy(cb, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cbb)), sizeof(cb));
+                    std::snprintf(t, sizeof(t), "; user[4:7] %08x %08x %08x %08x, bytes at 0x%llx:", u[4], u[5], u[6], u[7], static_cast<unsigned long long>(vb));
+                    bufs += t;
+                    for (std::uint8_t b8 : src) {
+                        std::snprintf(t, sizeof(t), " %02x", b8);
+                        bufs += t;
+                    }
+                    std::snprintf(t, sizeof(t), "; cb 0x%llx: %u %u %u %u", static_cast<unsigned long long>(cbb), cb[0], cb[1], cb[2], cb[3]);
+                    bufs += t;
+                }
+                host_log("texture probe: 0x%llx dispatch %s %ux%ux%u %s it, T# %08x %08x %08x %08x (flip %llu)%s",
+                         static_cast<unsigned long long>(tsharp_base(tw)), pl.name.c_str(), d.dim[0], d.dim[1], d.dim[2], b.storage ? "WRITES" : "reads",
+                         tw[0], tw[1], tw[2], tw[3], static_cast<unsigned long long>(hle_video_flip_count()), bufs.c_str());
+            }
+        }
     }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;

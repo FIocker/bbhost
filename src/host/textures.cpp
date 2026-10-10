@@ -3022,6 +3022,15 @@ bool textures_upload_region_locked(std::uint64_t base, const std::uint32_t* tsha
         if (textures_create_ahead_locked(tsharp)) g_region_created.fetch_add(1, std::memory_order_relaxed);
         it = g_surfaces.find(base);
     }
+    if (const std::uint64_t probe = tex_probe_base(); probe && base == probe) {
+        std::uint64_t head[2] = {};
+        std::memcpy(head, data, std::min<std::size_t>(bytes, sizeof(head)));
+        host_log("texture probe: 0x%llx upload token mip %u layer %u %ux%u at %u,%u (%zu bytes, rows of %u): %s; first %016llx %016llx (flip %llu)",
+                 static_cast<unsigned long long>(base), mip, layer, w, h, x, y, bytes, row_bytes,
+                 it == g_surfaces.end() ? "no surface" : it->second.failed ? "failed surface" : "into the surface",
+                 static_cast<unsigned long long>(head[0]), static_cast<unsigned long long>(head[1]),
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
     if (it == g_surfaces.end() || it->second.failed || !it->second.image) {
         g_region_no_surface.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -3183,6 +3192,12 @@ bool textures_carry_into_target_locked(std::uint64_t base, std::uint32_t width, 
 
 bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     CopySide src, dst;
+    if (tex_probe_base() && (tsharp_base(c.dst_tsharp) == tex_probe_base() || tsharp_base(c.src_tsharp) == tex_probe_base())) {
+        host_log("texture probe: copy token 0x%llx mip %u layer %u -> 0x%llx mip %u layer %u, %ux%u (flip %llu)",
+                 static_cast<unsigned long long>(tsharp_base(c.src_tsharp)), c.src_mip, c.src_layer,
+                 static_cast<unsigned long long>(tsharp_base(c.dst_tsharp)), c.dst_mip, c.dst_layer, c.w, c.h,
+                 static_cast<unsigned long long>(hle_video_flip_count()));
+    }
     // A refused token is a copy that did not happen (the game's method did
     // not run either): the destination's history says so, for F12.
     const auto refused = [&](const char* why) {
@@ -3859,6 +3874,7 @@ int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes) {
     for (auto kv = g_large_surfaces.lower_bound(large_first); kv != g_large_surfaces.end() && kv->first < end; ++kv) {
         if (kv->second->base + kv->second->total_src > va) hit.push_back(kv->second);
     }
+    const std::uint64_t probe = tex_probe_base();  // BBHOST_TEX_PROBE; 0 (off) checks nothing below
     for (Surface* sp : hit) {
         Surface& sf = *sp;
         ++touched;
@@ -3870,6 +3886,13 @@ int mark_surfaces_dirty_locked(std::uint64_t va, std::size_t bytes) {
         sf.unchanged = 0;
         sf.cp_dirty = true;
         if (sf.hot < 2) sf.hot = 2;
+        if (probe && sf.base == probe) {
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 24) {
+                host_log("texture probe: 0x%llx under a GPU write to [0x%llx,+0x%zx) (gpu-written %d, flip %llu)", static_cast<unsigned long long>(sf.base),
+                         static_cast<unsigned long long>(va), bytes, sf.gpu_written ? 1 : 0, static_cast<unsigned long long>(hle_video_flip_count()));
+            }
+        }
         if (sf.gpu_written && sf.width >= 16) {
             tex_event(sf.base, sf.total_src, "dirty 0x%llx (gpu-written %ux%u) by a write to [0x%llx,+0x%zx)", static_cast<unsigned long long>(sf.base),
                       sf.width, sf.height, static_cast<unsigned long long>(va), bytes);
@@ -3907,6 +3930,16 @@ std::uint64_t textures_hash_us() { return g_hash_us.load(); }
 std::uint64_t textures_replacements() { return g_surface_replacements.load(); }
 
 void textures_report() {
+    if (const std::uint64_t probe = tex_probe_base(); probe && hle_kernel_va_mapped(probe, 32)) {
+        std::uint64_t head[4] = {};
+        std::memcpy(head, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(probe)), sizeof(head));
+        auto it = g_surfaces.find(probe);
+        host_log("texture probe: 0x%llx memory now %016llx %016llx %016llx %016llx; surface %s (gpu-written %d, watched %d, uploads %u)",
+                 static_cast<unsigned long long>(probe), static_cast<unsigned long long>(head[0]), static_cast<unsigned long long>(head[1]),
+                 static_cast<unsigned long long>(head[2]), static_cast<unsigned long long>(head[3]), it == g_surfaces.end() ? "none" : "cached",
+                 it == g_surfaces.end() ? 0 : it->second.gpu_written ? 1 : 0, it == g_surfaces.end() ? 0 : it->second.watched ? 1 : 0,
+                 it == g_surfaces.end() ? 0u : it->second.uploads);
+    }
     if (const std::uint64_t n = g_view_memo_hits + g_view_memo_misses) {
         host_log("texture: view memo %llu of %llu descriptor lookups (%.1f%%), %llu resolved, %llu evicted%s",
                  static_cast<unsigned long long>(g_view_memo_hits), static_cast<unsigned long long>(n),
