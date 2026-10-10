@@ -77,7 +77,21 @@ struct BufferBinding {
     // A load indexes it (tbuffer_load_format_* with idxen): the host binds the
     // V#'s records (count x stride) and passes cb_stride / cb_w3.
     bool indexed = false;
+    // A load reads it at a run-time offset (s_buffer_load_dword* with the
+    // offset in an SGPR): the host binds the V#'s whole range - num_records
+    // bytes, times the stride when that is not 0 - and passes its length in
+    // dwords as cb_stride, which the shader checks each dword against, as GCN
+    // does (a dword past the range reads 0). Never also `indexed`.
+    bool ranged = false;
 };
+// A V#'s range in dwords as GCN checks a buffer load against it, from its
+// words 1 (stride in [29:16]) and 2 (num_records): num_records bytes, times the
+// stride when that is not 0, a dword in range when it starts inside.
+inline std::uint64_t vsharp_range_dwords(std::uint32_t w1, std::uint32_t w2) {
+    const std::uint32_t stride = (w1 >> 16) & 0x3fff;
+    const std::uint64_t bytes = stride ? std::uint64_t{w2} * stride : std::uint64_t{w2};
+    return (bytes + 3) / 4;
+}
 
 // One vertex element a vertex shader takes from Vulkan vertex input instead of
 // its fetch shader. The fetch shader would have loaded it with
@@ -412,7 +426,10 @@ struct StageParams {
     std::uint32_t lds_bytes;
     std::uint32_t pad[2];
     std::uint32_t cb_bias_dw[16];  // buffers[n]: dword index of the V# base inside its bound range
-    std::uint32_t cb_stride[16];   // buffers[n] read by index (BufferBinding::indexed): the V#'s stride in bytes
+    // buffers[n] read by index (BufferBinding::indexed): the V#'s stride in
+    // bytes; read at a run-time offset (BufferBinding::ranged): the V#'s range
+    // in dwords, rounded up (0 for a null or empty V#).
+    std::uint32_t cb_stride[16];
     std::uint32_t cb_w3[16];       // the same: the V#'s word 3 (data and number format, DST_SEL)
     // TranslateOptions::vertex_formats_from_params: vertex_format_descriptor
     // per vertex-input location. TessRole::LsCompute (no vertex input) reads

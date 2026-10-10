@@ -1926,11 +1926,15 @@ private:
             reject(std::string(mnemonic(in)) + " is not read through a bound storage buffer in the reference");
             return;
         }
+        const std::uint32_t index = site->second;
         if (!in.imm_flag && !in.has_literal) {
-            reject("scalar load at a register offset");
+            if (!ref.buffers[index].ranged || in.op < 8) {
+                reject("scalar load at a register offset from a buffer the reference does not bind whole");
+                return;
+            }
+            ranged_load(in, count, index);
             return;
         }
-        const std::uint32_t index = site->second;
         const std::uint32_t off_dw = in.imm_flag ? static_cast<std::uint32_t>(in.imm) : in.literal;
         const Id bias = params_load(bias_loads, 4, index);
         Pending p{in.sdst, {}};
@@ -1942,6 +1946,31 @@ private:
         }
         pending.push_back(std::move(p));
         ++buffer_loads;
+    }
+
+    // s_buffer_load_dword* at a register offset from a buffer the reference
+    // binds whole (BufferBinding::ranged), as translate.cpp load_buffer_ranged
+    // reads it: dword (offset >> 2) + k of the V#'s memory, 0 at or past its
+    // range in dwords (StageParams::cb_stride), as GCN's range check returns -
+    // an index past it reads dword 0 of the binding instead, in bounds.
+    std::size_t ranged_loads = 0;
+    void ranged_load(const Inst& in, int count, std::uint32_t index) {
+        const Id first = shift(spv::OpShiftRightLogical, as_u(read(static_cast<std::uint16_t>(in.imm), in)), cu(2));
+        const Id bias = params_load(bias_loads, 4, index);
+        const Id range_dw = params_load(stride_loads, 5, index);
+        Pending p{in.sdst, {}};
+        for (int k = 0; k < count; ++k) {
+            const Id at = ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k)));
+            const Id in_range = m.emit(spv::OpULessThan, t_bool, {at, range_dw});
+            const Id slot = ibin(spv::OpIAdd, bias, m.emit(spv::OpSelect, t_u32, {in_range, at, cu(0)}));
+            const Id word_v = m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), slot}));
+            const Val v = word(m.emit(spv::OpSelect, t_u32, {in_range, word_v, cu(0)}));
+            write_scalar(static_cast<std::uint16_t>(in.sdst + k), v);
+            p.values.push_back(v);
+        }
+        pending.push_back(std::move(p));
+        ++buffer_loads;
+        ++ranged_loads;
     }
 
     // A typed load's V# word 3 (StageParams::cb_w3), as translate.cpp
@@ -4906,8 +4935,11 @@ private:
         }
         head.push_back(std::to_string(exports.size()) + " exports with EXEC set");
         if (image_loads) head.push_back(std::to_string(image_loads) + " image loads at integer coordinates, which take neither a sampler nor derivatives");
-        head.push_back(std::to_string(buffer_loads) + " scalar loads, every one from a storage buffer the reference binds; " +
-                       std::to_string(masked_writes) + " VGPR writes under a varying EXEC become selects");
+        head.push_back(std::to_string(buffer_loads) + " scalar loads, every one from a storage buffer the reference binds" +
+                       (ranged_loads ? " (" + std::to_string(ranged_loads) + " at a run-time offset, each dword checked against the V#'s range "
+                                       "as GCN checks it)"
+                                     : std::string()) +
+                       "; " + std::to_string(masked_writes) + " VGPR writes under a varying EXEC become selects");
         if (clip_discard) {
             head.push_back("a pixel whose clip distances (the vertex stage's, at location " + std::to_string(opt.ps_clip_location()) +
                            ") are negative is discarded at entry, by the translator's own prologue");

@@ -287,7 +287,7 @@ void write_result(Writer& w, const gcn::TranslateResult& r, bool with_spirv) {
         w.path(b.path);
         w.u32(b.binding);
         w.u32(b.max_dw);
-        w.u8(static_cast<std::uint8_t>((b.pointer ? 1 : 0) | (b.indexed ? 2 : 0)));
+        w.u8(static_cast<std::uint8_t>((b.pointer ? 1 : 0) | (b.indexed ? 2 : 0) | (b.ranged ? 4 : 0)));
     }
     w.at(r.image_at);
     w.at(r.sampler_at);
@@ -344,6 +344,7 @@ bool read_result(Reader& r, gcn::TranslateResult& t) {
         const std::uint8_t f = r.u8();
         b.pointer = f & 1;
         b.indexed = f & 2;
+        b.ranged = f & 4;
     }
     r.at(t.image_at);
     r.at(t.sampler_at);

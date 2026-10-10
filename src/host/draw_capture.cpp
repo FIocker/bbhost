@@ -559,6 +559,8 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
             bj.set("path", b.path.str());
             bj.set("pointer", b.pointer);
             bj.set("max_dw", b.max_dw);
+            if (b.indexed) bj.set("indexed", true);
+            if (b.ranged) bj.set("ranged", true);
             bj.set("bias_dw", cs.params.cb_bias_dw[i]);
             bj.set("bytes", info.range);
             if (info.buffer == g.sink.buffer) {

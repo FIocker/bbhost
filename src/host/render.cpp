@@ -5770,7 +5770,8 @@ bool same_bindings(const gcn::TranslateResult& a, const gcn::TranslateResult& b)
     }
     for (std::size_t i = 0; i < a.buffers.size(); ++i) {
         const gcn::BufferBinding &x = a.buffers[i], &y = b.buffers[i];
-        if (x.binding != y.binding || x.max_dw != y.max_dw || x.pointer != y.pointer || x.indexed != y.indexed || x.path.str() != y.path.str()) {
+        if (x.binding != y.binding || x.max_dw != y.max_dw || x.pointer != y.pointer || x.indexed != y.indexed || x.ranged != y.ranged ||
+            x.path.str() != y.path.str()) {
             return false;
         }
     }
@@ -6463,7 +6464,7 @@ const GxStagePlan& stage_plan(const gcn::TranslateResult& meta, const GxStageRec
         plan->ndesc = st.ndesc;
         for (const gcn::ImageBinding& b : meta.images) plan->images.push_back(plan_binding(b.path, st, b.r128 ? 4 : 8));
         for (const gcn::SamplerBinding& b : meta.samplers) plan->samplers.push_back(plan_binding(b.path, st, 4));
-        for (const gcn::BufferBinding& b : meta.buffers) plan->buffers.push_back(plan_binding(b.path, st, b.indexed ? 4 : 2));
+        for (const gcn::BufferBinding& b : meta.buffers) plan->buffers.push_back(plan_binding(b.path, st, b.indexed || b.ranged ? 4 : 2));
         plan->all_records = true;
         for (const GxBindingPlan& b : plan->images) plan->all_records = plan->all_records && b.source != GxBindingPlan::kFallback;
         for (const GxBindingPlan& b : plan->samplers) plan->all_records = plan->all_records && b.source != GxBindingPlan::kFallback;
@@ -8367,7 +8368,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         std::uint32_t words[4] = {};
         // A pointer buffer reads a whole table, which only the commit builds.
         const bool resolved = b.pointer ? resolve_resource_impl(b.path, user, 2, words)
-                                        : resolve_via_plan(plan ? &plan->buffers[i] : nullptr, b.path, user, gx, b.indexed ? 4 : 2, words);
+                                        : resolve_via_plan(plan ? &plan->buffers[i] : nullptr, b.path, user, gx, b.indexed || b.ranged ? 4 : 2, words);
         // A V# read by index is read anywhere in its records (count x stride),
         // in dwords; its stride and word 3 go into the params block.
         VkDeviceSize bytes = static_cast<VkDeviceSize>(b.max_dw) * 4;
@@ -8391,6 +8392,13 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                                               : std::max<VkDeviceSize>(bytes, static_cast<VkDeviceSize>(words[2]) * stride);
             params.cb_stride[i] = stride;
             params.cb_w3[i] = words[3];
+        }
+        // A V# read at a run-time offset is read anywhere in its range, which
+        // the shader checks each dword against (gcn::vsharp_range_dwords).
+        if (b.ranged) {
+            const std::uint64_t range_dw = resolved ? gcn::vsharp_range_dwords(words[1], words[2]) : 0;
+            bytes = std::max<VkDeviceSize>(bytes, range_dw * 4);
+            params.cb_stride[i] = static_cast<std::uint32_t>(std::min<std::uint64_t>(range_dw, 0xffffffffu));
         }
         // A V# keeps memory-type bits above its 40-bit address; a pointer pair is the address.
         const std::uint64_t hi = b.pointer ? words[1] : (words[1] & 0xff);
@@ -8516,7 +8524,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             const std::string what = first ? b.path.str() + " " + why : std::string();
             if (first && fail_seen.size() < 32 && fail_seen.insert(what).second) {
                 host_log("render: %s buffer %s: base 0x%llx, %llu bytes%s", b.pointer ? "pointer" : "V#", what.c_str(),
-                         static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), b.indexed ? ", indexed" : "");
+                         static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes),
+                         b.indexed ? ", indexed" : b.ranged ? ", read at a run-time offset" : "");
             }
         }
         ++outcomes[outcome];

@@ -2188,6 +2188,10 @@ struct Asm {
     void smrd(std::uint32_t op, std::uint32_t sdst, std::uint32_t sbase, std::uint32_t offset_dw) {
         w.push_back(0xc0000000u | op << 22 | sdst << 15 | (sbase / 2) << 9 | 1u << 8 | offset_dw);
     }
+    // The same with the byte offset in SGPR `soff` (IMM clear).
+    void smrd_reg(std::uint32_t op, std::uint32_t sdst, std::uint32_t sbase, std::uint32_t soff) {
+        w.push_back(0xc0000000u | op << 22 | sdst << 15 | (sbase / 2) << 9 | soff);
+    }
     void vop1(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0) { w.push_back(0x7e000000u | vdst << 17 | op << 9 | src0); }
     // `vsrc1` is the 8-bit field: a VGPR index, or for v_readlane/v_writelane_b32 the lane's scalar code.
     void vop2(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0, std::uint32_t vsrc1) { w.push_back(op << 25 | vdst << 17 | vsrc1 << 9 | src0); }
@@ -2467,6 +2471,164 @@ void descriptor_loads() {
     CHECK(ref.buffers.size() == 1 && ref.buffers[0].path.str() == "user_sgpr[2]" && ref.buffer_at.count(8) && ref.buffer_at.count(12));
 }
 
+// One invocation of a straight-line lifted pixel shader that reads only the
+// params block and storage buffers: `user` the user SGPRs, `bias` and `range`
+// StageParams::cb_bias_dw and cb_stride, `buffers` each binding's dwords.
+// Returns mrt0's four words, or an error.
+struct ScalarRun {
+    bool ok = false;
+    std::string error;
+    std::array<std::uint32_t, 4> mrt0{};
+};
+ScalarRun run_scalar_ps(const std::vector<std::uint32_t>& spv, const std::array<std::uint32_t, 16>& user, const std::array<std::uint32_t, 16>& bias,
+                        const std::array<std::uint32_t, 16>& range, const std::map<std::uint32_t, std::vector<std::uint32_t>>& buffers) {
+    ScalarRun run;
+    using Vec = std::array<std::uint32_t, 4>;
+    std::map<std::uint32_t, Vec> val;
+    std::map<std::uint32_t, std::uint32_t> constants, location, binding, storage;
+    struct Chain {
+        std::uint32_t base;
+        std::vector<std::uint32_t> idx;
+    };
+    std::map<std::uint32_t, Chain> chains;
+    const auto fail = [&](const std::string& why) {
+        run.error = why;
+        return run;
+    };
+    bool in_body = false, stored = false;
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+        if (n == 0 || i + n > spv.size()) return fail("malformed module");
+        const std::uint32_t* a = &spv[i + 1];
+        i += n;
+        switch (op) {
+        case 71:  // OpDecorate
+            if (a[1] == 30) location[a[0]] = a[2];
+            if (a[1] == 33) binding[a[0]] = a[2];
+            continue;
+        case 59: storage[a[1]] = a[2]; continue;  // OpVariable
+        case 43: constants[a[1]] = a[2]; continue;
+        case 41: constants[a[1]] = 1; continue;
+        case 42: constants[a[1]] = 0; continue;
+        case 248: in_body = true; continue;
+        default: break;
+        }
+        if (!in_body) continue;
+        const auto get = [&](std::uint32_t id) -> Vec {
+            if (const auto c = constants.find(id); c != constants.end()) return {c->second, 0, 0, 0};
+            return val[id];
+        };
+        const auto g0 = [&](std::uint32_t id) { return get(id)[0]; };
+        const auto set = [&](std::uint32_t id, std::uint32_t v) { val[id] = {v, 0, 0, 0}; };
+        switch (op) {
+        case 65: {  // OpAccessChain
+            Chain c{a[2], {}};
+            for (std::uint32_t k = 3; k < n - 1; ++k) c.idx.push_back(g0(a[k]));
+            chains[a[1]] = c;
+            break;
+        }
+        case 61: {  // OpLoad
+            const auto c = chains.find(a[2]);
+            if (c == chains.end()) return fail("a load of something other than the params or a storage buffer");
+            const std::uint32_t base = c->second.base;
+            const auto& idx = c->second.idx;
+            if (storage[base] == 2) {  // Uniform: the params block
+                if (idx.size() != 3) return fail("a params load of another shape");
+                const std::uint32_t k = idx[1] * 4 + idx[2];
+                if (k >= 16) return fail("a params entry past 16");
+                if (idx[0] == 2) set(a[1], user[k]);
+                else if (idx[0] == 4) set(a[1], bias[k]);
+                else if (idx[0] == 5) set(a[1], range[k]);
+                else return fail("a params member the test does not give: " + std::to_string(idx[0]));
+            } else if (storage[base] == 12) {  // StorageBuffer
+                const auto b = buffers.find(binding[base]);
+                if (b == buffers.end() || idx.size() != 2 || idx[0] != 0) return fail("a storage buffer the test does not give");
+                if (idx[1] >= b->second.size()) return fail("a storage-buffer read past the binding (dword " + std::to_string(idx[1]) + ")");
+                set(a[1], b->second[idx[1]]);
+            } else {
+                return fail("a load from another storage class");
+            }
+            break;
+        }
+        case 62:  // OpStore
+            if (storage[a[0]] != 3 || !location.count(a[0]) || location[a[0]] != 0) return fail("a store to something other than mrt0");
+            run.mrt0 = get(a[1]);
+            stored = true;
+            break;
+        case 80: {  // OpCompositeConstruct
+            Vec v{};
+            for (std::uint32_t k = 2; k < n - 1 && k < 6; ++k) v[k - 2] = g0(a[k]);
+            val[a[1]] = v;
+            break;
+        }
+        case 124: val[a[1]] = get(a[2]); break;                         // OpBitcast
+        case 128: set(a[1], g0(a[2]) + g0(a[3])); break;                // OpIAdd
+        case 176: set(a[1], g0(a[2]) < g0(a[3])); break;                // OpULessThan
+        case 194: set(a[1], g0(a[2]) >> (g0(a[3]) & 31)); break;        // OpShiftRightLogical
+        case 199: set(a[1], g0(a[2]) & g0(a[3])); break;                // OpBitwiseAnd
+        case 169: val[a[1]] = g0(a[2]) ? get(a[3]) : get(a[4]); break;  // OpSelect
+        case 253: case 56: break;                                       // OpReturn, OpFunctionEnd
+        default: return fail("unsupported opcode " + std::to_string(op));
+        }
+    }
+    if (!stored) return fail("mrt0 is not written");
+    run.ok = true;
+    return run;
+}
+
+// s_buffer_load_dwordx4 at a register offset from a V# in a table: the
+// reference binds the V#'s whole range (BufferBinding::ranged), and the lift
+// reads dword (offset >> 2) + k of it, 0 at or past the range, as GCN's range
+// check returns - here through an interpreter of the lifted module, at
+// offsets inside, straddling and past the range and with the low bits set.
+void ranged_loads() {
+    constexpr std::uint32_t kBufferLoadX4 = 10;  // SMRD s_buffer_load_dwordx4
+    const auto program = [&] {
+        Asm a;
+        a.smrd(kLoadX4, 8, 2, 4);                 // s_load_dwordx4 s[8:11], s[2:3], 0x4: the V#
+        a.sopp(kWaitcnt, 0);
+        a.smrd_reg(kBufferLoadX4, 12, 8, 1);      // s_buffer_load_dwordx4 s[12:15], s[8:11], s1
+        a.sopp(kWaitcnt, 0);
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop1(kVMov, k, 12 + k);
+        a.exp_mrt0(0, 1, 2, 3);
+        a.endpgm();
+        return a.w;
+    };
+    gcn::TranslateResult ref;
+    const gcn::LiftResult l = lift_words(program(), nullptr, &ref);
+    CHECK(lifted_valid(l));
+    CHECK(ref.buffers.size() == 2 && ref.buffers[1].ranged && !ref.buffers[1].indexed && !ref.buffers[0].ranged &&
+          ref.buffers[1].path.str() == "user_sgpr[2]->load(+16)" && ref.buffer_at.count(8) && ref.buffer_at.at(8) == 1);
+    CHECK(proof_has(l, "1 at a run-time offset, each dword checked against the V#'s range"));
+    if (!l.ok() || ref.buffers.size() != 2) return;
+    const std::uint32_t b0 = ref.buffers[0].binding, b1 = ref.buffers[1].binding;
+    std::vector<std::uint32_t> data(64);
+    for (std::uint32_t k = 0; k < 64; ++k) data[k] = 0x1000u + k;
+    for (const auto& [offset, range, bias] : {std::array<std::uint32_t, 3>{16, 10, 0}, {33, 10, 0}, {40, 10, 0}, {36, 10, 0}, {0, 0, 0},
+                                              {8, 10, 6}, {0xfffffffcu, 10, 0}, {28, 64, 2}}) {
+        std::array<std::uint32_t, 16> user{}, biases{}, ranges{};
+        user[1] = offset;
+        biases[1] = bias;
+        ranges[1] = range;
+        const ScalarRun r = run_scalar_ps(l.spirv, user, biases, ranges, {{b0, std::vector<std::uint32_t>(16, 0)}, {b1, data}});
+        if (!r.ok) std::fprintf(stderr, "ranged load at %u: %s\n", offset, r.error.c_str());
+        CHECK(r.ok);
+        for (std::uint32_t k = 0; k < 4 && r.ok; ++k) {
+            const std::uint32_t at = (offset >> 2) + k;
+            const std::uint32_t want = at < range ? data[bias + at] : 0;
+            if (r.mrt0[k] != want) {
+                std::fprintf(stderr, "ranged load at byte %u (range %u dwords, bias %u): dword %u read %08x, expected %08x\n", offset, range, bias, k,
+                             r.mrt0[k], want);
+                ++g_failures;
+            }
+        }
+    }
+    // Left to the page table (the reference walks it, without a binding), the
+    // words are data the lift does not have.
+    CHECK(rejected_with(lift_words(program(), nullptr, nullptr, {"user_sgpr[2]->load(+16)"}),
+                        "data from a scalar load the reference walks the page table for"));
+}
+
 // Copies of a V#: a spill to lanes of a VGPR and back (v_writelane_b32 /
 // v_readlane_b32 of a spill cell), or s_mov, define what they copy, so a
 // constant buffer read through a copy of its V# is bound - where every copy
@@ -2655,6 +2817,7 @@ void lshl_b64() {
 void run() {
     spills();
     descriptor_loads();
+    ranged_loads();
     copies();
     cselect();
     lshl_b64();

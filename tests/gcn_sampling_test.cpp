@@ -48,6 +48,11 @@ struct Fixture {
     VkBuffer guest{};
     VkDeviceMemory guest_mem{};
     std::uint8_t* guest_map{};
+    // A constant buffer bound as a storage buffer at binding 112 (the
+    // translator's cb_binding_base): what the renderer binds over a V#.
+    VkBuffer cb{};
+    VkDeviceMemory cb_mem{};
+    std::uint32_t* cb_map{};
 
     // Twelve 4x4 layers (two cubes of six faces), texel (x, y, layer, 1): what a
     // Sea Islands cube T# is bound as.
@@ -123,13 +128,19 @@ struct Fixture {
 
     // A compute program of `body`, then run once against the fixture's set:
     // the destination texel back as four floats.
-    std::array<float, 4> dispatch_compute(const std::vector<gcn::Inst>& body, std::uint32_t user_sgprs) {
+    std::array<float, 4> dispatch_compute(const std::vector<gcn::Inst>& body, std::uint32_t user_sgprs, int cb = 0,
+                                          gcn::TranslateResult* result = nullptr) {
         gcn::Program p;
         for (gcn::Inst in : body) { in.offset = uint32_t(p.insts.size() * 8); in.size = 2; p.insts.push_back(in); }
         gcn::Inst end; end.enc = gcn::Enc::SOPP; end.op = 1; end.offset = uint32_t(p.insts.size() * 8); end.size = 1; p.insts.push_back(end);
         gcn::TranslateOptions o; o.stage = gcn::Stage::Compute; o.rsrc2 = user_sgprs << 1; o.cs_threads[0] = 1;
         o.sampler_force_unnormalized = {false};
+        // `cb` 1: constant buffers through storage-buffer bindings, with the
+        // page-table fallback; 2: without it (the renderer's no-fallback variant).
+        o.cb_ssbo = cb != 0;
+        o.cb_no_fallback = cb == 2;
         const auto translated = gcn::translate(p, o);
+        if (result) *result = translated;
         if (!translated.ok()) throw std::runtime_error(translated.errors[0]);
         spvtools::SpirvTools validator(SPV_ENV_VULKAN_1_2);
         validator.SetMessageConsumer([](auto, auto, const auto&, const char* msg) { std::fprintf(stderr,"%s\n",msg); });
@@ -236,6 +247,52 @@ struct Fixture {
         const std::uint8_t* b = guest_map + (kGuestData & 0xffff);
         const bool ok = b[7] == 128 && b[6] == 0x5a && b[8] == 0x5a;
         std::printf("%s A8 buffer_store_format: byte %u (expected 128), neighbours %02x %02x (expected 5a 5a)\n", ok ? "PASS" : "FAIL", b[7], b[6], b[8]);
+        return ok;
+    }
+
+    // s_buffer_load_dwordx4 at a register offset (BufferBinding::ranged):
+    // dword (offset >> 2) + k of the V#'s memory, 0 for a dword at or past
+    // the V#'s range - num_records bytes, times the stride when that is not 0.
+    // The V# is in s[12:15]; the offset is put in s20 by s_movk_i32, so the
+    // load's offset is a register; the four dwords go to the destination
+    // texel through v[16:19]. Bound (`bound`): the storage buffer at 112 holds
+    // the V#'s memory and StageParams::cb_stride its range in dwords; walked:
+    // guest memory, and the range from the V#'s own words.
+    bool run_ranged_load(int cb, bool bound, std::uint32_t offset, std::uint32_t stride, std::uint32_t records, const float (&want)[4],
+                         const char* what) {
+        auto* params = static_cast<gcn::StageParams*>(mapped);
+        params->user_sgpr[3] = 0xfac; params->user_sgpr[8] = 0;
+        float* mem = reinterpret_cast<float*>(guest_map + (kGuestData & 0xffff));
+        for (int k = 0; k < 64; ++k) {
+            mem[k] = 100.0f + float(k);                                   // walked
+            reinterpret_cast<float*>(cb_map)[k] = 100.0f + float(k);      // bound
+        }
+        params->user_sgpr[12] = static_cast<std::uint32_t>(kGuestData);
+        params->user_sgpr[13] = static_cast<std::uint32_t>(kGuestData >> 32) | stride << 16;
+        params->user_sgpr[14] = records;
+        params->user_sgpr[15] = 0x77fac;  // 32_32_32_32 float, X Y Z W: what scalar loads ignore
+        params->cb_valid = bound ? 1u : 0u;
+        params->cb_bias_dw[0] = 0;
+        params->cb_stride[0] = bound ? static_cast<std::uint32_t>(gcn::vsharp_range_dwords(params->user_sgpr[13], records)) : 0xdeadu;
+        std::vector<gcn::Inst> body;
+        gcn::Inst movk; movk.enc = gcn::Enc::SOPK; movk.op = 0; movk.dst = 20; movk.imm = static_cast<std::int32_t>(offset); body.push_back(movk);
+        gcn::Inst load; load.enc = gcn::Enc::SMRD; load.op = 10;  // s_buffer_load_dwordx4 s[24:27], s[12:15], s20
+        load.sdst = 24; load.src0 = 12; load.imm_flag = false; load.imm = 20; body.push_back(load);
+        gcn::Inst wait; wait.enc = gcn::Enc::SOPP; wait.op = 12; wait.imm = 0; body.push_back(wait);
+        for (int k = 0; k < 4; ++k) {
+            gcn::Inst mov; mov.enc = gcn::Enc::VOP1; mov.op = 1; mov.dst = static_cast<std::uint16_t>(16 + k); mov.src0 = static_cast<std::uint16_t>(24 + k);
+            body.push_back(mov);
+        }
+        image_store_body(body);
+        gcn::TranslateResult tr;
+        const auto got = dispatch_compute(body, 16, cb, &tr);
+        params->cb_valid = 0;
+        const bool ranged = tr.buffers.size() == 1 && tr.buffers[0].ranged && !tr.buffers[0].indexed && tr.buffer_at.count(8);
+        const bool ok = ranged && near4(got, want);
+        std::printf("%s s_buffer_load at a register offset (%s, %s): offset %u, stride %u, records %u: got (%g,%g,%g,%g), expected (%g,%g,%g,%g)%s\n",
+                    ok ? "PASS" : "FAIL", cb == 2 ? "no fallback" : "with fallback", bound ? "bound" : "walked", offset, stride, records, got[0],
+                    got[1], got[2], got[3], want[0], want[1], want[2], want[3], ranged ? "" : " - not a ranged binding");
+        (void)what;
         return ok;
     }
 
@@ -421,17 +478,18 @@ struct Fixture {
         sci.magFilter = sci.minFilter = VK_FILTER_NEAREST; sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         check(vkCreateSampler(device, &sci, nullptr, &sampler));
-        const std::array<VkDescriptorSetLayoutBinding,4> bindings = {{{0,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+        const std::array<VkDescriptorSetLayoutBinding,5> bindings = {{{0,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
             {16,VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
             {48,VK_DESCRIPTOR_TYPE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
-            {81,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}}};
-        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; li.bindingCount = 4; li.pBindings = bindings.data();
+            {81,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr},
+            {gcn::kBindingStorageBuffer0,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,1,VK_SHADER_STAGE_COMPUTE_BIT,nullptr}}};
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; li.bindingCount = 5; li.pBindings = bindings.data();
         check(vkCreateDescriptorSetLayout(device, &li, nullptr, &layout));
         VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; pli.setLayoutCount = 1; pli.pSetLayouts = &layout;
         check(vkCreatePipelineLayout(device, &pli, nullptr, &pipeline_layout));
-        std::array<VkDescriptorPoolSize,4> sizes{};
-        for (int i = 0; i < 4; ++i) sizes[i] = {bindings[i].descriptorType,1};
-        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dpi.maxSets = 1; dpi.poolSizeCount = 4; dpi.pPoolSizes = sizes.data();
+        std::array<VkDescriptorPoolSize,5> sizes{};
+        for (int i = 0; i < 5; ++i) sizes[i] = {bindings[i].descriptorType,1};
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; dpi.maxSets = 1; dpi.poolSizeCount = 5; dpi.pPoolSizes = sizes.data();
         check(vkCreateDescriptorPool(device, &dpi, nullptr, &descriptors));
         VkDescriptorSetAllocateInfo da{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; da.descriptorPool = descriptors; da.descriptorSetCount = 1; da.pSetLayouts = &layout;
         check(vkAllocateDescriptorSets(device, &da, &set));
@@ -444,6 +502,22 @@ struct Fixture {
             if (i == 0) w.pBufferInfo = &ub; else w.pImageInfo = &images[i-1];
         }
         vkUpdateDescriptorSets(device, 4, writes.data(), 0, nullptr);
+        {
+            VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size = 4096; ci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            check(vkCreateBuffer(device, &ci, nullptr, &cb));
+            VkMemoryRequirements cr{}; vkGetBufferMemoryRequirements(device, cb, &cr);
+            VkMemoryAllocateInfo ca2{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ca2.allocationSize = cr.size;
+            ca2.memoryTypeIndex = memory_type(cr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            check(vkAllocateMemory(device, &ca2, nullptr, &cb_mem)); check(vkBindBufferMemory(device, cb, cb_mem, 0));
+            void* map = nullptr; check(vkMapMemory(device, cb_mem, 0, VK_WHOLE_SIZE, 0, &map));
+            cb_map = static_cast<std::uint32_t*>(map);
+            std::memset(cb_map, 0, 4096);
+            VkDescriptorBufferInfo cbi{cb, 0, 4096};
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = set; w.dstBinding = gcn::kBindingStorageBuffer0; w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; w.descriptorCount = 1;
+            w.pBufferInfo = &cbi;
+            vkUpdateDescriptorSets(device, 1, &w, 0, nullptr);
+        }
         return true;
     }
     bool run(bool unorm, bool force, bool gradients, float x, float y, int expected_x, int expected_y,
@@ -505,6 +579,8 @@ struct Fixture {
             vkDestroyDescriptorSetLayout(device,layout,nullptr); vkDestroySampler(device,sampler,nullptr);
             vkDestroyImageView(device,source_view,nullptr); vkDestroyImageView(device,dest_view,nullptr);
             vkDestroyImageView(device,cube_view,nullptr); vkDestroyImage(device,cube_image,nullptr); vkFreeMemory(device,cube_mem,nullptr);
+            if (cb_map) vkUnmapMemory(device,cb_mem);
+            vkDestroyBuffer(device,cb,nullptr); vkFreeMemory(device,cb_mem,nullptr);
             if (guest_map) vkUnmapMemory(device,guest_mem);
             vkDestroyBuffer(device,guest,nullptr); vkFreeMemory(device,guest_mem,nullptr);
             vkDestroyImage(device,source,nullptr); vkDestroyImage(device,dest,nullptr);
@@ -539,5 +615,19 @@ int main() try {
     f.init_guest();
     ok &= f.run_upload_copy();
     ok &= f.run_buffer_store_select();
+    // Ranged scalar loads: ten dwords of range (40 bytes, stride 0; 2 records
+    // of 20 bytes); the offset's two low bits ignored; past the range 0.
+    for (const int cb : {1, 2}) {
+        for (const bool bound : {true, false}) {
+            if (cb == 2 && !bound) continue;  // the no-fallback variant always reads the binding
+            ok &= f.run_ranged_load(cb, bound, 16, 0, 40, {104, 105, 106, 107}, "inside");
+            ok &= f.run_ranged_load(cb, bound, 33, 0, 40, {108, 109, 0, 0}, "low bits ignored, straddling the end");
+            ok &= f.run_ranged_load(cb, bound, 40, 0, 40, {0, 0, 0, 0}, "past the end");
+            ok &= f.run_ranged_load(cb, bound, 0, 20, 2, {100, 101, 102, 103}, "records times the stride");
+            ok &= f.run_ranged_load(cb, bound, 32, 20, 2, {108, 109, 0, 0}, "records times the stride, straddling");
+            ok &= f.run_ranged_load(cb, bound, 0, 0, 0, {0, 0, 0, 0}, "an empty V#");
+            ok &= f.run_ranged_load(cb, bound, 36, 0, 38, {109, 0, 0, 0}, "a dword in range when it starts inside");
+        }
+    }
     return ok ? 0 : 1;
 } catch (const std::exception& e) { std::fprintf(stderr,"%s\n",e.what()); return 1; }

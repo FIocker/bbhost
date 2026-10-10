@@ -29,7 +29,9 @@ std::string translation_switches() {
     };
     std::string s = std::string("offsets=") + (runtime_sample_offsets() ? "1" : "0") + ";half_rtz=" + (native_half_rtz() ? "1" : "0") +
                     ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_min_form() ? "min" : "select") + ";";
-    for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS"}) s += env(name);
+    for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS", "BBHOST_CB_RANGED"}) {
+        s += env(name);
+    }
     return s;
 }
 
@@ -49,6 +51,17 @@ namespace {
 using spv::Id;
 
 constexpr std::uint32_t kFetchBias = 0x01000000;  // block offsets of the inlined fetch shader
+
+// BufferBinding::ranged: s_buffer_load at a register offset reads its V#'s
+// binding. BBHOST_CB_RANGED=0: those loads walk the page table instead, as
+// before (without GCN's range check).
+bool ranged_buffers_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_CB_RANGED");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 constexpr std::uint32_t kLdsWordsMax = 16384;  // GCN's 64 KiB per workgroup
 
 // COMPUTE_PGM_RSRC2.LDS_SIZE: bits 15..23, in units of 128 dwords. Declaring
@@ -800,6 +813,68 @@ struct Translator {
                                     int n, Id guest_u64) {
         const std::size_t index = buffer_for(path, key, pointer, off_dw + static_cast<std::uint32_t>(n));
         return read_bound(index, reg, cu(off_dw), n, guest_u64);
+    }
+    // n dwords of an s_buffer_load_dword* at a register offset from the V# in
+    // SGPRs [reg, reg + 3], traced to `path` (BufferBinding::ranged). GCN
+    // reads dword (offset >> 2) + k of the V#'s memory - the two low bits of
+    // the byte offset are ignored - and returns 0 for a dword at or past the
+    // end of its range, num_records bytes, times the stride when that is not 0
+    // (vsharp_range_dwords). The host binds the whole range and passes its
+    // dwords as cb_stride; an index past them reads dword 0 of the binding,
+    // in bounds, and the result is replaced by 0. The fallback walk takes the
+    // range from the V#'s own words.
+    std::vector<Id> load_buffer_ranged(const Inst& in, const ResourcePath& path, const std::string& key, Id offset_bytes, int n, Id base_u64) {
+        const int reg = in.src0;
+        const std::size_t index = buffer_for(path, key, false, static_cast<std::uint32_t>(n));
+        res.buffers[index].ranged = true;
+        res.buffer_at[cur_offset] = static_cast<std::uint32_t>(index);
+        buffer_sites.push_back({reg, index, sym_key(sym_of(reg)), sym_key(sym_of(reg + 1)), def_seq++, cur_block});
+        const Id first = shr(offset_bytes, cu(2));
+        const auto bound_reads = [&] {
+            const Id bias = params_u32(4, index);
+            const Id range_dw = params_u32(5, index);
+            std::vector<Id> vals;
+            for (int k = 0; k < n; ++k) {
+                const Id at = iadd(first, cu(static_cast<std::uint32_t>(k)));
+                const Id in_range = ult(at, range_dw);
+                const Id word = m.load(t_u32, m.access_chain(p_ssbo_u32, buffer_vars[index], {c_zero_u, iadd(bias, sel(in_range, at, c_zero_u))}));
+                vals.push_back(sel(in_range, word, c_zero_u));
+            }
+            return vals;
+        };
+        if (opt.cb_no_fallback) return bound_reads();
+        std::vector<Id> vars(static_cast<std::size_t>(n));
+        for (Id& v : vars) v = m.local_variable(p_fn_u32, c_zero_u);
+        const Id valid = buffer_bound(index);
+        const Id l_bound = m.fresh(), l_walk = m.fresh(), l_merge = m.fresh();
+        m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+        m.emit_void(spv::OpBranchConditional, {valid, l_bound, l_walk});
+        m.label(l_bound);
+        {
+            const std::vector<Id> vals = bound_reads();
+            for (int k = 0; k < n; ++k) m.store(vars[static_cast<std::size_t>(k)], vals[static_cast<std::size_t>(k)]);
+        }
+        m.emit_void(spv::OpBranch, {l_merge});
+        m.label(l_walk);
+        {
+            const Id w1 = read_s(static_cast<std::uint16_t>(reg + 1), in), w2 = read_s(static_cast<std::uint16_t>(reg + 2), in);
+            const Id stride = ubfe(w1, 16, 14);
+            const Id records = m.emit(spv::OpUConvert, t_u64, {w2});
+            const Id bytes = m.emit(spv::OpSelect, t_u64, {ine(stride, c_zero_u), m.emit(spv::OpIMul, t_u64, {records, m.emit(spv::OpUConvert, t_u64, {stride})}), records});
+            const Id range_dw = m.emit(spv::OpShiftRightLogical, t_u64, {m.emit(spv::OpIAdd, t_u64, {bytes, m.const_u64(3)}), m.const_u64(2)});
+            for (int k = 0; k < n; ++k) {
+                const Id at = iadd(first, cu(static_cast<std::uint32_t>(k)));
+                const Id in_range = m.emit(spv::OpULessThan, t_bool, {m.emit(spv::OpUConvert, t_u64, {at}), range_dw});
+                const Id byte = m.emit(spv::OpShiftLeftLogical, t_u64, {m.emit(spv::OpUConvert, t_u64, {sel(in_range, at, c_zero_u)}), m.const_u64(2)});
+                const Id word = load_u32_at(m.emit(spv::OpIAdd, t_u64, {base_u64, byte}));
+                m.store(vars[static_cast<std::size_t>(k)], sel(in_range, word, c_zero_u));
+            }
+        }
+        m.emit_void(spv::OpBranch, {l_merge});
+        m.label(l_merge);
+        std::vector<Id> vals;
+        for (Id v : vars) vals.push_back(ld(v));
+        return vals;
     }
     // StageParams member `member` (an array of 8 dwords in uvec4s), entry `index`.
     Id params_u32(std::uint32_t member, std::size_t index) {
@@ -2098,6 +2173,25 @@ struct Translator {
             as_buffer = std::find(opt.cb_ssbo_exclude.begin(), opt.cb_ssbo_exclude.end(), path_key) == opt.cb_ssbo_exclude.end() &&
                         (buffer_index.count(cb_key) || res.buffers.size() < kMaxBuffers);
         }
+        // An s_buffer_load at a register offset from a V# traced to user data
+        // reads the V#'s whole range through its binding (load_buffer_ranged).
+        // Not from a V# another load indexes: the two would want cb_stride for
+        // different things.
+        const char* ranged_why = "";
+        bool ranged = false;
+        if (opt.cb_ssbo && !known && !pointer && ranged_buffers_on()) {
+            ranged_why = " at a register offset from an untraced V#";
+            if (sym_path(in.src0, 2, cb_path) && cb_path.user_sgpr >= 0 && cb_path.user_sgpr + 1 < 16) {
+                cb_key = cb_path.str();
+                const auto existing = buffer_index.find(cb_key);
+                ranged_why = std::find(opt.cb_ssbo_exclude.begin(), opt.cb_ssbo_exclude.end(), cb_key) != opt.cb_ssbo_exclude.end()
+                                 ? " at a register offset, excluded"
+                             : existing != buffer_index.end() ? (res.buffers[existing->second].indexed ? " at a register offset from a V# a load indexes" : "")
+                             : res.buffers.size() >= kMaxBuffers ? " at a register offset past the buffer limit"
+                                                                 : "";
+                ranged = !*ranged_why;
+            }
+        }
         if (in.op < 8) {
             base = read_u64(in.src0, in);
         } else {
@@ -2107,10 +2201,10 @@ struct Translator {
             base = make_u64(w0, iand(w1, cu(0xff)));
         }
         const Id addr = addr_add(base, offset);
-        if (!as_buffer) {
+        if (!as_buffer && !ranged) {
             ResourcePath traced;
             const char* why = !opt.cb_ssbo                         ? " with constant buffers off"
-                              : !known                             ? " at a register offset"
+                              : !known                             ? (*ranged_why ? ranged_why : " at a register offset")
                               : !sym_path(in.src0, 2, traced)      ? " from an untraced base"
                               : traced.user_sgpr < 0 || traced.user_sgpr + 1 >= 16 ? " from outside user data"
                               : pointer && !traced.immediate       ? " through a loaded pointer"
@@ -2118,8 +2212,9 @@ struct Translator {
                                                                    : " excluded";
             note_walk(std::string(pointer ? "s_load" : "s_buffer_load") + why);
         }
-        const std::vector<Id> loaded = as_buffer ? load_buffer_run(cb_path, cb_key, pointer, in.src0, known_off, count, addr)
-                                                 : load_u32_run(addr, count);
+        const std::vector<Id> loaded = ranged      ? load_buffer_ranged(in, cb_path, cb_key, offset, count, base)
+                                       : as_buffer ? load_buffer_run(cb_path, cb_key, pointer, in.src0, known_off, count, addr)
+                                                   : load_u32_run(addr, count);
         in_smrd_write = true;
         for (int k = 0; k < count; ++k) {
             const Id v = loaded[k];
@@ -2446,6 +2541,9 @@ struct Translator {
         const std::string key = path.str();
         if (std::find(opt.cb_ssbo_exclude.begin(), opt.cb_ssbo_exclude.end(), key) != opt.cb_ssbo_exclude.end()) return reject(", excluded");
         if (!buffer_index.count(key) && res.buffers.size() >= kMaxBuffers) return reject(", past the buffer limit");
+        if (const auto it = buffer_index.find(key); it != buffer_index.end() && res.buffers[it->second].ranged) {
+            return reject(", a V# also read at a register offset");  // cb_stride holds its range
+        }
         int total = 0;
         for (int k = 0; k < count; ++k) total += bits[k];
         const int nwords = (total + 31) / 32;
