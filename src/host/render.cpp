@@ -336,6 +336,9 @@ const char* const kCopyRefusedWhy[kCopyRefusedCount] = {
     "fewer bytes than the source target holds", "the source is a copy's snapshot, not a drawn target",
     "nothing has drawn into the source yet", "a depth format without a copy path", "the destination image could not be made"};
 std::atomic<std::uint64_t> g_copy_refused[kCopyRefusedCount] = {};
+// Copies one destination long out of a larger target, the overlap copied
+// into the destination's image (copy_overlap_locked).
+std::atomic<std::uint64_t> g_rt_copies_overlap{0};
 
 // Targets re-created in another format of the same size and texel size, their
 // pixels carried over (rt_image), and re-created with their pixels lost; of
@@ -7349,9 +7352,11 @@ std::string render_target_copy_report() {
     }
     static std::uint64_t last_total = 0;  // the 5-second report is the only caller
     char buf[384];
-    std::snprintf(buf, sizeof(buf), "target copies: %llu into images; refused, copied as memory, %llu (+%llu in these flips)%s",
-                  static_cast<unsigned long long>(g_rt_copies.load()), static_cast<unsigned long long>(total),
-                  static_cast<unsigned long long>(total - last_total), reasons.c_str());
+    std::snprintf(buf, sizeof(buf),
+                  "target copies: %llu into images (%llu the overlap of a larger source); refused, copied as memory, %llu (+%llu in "
+                  "these flips)%s",
+                  static_cast<unsigned long long>(g_rt_copies.load()), static_cast<unsigned long long>(g_rt_copies_overlap.load()),
+                  static_cast<unsigned long long>(total), static_cast<unsigned long long>(total - last_total), reasons.c_str());
     last_total = total;
     return buf;
 }
@@ -7503,6 +7508,83 @@ bool record_target_copy_locked(RtImage& src, RtImage& dst, std::uint32_t width, 
     return true;
 }
 
+// The bytes of one texel of a T#'s data format (IMG_DATA_FORMAT), 0 for the
+// block-compressed and the formats a target is never made in.
+std::size_t tsharp_texel_bytes(std::uint32_t dfmt) {
+    switch (dfmt) {
+        case 1: return 1;                                   // 8
+        case 2: case 3: case 16: case 17: case 18: case 19: return 2;  // 16, 8_8, 5_6_5, 1_5_5_5, 5_5_5_1, 4_4_4_4
+        case 4: case 5: case 6: case 7: case 8: case 9: case 10: case 20: case 21: return 4;  // 32 ... 8_8_8_8, 8_24, 24_8
+        case 11: case 12: return 8;                         // 32_32, 16_16_16_16
+        case 14: return 16;                                 // 32_32_32_32
+        default: return 0;
+    }
+}
+
+// BBHOST_COPY_OVERLAP=0: a copy into a target smaller than its source is
+// refused as before - copied as memory, the destination's image left as it was.
+const bool g_copy_overlap = [] {
+    const char* e = std::getenv("BBHOST_COPY_OVERLAP");
+    return !(e && e[0] == '0');
+}();
+// A copy one destination long out of a larger target. GX's CopyResource
+// (gx_immediate_copy_resource, 0x2568660) copies the smaller resource's bytes
+// as memory (0x2568776 takes the smaller size); on the console the two are
+// always the same shape. Here the display buffers are the largest size a live
+// change can reach, so a target the game made at the display's size can be
+// larger than the render-size texture it copies into - and the game draws the
+// picture into its top left, at the render size. That is what the destination
+// gets: the overlap, from the top left, into the image samplers read there (a
+// colour target or a copy's snapshot of the same texel size), or into a
+// snapshot of the GX texture's size when the game made one there and nothing
+// has drawn it yet. False when the destination's shape is not known or the
+// copy is not one destination long.
+bool copy_overlap_locked(RtImage& src, std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes, VkFormat snap_format,
+                         const char* via) {
+    if (!g_copy_overlap) return false;
+    const std::size_t bpp = src.depth ? 4 : rt_bytes_per_pixel(src);
+    RtImage* dst = nullptr;
+    const char* what = "";
+    bool fresh = false;
+    if (auto rt = g_rts.find(dst_base); rt != g_rts.end()) {
+        if (rt->second.depth || rt_bytes_per_pixel(rt->second) != bpp) return false;
+        dst = &rt->second;
+        what = "its target";
+    } else if (auto st = g_snapshots.find(dst_base); st != g_snapshots.end()) {
+        if (rt_bytes_per_pixel(st->second) != bpp) return false;
+        dst = &st->second;
+        what = "its snapshot";
+    } else if (std::uint32_t t[8]; gx_resource_tsharp(dst_base, t)) {
+        const std::uint32_t tw = (t[2] & 0x3fff) + 1, th = ((t[2] >> 14) & 0x3fff) + 1;
+        if (tsharp_texel_bytes((t[1] >> 20) & 0x3f) != bpp || static_cast<std::size_t>(tw) * th * bpp > bytes) return false;
+        dst = make_copy_snapshot_locked(src_base, dst_base, snap_format, tw, th, src.depth);
+        if (!dst) return false;
+        what = "a snapshot of the GX texture's size";
+        fresh = true;
+    } else {
+        return false;
+    }
+    // The copy covers the whole destination: a CopyResource's.
+    if (rt_size_bytes(*dst) > bytes) return false;
+    const std::uint32_t w = std::min(src.width, dst->width), h = std::min(src.height, dst->height);
+    if (fresh && (w < dst->width || h < dst->height)) {
+        // Taller or wider than the source on one side: the rest of a new image
+        // starts at zero, not as the image heap left it.
+        const float zero[4] = {};
+        clear_image_locked(*dst, zero);
+    }
+    if (!record_target_copy_locked(src, *dst, w, h)) return false;
+    g_rt_copies_overlap.fetch_add(1, std::memory_order_relaxed);
+    static std::set<std::pair<std::uint64_t, std::uint64_t>> seen;  // under g.mu
+    if (seen.size() < 32 && seen.emplace(src_base, dst_base).second) {
+        host_log("render: %s 0x%llx -> 0x%llx 0x%zx bytes, fewer than the %ux%u source holds: its top-left %ux%u copied into %s "
+                 "(%ux%u format %d) at flip %llu",
+                 via, static_cast<unsigned long long>(src_base), static_cast<unsigned long long>(dst_base), bytes, src.width, src.height, w,
+                 h, what, dst->width, dst->height, static_cast<int>(dst->format), static_cast<unsigned long long>(hle_video_flip_count()));
+    }
+    return true;
+}
+
 bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes, const char* via) {
     // BBHOST_WATCH_COPY_DST=0x<base>: every whole-target copy into that
     // address, with the flip. A frame can go wrong without any draw being
@@ -7541,6 +7623,8 @@ bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, s
     const VkFormat snap_format = from_depth ? VK_FORMAT_R32_SFLOAT : src.format;
     const std::size_t src_bytes = static_cast<std::size_t>(src.width) * src.height * (from_depth ? 4 : rt_bytes_per_pixel(src));
     if (bytes < src_bytes) {
+        // One destination long out of a larger target: its overlap.
+        if (copy_overlap_locked(src, src_base, dst_base, bytes, snap_format, via)) return true;
         note_copy_refused_locked(kCopyRefusedSmaller, via, src_base, dst_base, bytes);
         return false;
     }

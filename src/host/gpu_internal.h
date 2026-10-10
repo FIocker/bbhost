@@ -1218,9 +1218,11 @@ std::string render_fill_stats();  // " fill-pending=N fill-applied=M"
 // Command-processor pipeline builds so far: [0] translate us, [1] modules us, [2] vkCreateGraphicsPipelines us,
 // [3] stage translations, [4] stages the cache served (with BBHOST_STAGE_CACHE=0: translations whose key was seen before).
 void render_pipeline_time_us(std::uint64_t out[5]);
-// A shader copies a render target's memory elsewhere: copy the image into a snapshot at dst.
-// `via` names the copy in the log ("copy token", "copy dispatch"); a copy from a
-// target it refuses is counted and logged once per pair (render_target_copy_report).
+// A shader copies a render target's memory elsewhere: copy the image into a snapshot at dst
+// (or into the target there of its shape); a copy one smaller destination long gets the
+// source's top-left overlap (copy_overlap_locked). `via` names the copy in the log ("copy
+// token", "copy dispatch"); a copy from a target it refuses is counted and logged once per
+// pair (render_target_copy_report).
 bool render_copy_target_locked(std::uint64_t src_base, std::uint64_t dst_base, std::size_t bytes, const char* via);
 // The 5-second report's line: copies into images, and the ones refused by reason.
 std::string render_target_copy_report();
