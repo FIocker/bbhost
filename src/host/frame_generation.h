@@ -18,10 +18,10 @@ struct FgStats {
     std::uint64_t interpolation_disabled = 0;
 };
 
-// Whether DLSS Frame Generation is enabled by configuration or environment variable.
+// Whether Frame Generation (DLSS or FSR3) is enabled by configuration or environment variable.
 bool fg_enabled();
 
-// Whether NGX Frame Generation is available on the hardware/driver.
+// Whether Frame Generation is available on the hardware/driver.
 bool fg_available();
 
 // Statistics for telemetry/PresentMon correlation.
@@ -31,7 +31,7 @@ void fg_note_real_presented();
 void fg_note_generated_presented();
 void fg_note_interpolation_disabled();
 
-// Manages per-frame Vulkan resources and evaluation for DLSS Frame Generation.
+// Manages per-frame Vulkan resources and evaluation for DLSS/FSR3 Frame Generation.
 class FrameGenerator {
 public:
     static constexpr unsigned kFrameSlots = 3;
@@ -41,7 +41,7 @@ public:
     bool init(VkInstance instance, VkPhysicalDevice phys, VkDevice device, std::uint32_t queue_family, VkQueue queue);
     void shutdown();
 
-    // Ensure output images and NGX FG feature match the given dimensions and format.
+    // Ensure output images and FG feature match the given dimensions and format.
     // Must be called with a valid command buffer (e.g. presenter's cmd under GPU lock).
     bool ensure_feature(VkCommandBuffer cmd, std::uint32_t width, std::uint32_t height, VkFormat format);
 
@@ -55,6 +55,9 @@ public:
     // Separate command submit and fence for evaluation. Called under GPU lock.
     bool evaluate_submit(VkImage color_image, VkImageView color_view, VkFormat color_format,
                          std::uint32_t width, std::uint32_t height, const gpu::DlssFgGuides& guides, unsigned slot = 0);
+    bool evaluate_submit(VkImage color_image, VkImageView color_view, VkFormat color_format,
+                         std::uint32_t width, std::uint32_t height, std::uint32_t full_width, std::uint32_t full_height,
+                         const gpu::DlssFgGuides& guides, unsigned slot = 0);
 
     // Wait for the separate evaluation fence to complete. Never call under GPU lock.
     bool wait_evaluation(std::uint64_t timeout_ns = 1000000000ull, unsigned slot = 0);
@@ -64,7 +67,7 @@ public:
     VkSemaphore ready_semaphore(unsigned slot) const { return frames_[slot].ready; }
     void note_ready_waited(unsigned slot) { frames_[slot].ready_unconsumed = false; }
 
-    // Check if the most recent evaluation had interpolation disabled by NGX (read from staging buffer).
+    // Check if the most recent evaluation had interpolation disabled (read from staging buffer).
     bool is_interpolation_disabled(unsigned slot = 0);
 
     // Accessors for owned generated resources.
@@ -92,6 +95,10 @@ private:
 
     bool create_image(OwnedImage& im, std::uint32_t w, std::uint32_t h, VkFormat fmt, VkImageUsageFlags usage);
     void destroy_image(OwnedImage& im);
+    bool ensure_hud_pipeline();
+    void destroy_hud_pipeline();
+    bool record_fsr_fg(VkCommandBuffer cmd, std::uint32_t width, std::uint32_t height,
+                       const gpu::DlssFgGuides& guides, unsigned slot);
 
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice phys_ = VK_NULL_HANDLE;
@@ -103,12 +110,23 @@ private:
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     bool feature_created_ = false;
     bool recreate_ = false;
+    int active_backend_ = 0; // 0: DLSS, 1: FSR3
     FgHistory history_;
+
+    std::uint32_t fsr_max_render_w_ = 0, fsr_max_render_h_ = 0;
 
     unsigned generated_count_ = 1;
     VkCommandPool eval_pool_ = VK_NULL_HANDLE;
     VkQueryPool times_ = VK_NULL_HANDLE;
     double timestamp_period_ns_ = 0;
+
+    std::uint64_t fsr_frame_id_ = 1;
+    void* fsr_fg_context_ = nullptr; // FfxVkFsr3_3_1_6FrameGenerationContext*
+    VkDescriptorSetLayout hud_set_layout_ = VK_NULL_HANDLE;
+    VkPipelineLayout hud_pipeline_layout_ = VK_NULL_HANDLE;
+    VkPipeline hud_pipeline_ = VK_NULL_HANDLE;
+    VkDescriptorPool hud_pool_ = VK_NULL_HANDLE;
+
     struct FrameSlot {
         std::array<OwnedImage, 3> generated{};
         OwnedImage real_copy, input;
@@ -118,9 +136,12 @@ private:
         bool ready_unconsumed = false;
         std::uint64_t ticket = 0;
         bool pending = false;
+        std::uint64_t fsr_frame_id = 0;
         VkBuffer disable_buf = VK_NULL_HANDLE;
         VkDeviceMemory disable_mem = VK_NULL_HANDLE;
         void* disable_mapped = nullptr;
+        OwnedImage hud_mask;
+        VkDescriptorSet hud_desc_set = VK_NULL_HANDLE;
     };
     std::array<FrameSlot, kFrameSlots> frames_{};
 };

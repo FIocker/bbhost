@@ -160,6 +160,8 @@ void apply_values(const std::map<std::string, std::string>& kv, HostConfig* c) {
     str("dlss.mode", &c->dlss_mode);
     num("dlss.output_width", &c->dlss_output_width);
     num("dlss.output_height", &c->dlss_output_height);
+    str("dlss.upscaler_backend", &c->upscaler_backend);
+    str("dlss.frame_generation_backend", &c->frame_generation_backend);
     num("dlss.frame_generation_factor", &c->dlss_fg_factor);
     {
         auto it = kv.find("dlss.frame_generation");
@@ -745,6 +747,14 @@ bool config_load(int argc, char** argv, HostConfig* out, std::string* error) {
     if (const char* e = std::getenv("BBHOST_IME")) {
         if (std::strcmp(e, "type") == 0 || std::strcmp(e, "auto") == 0) c.ime_mode = e;
     }
+    if (const char* e = std::getenv("BBHOST_UPSCALER")) {
+        if (std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr3") == 0 || std::strcmp(e, "fsr4") == 0)
+            c.upscaler_backend = e;
+    }
+    if (const char* e = std::getenv("BBHOST_FG_BACKEND")) {
+        if (std::strcmp(e, "dlss") == 0 || std::strcmp(e, "fsr3") == 0)
+            c.frame_generation_backend = e;
+    }
     g_cfg = c;
     *out = c;
     return true;
@@ -979,6 +989,10 @@ bool config_write_template(const std::string& path) {
            "# SR presets automatically choose a lower game render size.\n"
            "output_width = 0\n"
            "output_height = 0\n"
+           "# Upscaler backend: dlss, fsr3, fsr4 (experimental)\n"
+           "upscaler_backend = \"dlss\"\n"
+           "# Frame generation backend: dlss, fsr3\n"
+           "frame_generation_backend = \"dlss\"\n"
            "# DLSS Frame Generation requires nvngx_dlssg.dll and supported hardware.\n"
            "# This generates displayed frames without changing the gameplay rate.\n"
            "frame_generation = false\n"

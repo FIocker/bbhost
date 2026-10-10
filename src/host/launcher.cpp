@@ -190,14 +190,21 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     int resolution = host_opt_resolution_index();
     int custom_width = 1920, custom_height = 1080;
     host_opt_display_resolution(&custom_width, &custom_height);
+    int upscaler_backend = host_opt_index("upscaler_backend");
+    if (upscaler_backend < 0) upscaler_backend = host::parse_upscaler_backend(cfg.upscaler_backend);
     int dlss_mode = host_opt_index("dlss_mode");
+    int fg_backend = host_opt_index("fg_backend");
+    if (fg_backend < 0) fg_backend = host::parse_fg_backend(cfg.frame_generation_backend);
     int frame_generation = host_opt_index("frame_generation");
+    if (fg_backend == 1 && frame_generation > 1) frame_generation = 1;
     bool object_motion = host_opt_get("object_motion");
     static const char* const kResolutions[] = {"1280x720",         "1600x900",         "1920x1080",        "2560x1440",
                                                "3200x1800",        "3840x2160",        "2560x1080 (21:9)", "3440x1440 (21:9)",
                                                "5120x2160 (21:9)", "3840x1080 (32:9)", "5120x1440 (32:9)", "1280x800 (16:10)",
                                                "960x600 (16:10, upscaled)", "1024x640 (16:10, upscaled)", "Custom"};
-    static const char* const kDlssLabels[] = {"Off", "DLAA", "Quality", "Balanced", "Performance", "Ultra Performance"};
+    static const char* const kUpscalerLabels[] = {"DLSS", "FSR 3.1", "FSR 4 (Experimental)"};
+    static const char* const kDlssLabels[] = {"Off", "Native AA", "Quality", "Balanced", "Performance", "Ultra Performance"};
+    static const char* const kFgBackendLabels[] = {"DLSS", "FSR 3.1"};
     static const char* const kFgLabels[] = {"Off", "2x", "3x", "4x"};
     // The game's frame rate (engine/frame_rate.h): 0 is uncapped.
     static const int kCaps[] = {30, 60, 90, 0};
@@ -308,8 +315,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         if (!f[kToken].str().empty()) e.push_back({"update", "token_file", toml_string(saved_path(f[kToken].str()))});
         e.push_back({"startup", "setup_window", show_every_start ? "true" : "false"});
         e.push_back({"dlss", "mode", toml_string(host::DlssModes[dlss_mode])});
+        e.push_back({"dlss", "upscaler_backend", toml_string(host::upscaler_backend_name(upscaler_backend))});
+        e.push_back({"dlss", "frame_generation_backend", toml_string(host::fg_backend_name(fg_backend))});
         e.push_back({"dlss", "frame_generation", frame_generation ? "true" : "false"});
-        e.push_back({"dlss", "frame_generation_factor", std::to_string(std::max(2, frame_generation + 1))});
+        e.push_back({"dlss", "frame_generation_factor", std::to_string(std::max(2, (fg_backend == 1 && frame_generation > 1 ? 1 : frame_generation) + 1))});
         e.push_back({"dlss", "object_motion", object_motion ? "true" : "false"});
         // What this bbhost's file looks like (core/config.h): a value saved
         // from here is a choice.
@@ -333,8 +342,10 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("debug_camera", debug_camera);
         host_opt_set_frame_cap(kCaps[cap_choice]);
+        host_opt_set_index("upscaler_backend", upscaler_backend);
         host_opt_set_index("dlss_mode", dlss_mode);
-        host_opt_set_index("frame_generation", frame_generation);
+        host_opt_set_index("fg_backend", fg_backend);
+        host_opt_set_index("frame_generation", fg_backend == 1 && frame_generation > 1 ? 1 : frame_generation);
         host_opt_set("object_motion", object_motion);
         if (resolution == 14) host_opt_set_custom_resolution(custom_width, custom_height);
         else host_opt_set_resolution_index(resolution);
@@ -656,16 +667,44 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::TextDisabled("Supported range: 256x144 to 7680x4320.");
         }
         ImGui::SetNextItemWidth(200 * scale);
-        if (ImGui::Combo("DLSS", &dlss_mode, kDlssLabels, 6) && dlss_mode == 0) frame_generation = 0;
+        ImGui::Combo("Upscaler backend", &upscaler_backend, kUpscalerLabels, 3);
+        if (ImGui::IsItemHovered()) {
+            if (upscaler_backend == 2)
+                ImGui::SetTooltip("FSR 4 is experimental (v0.7 model). If assets are missing in exe/fsr4_shaders or BBHOST_FSR4_ASSETS, falls back cleanly. Run Install-FSR4.bat if provided.");
+            else if (upscaler_backend == 1)
+                ImGui::SetTooltip("AMD FidelityFX Super Resolution 3.1 reconstruction.");
+            else
+                ImGui::SetTooltip("NVIDIA DLSS (requires RTX hardware and DLLs).");
+        }
         ImGui::SetNextItemWidth(200 * scale);
-        if (ImGui::Combo("DLSS frame generation", &frame_generation, kFgLabels,
-                         host::experimental_mfg_enabled() ? 4 : 2) && frame_generation && dlss_mode == 0) dlss_mode = 1;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("2x adds one generated frame. Experimental 3x/4x may have uneven pacing under FPS limits.");
+        ImGui::Combo("Reconstruction quality", &dlss_mode, kDlssLabels, 6);
+        ImGui::SetNextItemWidth(200 * scale);
+        if (ImGui::Combo("Frame generation backend", &fg_backend, kFgBackendLabels, 2)) {
+            if (fg_backend == 1 && frame_generation > 1) frame_generation = 1;
+        }
+        if (ImGui::IsItemHovered()) {
+            if (fg_backend == 1)
+                ImGui::SetTooltip("FSR 3.1 Frame Generation (supports 2x factor only). Works across vendors.");
+            else
+                ImGui::SetTooltip("NVIDIA DLSS Frame Generation (requires RTX 40 series or newer and nvngx_dlssg.dll).");
+        }
+        ImGui::SetNextItemWidth(200 * scale);
+        const int max_fg_factors = fg_backend == 1 ? 2 : (host::experimental_mfg_enabled() ? 4 : 2);
+        ImGui::Combo("Frame generation", &frame_generation, kFgLabels, max_fg_factors);
+        if (fg_backend == 1 && frame_generation > 1) frame_generation = 1;
+        if (ImGui::IsItemHovered()) {
+            if (fg_backend == 1)
+                ImGui::SetTooltip("FSR Frame Generation supports 2x only (adds 1 generated frame per real frame).");
+            else
+                ImGui::SetTooltip("2x adds one generated frame. Experimental 3x/4x may have uneven pacing under FPS limits.");
+        }
         ImGui::Checkbox("Object motion vectors", &object_motion);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Tracks animated meshes for reconstruction and frame generation. Uses extra GPU time and about 128 MiB plus the motion image.");
-        ImGui::TextDisabled("DLSS and frame generation require supported NVIDIA RTX hardware.");
+        if (upscaler_backend == 0 || fg_backend == 0)
+            ImGui::TextDisabled("DLSS features require supported NVIDIA RTX hardware.");
+        if (upscaler_backend == 2)
+            ImGui::TextDisabled("FSR 4 is experimental v0.7; falls back if shaders are missing (check Install-FSR4.bat).");
         ImGui::TextDisabled("These settings apply when the game starts. F10 changes require a restart.");
         int selected_width = custom_width, selected_height = custom_height;
         if (resolution != 14) host::parse_resolution(std::string(kResolutions[resolution]).substr(0, std::string(kResolutions[resolution]).find(' ')), &selected_width, &selected_height);

@@ -17,6 +17,13 @@
 
 #include "../../tools/ngx_bridge/ngx_bridge.h"
 
+#include <cmath>
+#include "host/shaders/fsr_fg_hud.spv.h"
+
+#if defined(BBHOST_HAVE_FSR)
+#include <ffx_vk_fsr3_3_1_5_bridge.h>
+#endif
+
 namespace host {
 namespace {
 
@@ -77,6 +84,12 @@ uint32_t find_memory_type(VkPhysicalDevice phys, uint32_t bits, VkMemoryProperty
     return UINT32_MAX;
 }
 
+struct HudPushConstants {
+    std::uint32_t width;
+    std::uint32_t height;
+    std::uint32_t mode; // 0: extract HUD to ui_hud, 1: composite ui_hud onto generated_target
+};
+
 FgStats g_stats;
 std::mutex g_stats_mu;
 
@@ -87,6 +100,14 @@ bool fg_enabled() {
 }
 
 bool fg_available() {
+    const int backend = host_startup_settings().frame_generation_backend;
+    if (backend == 1) {
+#if defined(BBHOST_HAVE_FSR)
+        return true;
+#else
+        return false;
+#endif
+    }
     if (!load_bridge_fg()) return false;
     return g_bridge_fg.fg_available ? g_bridge_fg.fg_available() != 0 : false;
 }
@@ -128,7 +149,9 @@ bool FrameGenerator::init(VkInstance instance, VkPhysicalDevice phys, VkDevice d
     device_ = device;
     queue_family_ = queue_family;
     queue_ = queue;
-    load_bridge_fg();
+    if (host_startup_settings().frame_generation_backend == 0) {
+        load_bridge_fg();
+    }
 
     if (!device_) return false;
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -165,11 +188,25 @@ void FrameGenerator::shutdown() {
         vkDeviceWaitIdle(device_);
         host_gpu_queue_unlock();
     }
-    if (feature_created_ && g_bridge_fg.fg_release) g_bridge_fg.fg_release();
+    if (feature_created_) {
+        if (active_backend_ == 0 && g_bridge_fg.fg_release) {
+            g_bridge_fg.fg_release();
+        }
+#if defined(BBHOST_HAVE_FSR)
+        if (active_backend_ == 1 && fsr_fg_context_) {
+            ffxVkFsr3_3_1_6FrameGenerationContextDestroy(
+                static_cast<FfxVkFsr3_3_1_6FrameGenerationContext*>(fsr_fg_context_));
+            fsr_fg_context_ = nullptr;
+        }
+#endif
+    }
     feature_created_ = false;
+    fsr_max_render_w_ = fsr_max_render_h_ = 0;
+    destroy_hud_pipeline();
     for (auto& frame : frames_) {
         for (auto& image : frame.generated) destroy_image(image);
         destroy_image(frame.real_copy); destroy_image(frame.input);
+        destroy_image(frame.hud_mask);
         if (frame.disable_mapped) vkUnmapMemory(device_, frame.disable_mem);
         if (frame.disable_buf) vkDestroyBuffer(device_, frame.disable_buf, nullptr);
         if (frame.disable_mem) vkFreeMemory(device_, frame.disable_mem, nullptr);
@@ -242,9 +279,100 @@ void FrameGenerator::destroy_image(OwnedImage& im) {
     im.format = VK_FORMAT_UNDEFINED;
 }
 
+bool FrameGenerator::ensure_hud_pipeline() {
+    if (hud_pipeline_) return true;
+
+    const VkDescriptorSetLayoutBinding binds[5] = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+    };
+    VkDescriptorSetLayoutCreateInfo sli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    sli.bindingCount = 5;
+    sli.pBindings = binds;
+    if (vkCreateDescriptorSetLayout(device_, &sli, nullptr, &hud_set_layout_) != VK_SUCCESS) return false;
+
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(HudPushConstants)};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &hud_set_layout_;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &range;
+    if (vkCreatePipelineLayout(device_, &pli, nullptr, &hud_pipeline_layout_) != VK_SUCCESS) return false;
+
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = sizeof(k_fsr_fg_hud_spv);
+    smi.pCode = k_fsr_fg_hud_spv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(device_, &smi, nullptr, &module) != VK_SUCCESS) return false;
+
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = module;
+    ci.stage.pName = "main";
+    ci.layout = hud_pipeline_layout_;
+    const bool ok = vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &ci, nullptr, &hud_pipeline_) == VK_SUCCESS;
+    vkDestroyShaderModule(device_, module, nullptr);
+    if (!ok) return false;
+
+    VkDescriptorPoolSize pool_sizes[2] = {
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3 * kFrameSlots},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2 * kFrameSlots},
+    };
+    VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool_info.maxSets = kFrameSlots;
+    pool_info.poolSizeCount = 2;
+    pool_info.pPoolSizes = pool_sizes;
+    if (vkCreateDescriptorPool(device_, &pool_info, nullptr, &hud_pool_) != VK_SUCCESS) return false;
+
+    for (unsigned s = 0; s < kFrameSlots; ++s) {
+        VkDescriptorSetAllocateInfo alloc_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        alloc_info.descriptorPool = hud_pool_;
+        alloc_info.descriptorSetCount = 1;
+        alloc_info.pSetLayouts = &hud_set_layout_;
+        if (vkAllocateDescriptorSets(device_, &alloc_info, &frames_[s].hud_desc_set) != VK_SUCCESS) return false;
+    }
+
+    return true;
+}
+
+void FrameGenerator::destroy_hud_pipeline() {
+    if (hud_pool_) {
+        vkDestroyDescriptorPool(device_, hud_pool_, nullptr);
+        hud_pool_ = VK_NULL_HANDLE;
+    }
+    if (hud_pipeline_) {
+        vkDestroyPipeline(device_, hud_pipeline_, nullptr);
+        hud_pipeline_ = VK_NULL_HANDLE;
+    }
+    if (hud_pipeline_layout_) {
+        vkDestroyPipelineLayout(device_, hud_pipeline_layout_, nullptr);
+        hud_pipeline_layout_ = VK_NULL_HANDLE;
+    }
+    if (hud_set_layout_) {
+        vkDestroyDescriptorSetLayout(device_, hud_set_layout_, nullptr);
+        hud_set_layout_ = VK_NULL_HANDLE;
+    }
+    for (auto& frame : frames_) {
+        frame.hud_desc_set = VK_NULL_HANDLE;
+    }
+}
+
 bool FrameGenerator::ensure_feature(VkCommandBuffer cmd, std::uint32_t width, std::uint32_t height, VkFormat format) {
-    if (ready() && width_ == width && height_ == height && format_ == format) return true;
-    if (!load_bridge_fg() || !g_bridge_fg.fg_available || !g_bridge_fg.fg_available()) return false;
+    const int backend = host_startup_settings().frame_generation_backend;
+    if (backend == 1 && format == VK_FORMAT_B8G8R8A8_UNORM) format = VK_FORMAT_R8G8B8A8_UNORM;
+    if (ready() && width_ == width && height_ == height && format_ == format && active_backend_ == backend) return true;
+
+    if (backend == 0) {
+        if (!load_bridge_fg() || !g_bridge_fg.fg_available || !g_bridge_fg.fg_available()) return false;
+    } else {
+#if !defined(BBHOST_HAVE_FSR)
+        return false;
+#endif
+    }
 
     // Even after a failed evaluation/released NGX feature, a previous real
     // frame's blit can still read our images. Retire that work before resizing.
@@ -254,20 +382,33 @@ bool FrameGenerator::ensure_feature(VkCommandBuffer cmd, std::uint32_t width, st
         host_gpu_queue_unlock();
     }
     if (feature_created_) {
-        if (g_bridge_fg.fg_release) {
+        if (active_backend_ == 0 && g_bridge_fg.fg_release) {
             g_bridge_fg.fg_release();
         }
+#if defined(BBHOST_HAVE_FSR)
+        if (active_backend_ == 1 && fsr_fg_context_) {
+            ffxVkFsr3_3_1_6FrameGenerationContextDestroy(
+                static_cast<FfxVkFsr3_3_1_6FrameGenerationContext*>(fsr_fg_context_));
+            fsr_fg_context_ = nullptr;
+        }
+#endif
         feature_created_ = false;
+        fsr_max_render_w_ = fsr_max_render_h_ = 0;
     }
 
     const VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    const unsigned requested = std::clamp(host_startup_settings().frame_generation_factor, 2, 4) - 1;
-    const unsigned supported = g_bridge_fg.fg_max_generated && g_bridge_fg.fg_evaluate_index ?
-        g_bridge_fg.fg_max_generated() : 1;
-    generated_count_ = requested <= supported ? requested : 1;
-    if (generated_count_ != requested)
-        host_log("framegen: requested %ux unsupported (maximum %ux); using 2x", requested + 1, supported + 1);
+    if (backend == 1) {
+        // FSR 3.1.6 only supports 2x frame generation
+        generated_count_ = 1;
+    } else {
+        const unsigned requested = std::clamp(host_startup_settings().frame_generation_factor, 2, 4) - 1;
+        const unsigned supported = g_bridge_fg.fg_max_generated && g_bridge_fg.fg_evaluate_index ?
+            g_bridge_fg.fg_max_generated() : 1;
+        generated_count_ = requested <= supported ? requested : 1;
+        if (generated_count_ != requested)
+            host_log("framegen: requested %ux unsupported (maximum %ux); using 2x", requested + 1, supported + 1);
+    }
     for (auto& frame : frames_) {
         for (unsigned i = 0; i < frame.generated.size(); ++i) {
             if (i >= generated_count_) { destroy_image(frame.generated[i]); continue; }
@@ -281,6 +422,14 @@ bool FrameGenerator::ensure_feature(VkCommandBuffer cmd, std::uint32_t width, st
             return false;
         }
         if (!create_image(frame.input, width, height, format, usage)) return false;
+        if (backend == 1) {
+            if (!create_image(frame.hud_mask, width, height, format, usage)) {
+                host_log("framegen: failed to create hud_mask image");
+                return false;
+            }
+        } else {
+            destroy_image(frame.hud_mask);
+        }
 
         if (!frame.disable_buf) {
             VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -315,42 +464,276 @@ bool FrameGenerator::ensure_feature(VkCommandBuffer cmd, std::uint32_t width, st
         }
 
         // Transition owned images to VK_IMAGE_LAYOUT_GENERAL
-        VkImageMemoryBarrier barriers[5] = {};
-        const unsigned barrier_count = generated_count_ + 2;
-        for (unsigned i = 0; i < barrier_count; ++i) {
-            barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barriers[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barriers[i].srcQueueFamilyIndex = barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barriers[i].image = i < generated_count_ ? frame.generated[i].image :
-                i == generated_count_ ? frame.real_copy.image : frame.input.image;
-            barriers[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            barriers[i].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        VkImageMemoryBarrier barriers[6] = {};
+        unsigned barrier_count = 0;
+        for (unsigned i = 0; i < generated_count_; ++i) {
+            barriers[barrier_count].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[barrier_count].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barriers[barrier_count].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[barrier_count].srcQueueFamilyIndex = barriers[barrier_count].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[barrier_count].image = frame.generated[i].image;
+            barriers[barrier_count].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            barriers[barrier_count++].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         }
+        barriers[barrier_count].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barriers[barrier_count].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barriers[barrier_count].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barriers[barrier_count].srcQueueFamilyIndex = barriers[barrier_count].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[barrier_count].image = frame.real_copy.image;
+        barriers[barrier_count].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barriers[barrier_count++].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+
+        barriers[barrier_count].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barriers[barrier_count].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barriers[barrier_count].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barriers[barrier_count].srcQueueFamilyIndex = barriers[barrier_count].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[barrier_count].image = frame.input.image;
+        barriers[barrier_count].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        barriers[barrier_count++].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+
+        if (backend == 1 && frame.hud_mask.image) {
+            barriers[barrier_count].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[barrier_count].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barriers[barrier_count].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barriers[barrier_count].srcQueueFamilyIndex = barriers[barrier_count].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[barrier_count].image = frame.hud_mask.image;
+            barriers[barrier_count].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            barriers[barrier_count++].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        }
+
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                              0, 0, nullptr, 0, nullptr, barrier_count, barriers);
     }
 
-    uint32_t r = g_bridge_fg.fg_create(cmd, width, height, format);
-    if (ngxb_failed(r)) {
-        host_log("framegen: ngxb_fg_create failed (0x%08x) for %ux%u format %d", r, width, height, static_cast<int>(format));
-        return false;
+    if (backend == 0) {
+        uint32_t r = g_bridge_fg.fg_create(cmd, width, height, format);
+        if (ngxb_failed(r)) {
+            host_log("framegen: ngxb_fg_create failed (0x%08x) for %ux%u format %d", r, width, height, static_cast<int>(format));
+            return false;
+        }
+        host_log("framegen: DLSS Frame Generation %ux created for %ux%u format %d", generated_count_ + 1, width, height, static_cast<int>(format));
+    } else {
+#if defined(BBHOST_HAVE_FSR)
+        if (!ensure_hud_pipeline()) {
+            host_log("framegen: failed to create HUD composite compute pipeline");
+            return false;
+        }
+        // Write descriptors for HUD pipeline for each slot
+        for (unsigned s = 0; s < kFrameSlots; ++s) {
+            auto& f = frames_[s];
+            const VkDescriptorImageInfo img_info[5] = {
+                {VK_NULL_HANDLE, f.real_copy.view, VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, f.input.view, VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, f.hud_mask.view, VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, f.generated[0].view, VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, f.generated[0].view, VK_IMAGE_LAYOUT_GENERAL},
+            };
+            VkWriteDescriptorSet writes[5] = {};
+            for (int k = 0; k < 5; ++k) {
+                writes[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[k].dstSet = f.hud_desc_set;
+                writes[k].dstBinding = k;
+                writes[k].descriptorCount = 1;
+                writes[k].descriptorType = (k == 2 || k == 3) ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                writes[k].pImageInfo = &img_info[k];
+            }
+            vkUpdateDescriptorSets(device_, 5, writes, 0, nullptr);
+        }
+        // fsr_fg_context_ will be created lazily when guides are available with actual render dimensions
+#endif
     }
 
     width_ = width;
     height_ = height;
     format_ = format;
+    active_backend_ = backend;
     feature_created_ = true;
     recreate_ = false;
     history_.clear();
-    host_log("framegen: DLSS Frame Generation %ux created for %ux%u format %d", generated_count_ + 1, width, height, static_cast<int>(format));
     return true;
+}
+
+bool FrameGenerator::record_fsr_fg(VkCommandBuffer cmd, std::uint32_t width, std::uint32_t height,
+                                   const gpu::DlssFgGuides& guides, unsigned slot) {
+#if defined(BBHOST_HAVE_FSR)
+    auto& frame = frames_[slot];
+
+    // Lazy creation / re-creation of FSR FG context with maxRender dimensions from guides
+    if (!fsr_fg_context_ || fsr_max_render_w_ < guides.width || fsr_max_render_h_ < guides.height) {
+        if (fsr_fg_context_) {
+            host_gpu_queue_lock();
+            vkDeviceWaitIdle(device_);
+            host_gpu_queue_unlock();
+            ffxVkFsr3_3_1_6FrameGenerationContextDestroy(
+                static_cast<FfxVkFsr3_3_1_6FrameGenerationContext*>(fsr_fg_context_));
+            fsr_fg_context_ = nullptr;
+        }
+        FfxVkFsr3_3_1_6FrameGenerationCreateInfo ci{};
+        ci.physicalDevice = phys_;
+        ci.device = device_;
+        ci.maxRenderWidth = guides.width;
+        ci.maxRenderHeight = guides.height;
+        ci.displayWidth = width;
+        ci.displayHeight = height;
+        ci.colorFormat = format_;
+        FfxVkFsr3_3_1_6FrameGenerationContext* ctx = nullptr;
+        FfxVkFsr3_3_1_6FrameGenerationResult fres = ffxVkFsr3_3_1_6FrameGenerationContextCreate(&ci, &ctx);
+        if (fres != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+            host_log("framegen: FSR 3.1.6 ContextCreate failed (%d) for %ux%u format %d", fres, width, height, static_cast<int>(format_));
+            return false;
+        }
+        fsr_fg_context_ = ctx;
+        fsr_max_render_w_ = ci.maxRenderWidth;
+        fsr_max_render_h_ = ci.maxRenderHeight;
+        host_log("framegen: FSR 3.1.6 Frame Generation 2x created (maxRender %ux%u, display %ux%u)",
+                 fsr_max_render_w_, fsr_max_render_h_, width, height);
+    }
+
+    auto* ctx = static_cast<FfxVkFsr3_3_1_6FrameGenerationContext*>(fsr_fg_context_);
+    if (!ctx) return false;
+
+    // Retire any completed frames whose GPU submission fence has signalled
+    for (unsigned s = 0; s < kFrameSlots; ++s) {
+        if (frames_[s].fsr_frame_id && vkGetFenceStatus(device_, frames_[s].fence) == VK_SUCCESS) {
+            ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(ctx, frames_[s].fsr_frame_id);
+            frames_[s].fsr_frame_id = 0;
+        }
+    }
+
+    const bool reset = guides.reset || history_.needs_reset(guides.render_frame_index);
+    if (frame.disable_mapped) {
+        *static_cast<uint32_t*>(frame.disable_mapped) = reset ? 1u : 0u;
+    }
+
+    // Barrier: ensure transfer writes into frame.real_copy and frame.input are visible to compute shader sampling
+    VkMemoryBarrier copy_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    copy_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    copy_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &copy_barrier, 0, nullptr, 0, nullptr);
+
+    // Step 1: Compute HUD isolation pass
+    // Extract RGB difference: abs(real_copy.rgb - input.rgb) > threshold -> ui_hud
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hud_pipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hud_pipeline_layout_, 0, 1, &frame.hud_desc_set, 0, nullptr);
+    HudPushConstants pc{width, height, 0u};
+    vkCmdPushConstants(cmd, hud_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+
+    VkMemoryBarrier hud_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    hud_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    hud_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &hud_barrier, 0, nullptr, 0, nullptr);
+
+    // Step 2: Prepare FSR FG
+    const std::uint64_t fid = fsr_frame_id_++;
+    frame.fsr_frame_id = fid;
+
+    const VkImageUsageFlags color_usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                          VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    const VkImageUsageFlags guide_usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+
+    const float frame_ms = std::isfinite(guides.frame_ms) ? std::clamp(guides.frame_ms, 1.0f, 100.0f) : 16.66f;
+    const float near_plane = std::isfinite(guides.camera.near_plane) && guides.camera.near_plane > 0.0f ? guides.camera.near_plane : 0.1f;
+    const float far_plane = std::isfinite(guides.camera.far_plane) && guides.camera.far_plane > near_plane ? guides.camera.far_plane : 3000.0f;
+    const float vfov = std::isfinite(guides.camera.vertical_fov) && guides.camera.vertical_fov > 0.0f ? guides.camera.vertical_fov : 1.0f;
+    const float jx = std::isfinite(guides.camera.jitter[0]) ? guides.camera.jitter[0] : 0.0f;
+    const float jy = std::isfinite(guides.camera.jitter[1]) ? guides.camera.jitter[1] : 0.0f;
+
+    FfxVkFsr3_3_1_6FrameGenerationPrepareInfo prep{};
+    prep.commandBuffer = cmd;
+    prep.color = {frame.input.image, frame.input.format, width, height, VK_IMAGE_LAYOUT_GENERAL, color_usage};
+    prep.depth = {guides.depth, guides.depth_format, guides.width, guides.height, VK_IMAGE_LAYOUT_GENERAL, guide_usage};
+    prep.motionVectors = {guides.motion, guides.motion_format, guides.width, guides.height, VK_IMAGE_LAYOUT_GENERAL, guide_usage};
+    prep.renderWidth = guides.width;
+    prep.renderHeight = guides.height;
+    prep.jitterOffsetX = jx;
+    prep.jitterOffsetY = jy;
+    prep.motionVectorScaleX = 1.0f;
+    prep.motionVectorScaleY = 1.0f;
+    prep.frameTimeMilliseconds = frame_ms;
+    prep.minLuminance = 0.0f;
+    prep.maxLuminance = 1000.0f;
+    prep.transferFunction = FFX_VK_FSR3_3_1_6_FRAMEGEN_TRANSFER_SRGB;
+    prep.cameraNear = near_plane;
+    prep.cameraFar = far_plane;
+    prep.viewSpaceToMeters = 1.0f;
+    prep.cameraVerticalFovRadians = vfov;
+    for (int i = 0; i < 3; ++i) {
+        prep.cameraPosition[i] = std::isfinite(guides.camera.position[i]) ? guides.camera.position[i] : 0.0f;
+        prep.cameraUp[i] = std::isfinite(guides.camera.up[i]) ? guides.camera.up[i] : (i == 1 ? 1.0f : 0.0f);
+        prep.cameraRight[i] = std::isfinite(guides.camera.right[i]) ? guides.camera.right[i] : (i == 0 ? 1.0f : 0.0f);
+        prep.cameraForward[i] = std::isfinite(guides.camera.forward[i]) ? guides.camera.forward[i] : (i == 2 ? 1.0f : 0.0f);
+    }
+    prep.frameId = fid;
+    prep.reset = reset ? VK_TRUE : VK_FALSE;
+
+    FfxVkFsr3_3_1_6FrameGenerationResult r_prep = ffxVkFsr3_3_1_6FrameGenerationContextRecordPrepare(ctx, &prep);
+    if (r_prep != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+        static int prep_fail = 0;
+        if (++prep_fail <= 5) host_log("framegen: FSR RecordPrepare failed (%d)", r_prep);
+        ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(ctx, fid);
+        frame.fsr_frame_id = 0;
+        return false;
+    }
+
+    // Step 3: Dispatch FSR FG into generated[0]
+    FfxVkFsr3_3_1_6FrameGenerationDispatchInfo disp{};
+    disp.commandBuffer = cmd;
+    disp.color = prep.color;
+    disp.output = {frame.generated[0].image, frame.generated[0].format, width, height, VK_IMAGE_LAYOUT_GENERAL, color_usage};
+    disp.displayWidth = width;
+    disp.displayHeight = height;
+    disp.frameTimeMilliseconds = frame_ms;
+    disp.cameraNear = near_plane;
+    disp.cameraFar = far_plane;
+    disp.viewSpaceToMeters = 1.0f;
+    disp.cameraVerticalFovRadians = vfov;
+    disp.minLuminance = 0.0f;
+    disp.maxLuminance = 1000.0f;
+    disp.transferFunction = FFX_VK_FSR3_3_1_6_FRAMEGEN_TRANSFER_SRGB;
+    disp.frameId = fid;
+    disp.reset = reset ? VK_TRUE : VK_FALSE;
+
+    FfxVkFsr3_3_1_6FrameGenerationResult r_disp = ffxVkFsr3_3_1_6FrameGenerationContextRecordDispatch(ctx, &disp);
+    {
+        std::lock_guard<std::mutex> lock(g_stats_mu);
+        ++g_stats.evaluations;
+        if (r_disp != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) ++g_stats.evaluations_failed;
+    }
+    if (r_disp != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
+        static int disp_fail = 0;
+        if (++disp_fail <= 5) host_log("framegen: FSR RecordDispatch failed (%d)", r_disp);
+        ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(ctx, fid);
+        frame.fsr_frame_id = 0;
+        return false;
+    }
+
+    // Barrier after FSR dispatch before HUD compositing
+    VkMemoryBarrier fsr_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    fsr_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    fsr_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &fsr_barrier, 0, nullptr, 0, nullptr);
+
+    // Step 4: Composite HUD onto generated[0]
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hud_pipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, hud_pipeline_layout_, 0, 1, &frame.hud_desc_set, 0, nullptr);
+    pc.mode = 1u;
+    vkCmdPushConstants(cmd, hud_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+    vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool FrameGenerator::evaluate(VkCommandBuffer cmd, VkImage color_image, VkImageView color_view, VkFormat color_format,
                               std::uint32_t width, std::uint32_t height, const gpu::DlssFgGuides& guides, unsigned slot) {
     auto& frame = frames_[slot];
-    if (!feature_created_ || !g_bridge_fg.fg_evaluate) return false;
+    if (!feature_created_) return false;
     if (!guides.valid || !guides.depth || !guides.motion) return false;
 
     // The game renders a logical picture in the top-left of its maximum-size
@@ -364,15 +747,49 @@ bool FrameGenerator::evaluate(VkCommandBuffer cmd, VkImage color_image, VkImageV
     VkImageCopy crop{};
     crop.srcSubresource = crop.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     crop.extent = {width, height, 1};
-    vkCmdCopyImage(cmd, color_image, VK_IMAGE_LAYOUT_GENERAL, frame.input.image,
-                   VK_IMAGE_LAYOUT_GENERAL, 1, &crop);
-    // MFG evaluates every temporal position with identical inputs. OutputReal
-    // is optional: retain the real endpoint once instead of having NGX copy
-    // it again for each generated position. The slot's lease protects both
-    // retained images until the compositor retires its last read.
-    if (generated_count_ > 1)
-        vkCmdCopyImage(cmd, color_image, VK_IMAGE_LAYOUT_GENERAL, frame.real_copy.image,
+
+    if (active_backend_ == 1) {
+        // FSR 3.1.6 path:
+        // Input must be pre-HUD hudless color image. Real copy must always be manual full color image.
+        // If guides do not have a valid matching hudless image, suppress generated frame.
+        const bool valid_hudless = guides.hudless &&
+                                   guides.hudless_width >= width &&
+                                   guides.hudless_height >= height &&
+                                   (guides.hudless_format == frame.input.format ||
+                                    (guides.hudless_format == VK_FORMAT_B8G8R8A8_UNORM &&
+                                     frame.input.format == VK_FORMAT_R8G8B8A8_UNORM));
+        if (!valid_hudless) {
+            return false;
+        }
+
+        const auto copy_color = [&](VkImage source, VkFormat source_format, const OwnedImage& target) {
+            if (source_format == target.format) {
+                vkCmdCopyImage(cmd, source, VK_IMAGE_LAYOUT_GENERAL, target.image,
+                               VK_IMAGE_LAYOUT_GENERAL, 1, &crop);
+            } else {
+                VkImageBlit blit{};
+                blit.srcSubresource = blit.dstSubresource = crop.srcSubresource;
+                blit.srcOffsets[1] = blit.dstOffsets[1] = {static_cast<int>(width), static_cast<int>(height), 1};
+                vkCmdBlitImage(cmd, source, VK_IMAGE_LAYOUT_GENERAL, target.image,
+                               VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+            }
+        };
+        copy_color(color_image, color_format, frame.real_copy);
+        copy_color(guides.hudless, guides.hudless_format, frame.input);
+    } else {
+        // DLSS path: preserve exact original flow
+        // DLSS input is ALWAYS full color image
+        vkCmdCopyImage(cmd, color_image, VK_IMAGE_LAYOUT_GENERAL, frame.input.image,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &crop);
+
+        // MFG (> 1 generated) evaluates every temporal position with identical inputs.
+        // Retain the real endpoint once manually.
+        // For 2x (generated_count_ == 1), NGX OutputReal writes real_copy.
+        if (generated_count_ > 1) {
+            vkCmdCopyImage(cmd, color_image, VK_IMAGE_LAYOUT_GENERAL, frame.real_copy.image,
+                           VK_IMAGE_LAYOUT_GENERAL, 1, &crop);
+        }
+    }
     (void)color_view;
     (void)color_format;
 
@@ -380,7 +797,12 @@ bool FrameGenerator::evaluate(VkCommandBuffer cmd, VkImage color_image, VkImageV
         vkCmdResetQueryPool(cmd, times_, slot * 2, 2);
         vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, times_, slot * 2);
     }
-    const bool reset = guides.reset || history_.needs_reset(guides.render_frame_index);
+
+    if (active_backend_ == 1) {
+        if (!record_fsr_fg(cmd, width, height, guides, slot)) return false;
+    } else {
+        if (!g_bridge_fg.fg_evaluate) return false;
+        const bool reset = guides.reset || history_.needs_reset(guides.render_frame_index);
     if (frame.disable_mapped) {
         *static_cast<uint32_t*>(frame.disable_mapped) = reset ? 1u : 0u;
     }
@@ -428,6 +850,7 @@ bool FrameGenerator::evaluate(VkCommandBuffer cmd, VkImage color_image, VkImageV
         if (++fail_count <= 5) host_log("framegen: evaluate failed (0x%08x)", r);
         return false;
     }
+    }
 
     VkMemoryBarrier post_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     post_barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -450,6 +873,12 @@ bool FrameGenerator::is_interpolation_disabled(unsigned slot) {
 
 bool FrameGenerator::evaluate_submit(VkImage color_image, VkImageView color_view, VkFormat color_format,
                                      std::uint32_t width, std::uint32_t height, const gpu::DlssFgGuides& guides, unsigned slot) {
+    return evaluate_submit(color_image, color_view, color_format, width, height, width, height, guides, slot);
+}
+
+bool FrameGenerator::evaluate_submit(VkImage color_image, VkImageView color_view, VkFormat color_format,
+                                     std::uint32_t width, std::uint32_t height, std::uint32_t full_width, std::uint32_t full_height,
+                                     const gpu::DlssFgGuides& guides, unsigned slot) {
     auto& frame = frames_[slot];
     if (!frame.cmd || !frame.fence) return false;
     if (frame.pending) {
@@ -469,10 +898,15 @@ bool FrameGenerator::evaluate_submit(VkImage color_image, VkImageView color_view
 
     if (!evaluate(frame.cmd, color_image, color_view, color_format, width, height, guides, slot)) {
         vkEndCommandBuffer(frame.cmd);
-        // This recording is discarded; recreate on retry so an image whose
-        // transition never ran cannot be mistaken for one in GENERAL layout.
-        // Previously submitted frames may still use NGX's feature state. The
-        // producer drains their leases before ensure_feature releases it.
+        vkResetCommandBuffer(frame.cmd, 0);
+#if defined(BBHOST_HAVE_FSR)
+        if (active_backend_ == 1 && frame.fsr_frame_id && fsr_fg_context_) {
+            ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(
+                static_cast<FfxVkFsr3_3_1_6FrameGenerationContext*>(fsr_fg_context_),
+                frame.fsr_frame_id);
+            frame.fsr_frame_id = 0;
+        }
+#endif
         recreate_ = true;
         return false;
     }

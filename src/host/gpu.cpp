@@ -2,6 +2,7 @@
 #include "core/host_clock.h"
 #include "core/portable.h"
 #include "host/dlaa.h"
+#include "host/fsr_upscaler.h"
 #include "host/foreign_hooks.h"
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
@@ -2007,6 +2008,27 @@ bool init_locked() {
     VkPhysicalDeviceVulkan12Features f12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     f12.pNext = &f13;
     f12.bufferDeviceAddress = VK_TRUE;
+    // Temporal FSR shaders use FP16/INT8 storage and, for the optional FSR 4
+    // model, integer dot products. Enable only features reported by the GPU.
+    VkPhysicalDevice16BitStorageFeatures fsr16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
+    {
+        VkPhysicalDevice16BitStorageFeatures q16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES};
+        VkPhysicalDeviceVulkan12Features q12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        VkPhysicalDeviceVulkan13Features q13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+        query.pNext = &q12; q12.pNext = &q13; q13.pNext = &q16;
+        vkGetPhysicalDeviceFeatures2(g.phys, &query);
+        f12.shaderInt8 = q12.shaderInt8;
+        f12.storageBuffer8BitAccess = q12.storageBuffer8BitAccess;
+        f12.uniformAndStorageBuffer8BitAccess = q12.uniformAndStorageBuffer8BitAccess;
+        f12.shaderSubgroupExtendedTypes = q12.shaderSubgroupExtendedTypes;
+        f13.shaderIntegerDotProduct = q13.shaderIntegerDotProduct;
+        fsr16.storageBuffer16BitAccess = q16.storageBuffer16BitAccess;
+        fsr16.uniformAndStorageBuffer16BitAccess = q16.uniformAndStorageBuffer16BitAccess;
+        fsr16.storagePushConstant16 = q16.storagePushConstant16;
+        fsr16.storageInputOutput16 = q16.storageInputOutput16;
+        fsr16.pNext = f13.pNext; f13.pNext = &fsr16;
+    }
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = &f12;
     f2.features.shaderInt64 = VK_TRUE;
@@ -2069,6 +2091,7 @@ bool init_locked() {
     // DB_DEPTH_CONTROL bit 3: the deferred lights cull by depth range.
     VkPhysicalDeviceFeatures supported{};
     vkGetPhysicalDeviceFeatures(g.phys, &supported);
+    f2.features.shaderStorageImageExtendedFormats = supported.shaderStorageImageExtendedFormats;
     f2.features.shaderImageGatherExtended = supported.shaderImageGatherExtended;
     // BBHOST_RUNTIME_OFFSETS=0: the coordinates move even with the feature, to
     // compare the two.
@@ -3893,6 +3916,7 @@ void retire_slot_locked(int k) {
     // Fences on one queue complete in submission order, so every CP write
     // recorded into this submission or an earlier one is in memory now.
     g.completed_submits = std::max(g.completed_submits, sl.serial + 1);
+    if (r == VK_SUCCESS) fsr_retire_locked(g.completed_submits);
     for (auto it = g.pending_writes.begin(); it != g.pending_writes.end();) {
         it = it->second.serial < g.completed_submits ? g.pending_writes.erase(it) : std::next(it);
     }

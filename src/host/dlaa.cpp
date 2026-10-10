@@ -7,6 +7,7 @@
 #include "host/object_motion.h"
 #include "host/settings.h"
 #include "host/display_settings.h"
+#include "host/fsr_upscaler.h"
 #include "host/shaders/dlaa_mv.spv.h"
 #include "log.h"
 
@@ -81,6 +82,18 @@ bool config_on() {
     return on;
 }
 
+bool fsr_selected() { return host_startup_settings().upscaler_backend != 0; }
+
+bool ngx_requested() {
+    const auto& settings = host_startup_settings();
+    return (config_on() && !fsr_selected()) ||
+           (settings.frame_generation && settings.frame_generation_backend == 0);
+}
+
+bool guides_only() {
+    return dlss_sr_is_active() || fsr_selected() || !config_on();
+}
+
 std::uint32_t config_preset() {
     std::string v = config_value("dlaa.preset");
     if (const char* e = std::getenv("BBHOST_DLAA_PRESET")) v = e;
@@ -92,8 +105,8 @@ std::uint32_t config_preset() {
 bool load_bridge() {
     if (g_bridge.tried) return g_bridge.evaluate != nullptr;
     g_bridge.tried = true;
-    if (!config_on()) {
-        host_log("dlaa: off (dlaa.enabled / BBHOST_DLAA)");
+    if (!ngx_requested()) {
+        host_log("temporal: NGX is not requested for the selected providers");
         return false;
     }
 #if defined(_WIN32)
@@ -511,6 +524,7 @@ bool init_ngx_locked() {
 void release_locked() {
     if (g_s.feature || g_sr.ready || g_s.output.image) flush_locked();  // NGX's and our images idle before they go
     if (g_s.feature || g_sr.ready) g_bridge.release();
+    fsr_shutdown_locked();
     g_sr = {};
     g_s.feature = false;
     destroy_image(g_s.output);
@@ -528,7 +542,7 @@ void fail_locked(const char* why) {
 // Images and the DLSS feature for a scene of this size and format. False
 // when they are not ready to evaluate this frame (just created, or failed).
 bool ensure_locked(std::uint32_t w, std::uint32_t h, VkFormat color_format) {
-    const bool sr = dlss_sr_is_active();
+    const bool sr = guides_only();
     if ((sr ? bool(g_s.depth.image) : g_s.feature) && g_s.width == w && g_s.height == h && g_s.color_format == color_format) return true;
     release_locked();
     g_s.output_same_format = storage_ok(color_format);
@@ -689,6 +703,11 @@ void dlaa_capture_hudless_locked(RtImage* source, std::uint32_t logical_width, s
 bool dlaa_get_display_override_locked(std::uint64_t, void**, std::uint32_t*, std::uint32_t*, std::uint32_t*) { return false; }
 
 bool dlss_sr_is_active() {
+    // FSR native AA uses the same pre-HUD reconstruction stage as upscaling.
+    // The public name remains for the renderer's existing resolution hooks.
+    if (fsr_selected())
+        return config_on() && !g_sr_render_failed &&
+               g_s.enabled.load(std::memory_order_relaxed) && !g_s.failed;
     return config_on() && sr_quality() != 0 && !g_sr_render_failed &&
            static_cast<std::uint32_t>(host_startup_settings().output_width) > g_s.main_w &&
            static_cast<std::uint32_t>(host_startup_settings().output_height) > g_s.main_h &&
@@ -704,7 +723,22 @@ bool dlss_sr_evaluate_locked(VkCommandBuffer, VkImage input, VkImageView input_v
                              std::uint32_t in_w, std::uint32_t in_h, VkImage output, VkImageView output_view,
                              VkFormat output_format, std::uint32_t out_w, std::uint32_t out_h) {
     if (!dlss_sr_is_active() || !g_fg_current.valid || !input || !output ||
-        g_fg_current.width != in_w || g_fg_current.height != in_h || !init_ngx_locked()) return false;
+        g_fg_current.width != in_w || g_fg_current.height != in_h) return false;
+    if (fsr_selected()) {
+        auto guides = g_fg_current;
+        guides.depth = g_s.depth.image; guides.depth_view = g_s.depth.view;
+        guides.motion = g_s.motion.image; guides.motion_view = g_s.motion.view;
+        const NgxbImage color{input, input_view, input_format, in_w, in_h, VK_IMAGE_ASPECT_COLOR_BIT};
+        const NgxbImage target{output, output_view, output_format, out_w, out_h, VK_IMAGE_ASPECT_COLOR_BIT};
+        render_end_pass_locked();
+        memory_barrier(g_cmd());
+        const bool ok = fsr_upscale_locked(g.phys, g.device, g_cmd(), color, target,
+                                           guides, g.flushes, g.completed_submits);
+        memory_barrier(g_cmd());
+        if (!ok) g_s.reset = true;
+        return ok;
+    }
+    if (!init_ngx_locked()) return false;
     const int quality = sr_quality();
     if (!g_sr.ready || g_sr.input_w != in_w || g_sr.input_h != in_h || g_sr.output_w != out_w ||
         g_sr.output_h != out_h || g_sr.format != input_format || g_sr.quality != quality) {
@@ -756,18 +790,20 @@ bool dlss_sr_upscale_hud_locked(RtImage* source, std::uint32_t in_w, std::uint32
     if (!source || !source->initialised || source->depth || !dlss_sr_is_active() ||
         !g_fg_current.valid || g_fg_current.width != in_w || g_fg_current.height != in_h) return false;
     dlss_sr_get_dimensions(in_w, in_h, out_w, out_h);
-    if (!in_w || !in_h || *out_w <= in_w || *out_h <= in_h ||
+    if (!in_w || !in_h || *out_w < in_w || *out_h < in_h ||
         *out_w > source->width || *out_h > source->height || !storage_ok(source->format)) {
         host_log("dlss: requested output does not fit the HUD target; falling back to native DLAA");
         g_sr_render_failed = true; g_s.reset = true;
         return false;
     }
     if (g_sr_hud_anchor == g_fg_current.frame_index) return true;
+    const auto sr_format = fsr_selected() && source->format == VK_FORMAT_B8G8R8A8_UNORM ?
+                           VK_FORMAT_R8G8B8A8_UNORM : source->format;
     if (!g_sr_input.image || !g_sr_output.image || g_sr_image_iw != in_w || g_sr_image_ih != in_h ||
-        g_sr_image_ow != *out_w || g_sr_image_oh != *out_h || g_sr_input.format != source->format) {
+        g_sr_image_ow != *out_w || g_sr_image_oh != *out_h || g_sr_input.format != sr_format) {
         flush_locked(); destroy_image(g_sr_input); destroy_image(g_sr_output);
-        if (!fg_resize_image_locked(g_sr_input, in_w, in_h, source->format) ||
-            !fg_resize_image_locked(g_sr_output, *out_w, *out_h, source->format)) {
+        if (!fg_resize_image_locked(g_sr_input, in_w, in_h, sr_format) ||
+            !fg_resize_image_locked(g_sr_output, *out_w, *out_h, sr_format)) {
             destroy_image(g_sr_input); destroy_image(g_sr_output);
             return false;
         }
@@ -776,7 +812,16 @@ bool dlss_sr_upscale_hud_locked(RtImage* source, std::uint32_t in_w, std::uint32
     }
     begin_recording_locked(); render_end_pass_locked();
     memory_barrier(g_cmd());
-    fg_copy_locked(g_cmd(), source->image, g_sr_input, in_w, in_h);
+    if (sr_format == source->format) {
+        fg_copy_locked(g_cmd(), source->image, g_sr_input, in_w, in_h);
+    } else {
+        to_general(g_cmd(), g_sr_input);
+        VkImageBlit blit{};
+        blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        blit.srcOffsets[1] = blit.dstOffsets[1] = {static_cast<int>(in_w), static_cast<int>(in_h), 1};
+        vkCmdBlitImage(g_cmd(), source->image, VK_IMAGE_LAYOUT_GENERAL, g_sr_input.image,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+    }
     to_general(g_cmd(), g_sr_output);
     memory_barrier(g_cmd());
     if (!dlss_sr_evaluate_locked(g_cmd(), g_sr_input.image, g_sr_input.view, g_sr_input.format,
@@ -785,8 +830,16 @@ bool dlss_sr_upscale_hud_locked(RtImage* source, std::uint32_t in_w, std::uint32
     VkImageCopy copy{};
     copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.extent = {*out_w, *out_h, 1};
-    vkCmdCopyImage(g_cmd(), g_sr_output.image, VK_IMAGE_LAYOUT_GENERAL, source->image,
-                   VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    if (sr_format == source->format) {
+        vkCmdCopyImage(g_cmd(), g_sr_output.image, VK_IMAGE_LAYOUT_GENERAL, source->image,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+    } else {
+        VkImageBlit blit{};
+        blit.srcSubresource = blit.dstSubresource = copy.srcSubresource;
+        blit.srcOffsets[1] = blit.dstOffsets[1] = {static_cast<int>(*out_w), static_cast<int>(*out_h), 1};
+        vkCmdBlitImage(g_cmd(), g_sr_output.image, VK_IMAGE_LAYOUT_GENERAL, source->image,
+                       VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+    }
     memory_barrier(g_cmd());
     source->fill_last = false;
     g_sr_hud_anchor = g_fg_current.frame_index;
@@ -808,7 +861,8 @@ bool dlaa_main_draw_locked(std::uint64_t depth, std::uint32_t depth_ctl, std::ui
 }
 
 bool dlaa_motion_active_locked() {
-    return g_s.enabled.load(std::memory_order_relaxed) && !g_s.failed;
+    return (config_on() || fg_requested()) &&
+           g_s.enabled.load(std::memory_order_relaxed) && !g_s.failed;
 }
 
 void dlaa_jitter_locked(float* x, float* y) {
@@ -1206,7 +1260,8 @@ void dlaa_anchor_locked(const std::uint64_t* sampled, int count) {
         g_s.reset = true;
         return;
     }
-    if (!init_ngx_locked()) {
+    if (!config_on() && !fg_requested()) return;
+    if (ngx_requested() && !init_ngx_locked() && !fsr_selected()) {
         g_s.failed = true;
         return;
     }
@@ -1252,7 +1307,7 @@ void dlaa_anchor_locked(const std::uint64_t* sampled, int count) {
     e.mv_scale_x = e.mv_scale_y = 1.0f;
     e.reset = g_s.reset ? 1 : 0;
     e.frame_ms = ms;
-    const bool sr = dlss_sr_is_active();
+    const bool sr = guides_only();
     const std::uint32_t r = sr ? 1u : g_bridge.evaluate(cmd, &e);
     if (ngx_failed(r)) {
         if (++g_s.failures <= 5) host_log("dlaa: evaluate failed (0x%08x)", r);
@@ -1315,9 +1370,13 @@ void dlaa_anchor_locked(const std::uint64_t* sampled, int count) {
     memory_barrier(cmd);
     scene->fill_last = false;
     g_s.reset = false;
-    // The next frame's jitter: Halton(2, 3) over 16 frames, centred.
-    if (g_s.jitter_mode.load(std::memory_order_relaxed) == 0) {
-        g_s.jitter_index = g_s.jitter_index % 16 + 1;
+    // FSR recommends eight phases times the square of the upscale ratio.
+    // Keep native DLSS's existing sequence; FG-only guide capture has no jitter.
+    if (config_on() && g_s.jitter_mode.load(std::memory_order_relaxed) == 0) {
+        const double ratio = static_cast<double>(host_startup_settings().output_width) /
+                             std::max(1u, scene->width);
+        const auto phases = fsr_selected() ? std::max(8u, static_cast<unsigned>(std::lround(8.0 * ratio * ratio))) : 16u;
+        g_s.jitter_index = g_s.jitter_index % phases + 1;
         g_s.jx = halton(g_s.jitter_index, 2) - 0.5f;
         g_s.jy = halton(g_s.jitter_index, 3) - 0.5f;
     }

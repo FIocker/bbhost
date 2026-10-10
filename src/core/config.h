@@ -50,6 +50,8 @@ struct HostConfig {
     std::string dlss_mode = "off"; // off, dlaa, quality, balanced, performance, ultra_performance
     int dlss_output_width = 0;
     int dlss_output_height = 0;
+    std::string upscaler_backend = "dlss"; // dlss, fsr3, fsr4
+    std::string frame_generation_backend = "dlss"; // dlss, fsr3
     bool dlss_frame_generation = false;
     int dlss_fg_factor = 2;
     bool dlss_object_motion = false; // animated mesh vectors; optional extra GPU work

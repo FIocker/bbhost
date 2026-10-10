@@ -2410,6 +2410,8 @@ std::array<bool, host::FrameGenerator::kFrameSlots> g_fg_leased{};
 
 int acquire_fg_slot(unsigned w, unsigned h, VkFormat format) {
     auto& fg = host::fg_get();
+    if (host_startup_settings().frame_generation_backend == 1 && format == VK_FORMAT_B8G8R8A8_UNORM)
+        format = VK_FORMAT_R8G8B8A8_UNORM;
     std::unique_lock<std::mutex> lk(g_present_mu);
     const bool resize = !fg.ready() || fg.width() != w || fg.height() != h || fg.generated_format() != format;
     if (resize) {

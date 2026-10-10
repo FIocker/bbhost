@@ -261,11 +261,15 @@ endif()
 
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
+  include(cmake/fsr.cmake)
+  target_link_libraries(bbhost PRIVATE bbhost_fsr_provider)
+  target_compile_definitions(bbhost PRIVATE BBHOST_HAVE_FSR=1)
+  target_link_libraries(bbhost PRIVATE ffx-vulkan::fsr3-vk-backend-3.1.5 ffx-vulkan::fsr3-vk-framegeneration-3.1.6 ffx-vulkan::fsr4-v07-vulkan ffx-vulkan::fsr4-v07-assets)
   # Draw capture manifests and raw-texel comparison.
   add_library(replay_common STATIC src/replay/json.cpp src/replay/compare.cpp)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
-  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/dlaa.cpp src/host/frame_generation.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/dlaa.cpp src/host/fsr_upscaler.cpp src/host/frame_generation.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
@@ -309,7 +313,7 @@ if(SDL3_FOUND AND Vulkan_FOUND)
   set_source_files_properties(src/host/overlay.cpp src/host/present_pass.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/ingame_menu.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/buffer_shadow.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
-  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/dlaa.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
+  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/dlaa.cpp src/host/fsr_upscaler.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   target_sources(bbhost PRIVATE src/host/object_motion.cpp)
   set_source_files_properties(src/host/object_motion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
 else()
@@ -524,6 +528,15 @@ endif()
 
 # Motion regressions are portable, including the native Windows renderer build.
 enable_testing()
+if(Vulkan_FOUND)
+  add_executable(fsr_provider_check tools/win/fsr_provider_check.cpp)
+  target_compile_features(fsr_provider_check PRIVATE cxx_std_20)
+  target_link_libraries(fsr_provider_check PRIVATE
+    ffx-vulkan::fsr3-vk-backend-3.1.5
+    ffx-vulkan::fsr3-vk-framegeneration-3.1.6 Vulkan::Vulkan bbhost_fsr_provider)
+  add_test(NAME fsr_provider_check COMMAND fsr_provider_check)
+  set_tests_properties(fsr_provider_check PROPERTIES RUN_SERIAL TRUE SKIP_RETURN_CODE 77 TIMEOUT 60)
+endif()
 add_executable(display_settings_test tests/display_settings_test.cpp)
 target_include_directories(display_settings_test PRIVATE src)
 target_compile_options(display_settings_test PRIVATE -UNDEBUG)

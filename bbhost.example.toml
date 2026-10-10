@@ -78,6 +78,8 @@ fps_cap = 30
 # obs_capture = "auto"
 
 [dlss]
+upscaler_backend = "dlss" # dlss, fsr3, or fsr4 (optional model download)
+frame_generation_backend = "dlss" # dlss or fsr3 (2x only)
 # Off, native DLAA, or a super-resolution preset. Setup and F10 share these
 # choices. Restart after changing any temporal-rendering setting.
 mode = "off" # off, dlaa, quality, balanced, performance, ultra_performance

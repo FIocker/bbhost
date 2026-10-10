@@ -32,5 +32,20 @@ int main() {
     assert(override_output.output_width == 3440 && override_output.output_height == 1440);
     auto native = host::display_dimensions(1920, 1080, 1, 3440, 1440);
     assert(native.output_width == 1920 && native.render_width == 1920);
+
+    assert(host::parse_upscaler_backend("dlss") == 0);
+    assert(host::parse_upscaler_backend("fsr3") == 1);
+    assert(host::parse_upscaler_backend("fsr4") == 2);
+    assert(host::parse_upscaler_backend("unknown") == 0);
+    assert(std::string(host::upscaler_backend_name(0)) == "dlss");
+    assert(std::string(host::upscaler_backend_name(1)) == "fsr3");
+    assert(std::string(host::upscaler_backend_name(2)) == "fsr4");
+
+    assert(host::parse_fg_backend("dlss") == 0);
+    assert(host::parse_fg_backend("fsr3") == 1);
+    assert(host::parse_fg_backend("other") == 0);
+    assert(std::string(host::fg_backend_name(0)) == "dlss");
+    assert(std::string(host::fg_backend_name(1)) == "fsr3");
+
     std::puts("display_settings_test: custom sizes, SR presets, native modes and overrides passed");
 }

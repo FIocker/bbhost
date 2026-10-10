@@ -25,6 +25,8 @@ struct HostSettings {
     int res_width = 1920, res_height = 1080;  // the render resolution (BBHOST_RES wins)
     int output_width = 1920, output_height = 1080; // reconstructed/native display size
     int dlss_mode = 0; // Off, DLAA, Quality, Balanced, Performance, Ultra Performance
+    int upscaler_backend = 0; // 0 DLSS, 1 FSR3, 2 FSR4
+    int frame_generation_backend = 0; // 0 DLSS, 1 FSR3
     bool frame_generation = false; // captured at startup
     int frame_generation_factor = 2; // 2x/3x/4x, subject to NGX capabilities
 

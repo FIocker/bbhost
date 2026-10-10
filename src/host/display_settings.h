@@ -13,6 +13,31 @@ namespace host {
 inline constexpr const char* DlssModes[] = {
     "off", "dlaa", "quality", "balanced", "performance", "ultra_performance"};
 
+inline constexpr const char* UpscalerBackendNames[] = {"dlss", "fsr3", "fsr4"};
+inline constexpr const char* FgBackendNames[] = {"dlss", "fsr3"};
+
+inline int parse_upscaler_backend(const std::string& name) {
+    if (name == "fsr3") return 1;
+    if (name == "fsr4") return 2;
+    return 0;
+}
+
+inline const char* upscaler_backend_name(int backend) {
+    if (backend == 1) return "fsr3";
+    if (backend == 2) return "fsr4";
+    return "dlss";
+}
+
+inline int parse_fg_backend(const std::string& name) {
+    if (name == "fsr3") return 1;
+    return 0;
+}
+
+inline const char* fg_backend_name(int backend) {
+    if (backend == 1) return "fsr3";
+    return "dlss";
+}
+
 // Higher factors can have uneven temporal spacing under an external FPS cap.
 // Keep them available for pacing research without exposing them by default.
 inline bool experimental_mfg_enabled() {
