@@ -2983,8 +2983,11 @@ struct Translator {
             std::vector<Id> coords;
             for (int k = 0; k < ncoord; ++k) coords.push_back(i(ld(vgpr_var(in.vaddr + k))));
             const Id coord = ncoord == 1 ? coords[0] : m.emit(spv::OpCompositeConstruct, ncoord == 2 ? t_v2i : ncoord == 3 ? t_v3i : t_v4i, coords);
+            // DMASK names the data components the consecutive VGPRs hold, R
+            // first; the others are 0 (the ISA's MIMG DMASK field: "missing
+            // components get 0"). Then the inverse of the T#'s select.
             std::vector<Id> raws;
-            for (int k = 0; k < 4; ++k) raws.push_back(ld(vgpr_var(in.vdata + std::min(k, popcount4(in.dmask) - 1))));
+            for (int k = 0, next = 0; k < 4; ++k) raws.push_back((in.dmask >> k) & 1 ? ld(vgpr_var(in.vdata + next++)) : c_zero_u);
             raws = store_dst_sel_rt(raws, read_s(in.srsrc + 3, in));
             std::vector<Id> vals;
             for (const Id raw : raws) vals.push_back(img.kind == 1 ? raw : img.kind == 2 ? i(raw) : f(raw));
@@ -3202,7 +3205,6 @@ struct Translator {
         }
         write_texel(in, texel);
     }
-    static int popcount4(std::uint32_t m4) { return ((m4 >> 0) & 1) + ((m4 >> 1) & 1) + ((m4 >> 2) & 1) + ((m4 >> 3) & 1); }
     static std::uint32_t gather_component(std::uint32_t dmask) {
         for (std::uint32_t k = 0; k < 4; ++k) if ((dmask >> k) & 1) return k;
         return 0;

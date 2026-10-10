@@ -353,6 +353,23 @@ struct Fixture {
                     got[2], got[3]);
         return ok;
     }
+    // image_store's DMASK names the data components the consecutive VGPRs
+    // hold, R first; the others are 0 (the ISA's MIMG DMASK field), before the
+    // inverse of the T#'s select (X Y Z W here).
+    bool run_store_dmask(std::uint32_t dmask, const float (&want)[4]) {
+        auto* params = static_cast<gcn::StageParams*>(mapped);
+        params->user_sgpr[3] = 0xfac; params->user_sgpr[8] = 0;
+        std::vector<gcn::Inst> body;
+        for (int k = 0; k < 4; ++k) body.push_back(vmov(16 + k, std::bit_cast<std::uint32_t>(float(k + 1))));
+        image_store_body(body);
+        body.back().dmask = static_cast<std::uint8_t>(dmask);
+        const auto got = dispatch_compute(body, 12);
+        const bool ok = near4(got, want);
+        std::printf("%s image_store dmask %x of (1, 2, 3, 4): got (%g,%g,%g,%g), expected (%g,%g,%g,%g)\n", ok ? "PASS" : "FAIL", dmask, got[0], got[1],
+                    got[2], got[3], want[0], want[1], want[2], want[3]);
+        return ok;
+    }
+
     void bind_sampled(VkImageView view) {
         VkDescriptorImageInfo info{{}, view, VK_IMAGE_LAYOUT_GENERAL};
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -684,6 +701,10 @@ int main() try {
         ok &= f.run_typed_load(cb, 4, 1, zyxw, {5, -1, -1, -1}, "one component");
     }
     ok &= f.run_format_load_select();
+    ok &= f.run_store_dmask(0xf, {1, 2, 3, 4});
+    ok &= f.run_store_dmask(0x1, {1, 0, 0, 0});
+    ok &= f.run_store_dmask(0x9, {1, 0, 0, 2});
+    ok &= f.run_store_dmask(0x6, {0, 1, 2, 0});
     // Ranged scalar loads: ten dwords of range (40 bytes, stride 0; 2 records
     // of 20 bytes); the offset's two low bits ignored; past the range 0.
     for (const int cb : {1, 2}) {
