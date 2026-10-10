@@ -59,6 +59,8 @@ rates alone do not establish complete scanouts, perceived smoothness or latency.
 | Reconstruction off / FSR 2x | 30 | 30.00 | 60.00 | 18.64 ms |
 | FSR 4 Quality / FSR 2x | 30 | 30.00 | 60.00 | 24.71 ms |
 
+| DLSS Quality / DLSS 2x regression | 30 | 30.00 | 60.00 | 24.60 ms |
+
 All measured windows have no missing display intervals. Generation windows
 have no evaluation failures, expired generated positions or reset suppression.
 The initial history reset is outside the measured window. The 60 FPS selected
@@ -75,3 +77,24 @@ fine detail with analytical FSR frame generation. The fixtures establish real
 interpolated content and safe resources; they do not certify perceptual quality
 or latency. This provider remains experimental. FSR 4 is the optional
 source-v07 reconstruction model, not FSR 4 ML frame generation.
+
+## Packaged build checks
+
+The packaged executable loads FSR 4 from its own asset directory and renders in
+both test areas. With that directory overridden to a missing location, it logs
+one fallback message, initializes FSR 3 and continues 2x generation.
+FSR 4 plus generation reports the same three gameplay validation IDs listed
+above; no new FSR diagnostics appear.
+
+Setup's Start-up and display section exposes both providers, reconstruction
+presets and object vectors. Its FSR factor dropdown contains Off and 2x only.
+F10 presents those settings at output size; clicking the FSR generation arrow
+from 2x selects Off and saves correctly. The FSR cycle stays limited to those
+two states even with experimental DLSS MFG enabled. Temporal settings remain
+restart choices. Setup closes normally.
+
+The F12 capture checker passes: no targets clipped by size, no lost clears,
+no stale uploads or copy-back textures, and 46 float targets with no infinite
+or NaN texels. Seven registered reconstruction, pointer, timing, history and
+motion checks pass on Windows. Hosted GPU fixture skips are not used as local
+GPU validation evidence.

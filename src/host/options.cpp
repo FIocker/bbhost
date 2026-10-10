@@ -803,7 +803,10 @@ void rebuild_settings() {
 
 void set_index(int id, int index, bool from_file) {
     Setting& s = g_set[id];
-    const int n = static_cast<int>(s.values.size());
+    // FSR has only Off/2x, even when experimental DLSS MFG is opted in.
+    // Wrap over those two choices so Right from 2x can turn generation off.
+    const int n = id == kFrameGeneration && g_set[kFgBackend].index == 1 ?
+                  2 : static_cast<int>(s.values.size());
     index = ((index % n) + n) % n;
     if (index == s.index && from_file) {
         return;
