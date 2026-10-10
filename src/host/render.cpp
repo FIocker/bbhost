@@ -1940,9 +1940,9 @@ std::map<std::string, std::array<std::uint64_t, kVsWhyCount>> g_vs_other;
 // ... and its vertex shader (GpuStats::draws_vs): the lifter takes only a
 // vertex shader on vertex input, and only a no-fallback stage - which a
 // fallback pipeline laid out from its no-fallback stages has too (layout_only).
-int draw_vs_kind(const GfxPipeline& p, bool vertex_input) {
+int draw_vs_kind(const GfxPipeline& p, bool vertex_input, bool fetchless) {
     if (p.vs.lifted) return kDrawVsLifted;
-    if (!vertex_input || p.tess_hw) return kDrawVsOther;
+    if ((!vertex_input && !fetchless) || p.tess_hw) return kDrawVsOther;
     return p.lean || p.layout_only ? kDrawVsTranslated : kDrawVsFallback;
 }
 
@@ -3897,8 +3897,11 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                               s.tess_hw,    s.tess_control_points, s.tess_quads, s.tess_cw, s.tess_spacing, s.tess_attrs, s.tess_attr_vec4s,
                               s.tess_window};
     // BBHOST_DECOMP: the no-fallback variant of a selected vertex shader on
-    // vertex input runs its lift, under a key of its own.
-    const bool vs_decomp = stage_lean && vertex_input && !g_vs_dispatcher && decomp_selects(vs_name);
+    // vertex input runs its lift, under a key of its own - and so does one
+    // that calls no fetch shader at all (its inputs are the vertex and
+    // instance indices), outside tessellation.
+    const bool vs_fetchless = fetch_words.empty() && !s.tess_hw && !s.domain_level;
+    const bool vs_decomp = stage_lean && (vertex_input || vs_fetchless) && !g_vs_dispatcher && decomp_selects(vs_name);
     const std::uint64_t vs_key = lift_key(vs_stage_key(vs_in), vs_decomp);
     const bool vs_cacheable = g_stage_cache_on;
     const std::shared_ptr<const CachedStage> vs_hit = vs_cacheable ? cached_stage(vs_key) : nullptr;
@@ -13819,7 +13822,7 @@ static bool draw_impl(const GpuDraw& d) {
     cmds.publish();  // the diagnostics below may record or flush: they come after this draw
     bump(g.draws);  // the one writer, under g.mu: no locked add
     bump(g.draws_ps[draw_ps_kind(*bind_pl)]);
-    const int vs_kind = draw_vs_kind(*bind_pl, use_vertex_input);
+    const int vs_kind = draw_vs_kind(*bind_pl, use_vertex_input, fetch_words.empty() && !s.tess_hw && !s.domain_level);
     bump(g.draws_vs[vs_kind]);
     if (vs_kind == kDrawVsOther) {
         const int why = s.tess_hw                          ? kVsWhyTessHw
