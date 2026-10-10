@@ -694,7 +694,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         if (fg_backend == 1 && frame_generation > 1) frame_generation = 1;
         if (ImGui::IsItemHovered()) {
             if (fg_backend == 1)
-                ImGui::SetTooltip("FSR Frame Generation supports 2x only (adds 1 generated frame per real frame).");
+                ImGui::SetTooltip("Experimental FSR Frame Generation supports 2x only. Fast motion can show interpolation artifacts.");
             else
                 ImGui::SetTooltip("2x adds one generated frame. Experimental 3x/4x may have uneven pacing under FPS limits.");
         }

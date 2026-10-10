@@ -257,7 +257,7 @@ Setting g_set[kSettingCount] = {
     {"dlss_mode", "Reconstruction quality", {"Off", "Native AA", "Quality", "Balanced", "Performance", "Ultra Performance"}, 0,
      "DLAA/Native AA renders at native resolution. SR presets render fewer pixels and reconstruct the selected display size. Requires a restart.", true},
     {"fg_backend", "FG backend", {"DLSS", "FSR 3.1"}, 0,
-     "Frame generation provider: DLSS (RTX 40 series or newer) or FSR 3.1 (2x only). Requires a restart.", true},
+     "Frame generation provider: DLSS (RTX 40 series or newer) or experimental FSR 3.1 (2x only; fast motion can show interpolation artifacts). Requires a restart.", true},
     {"frame_generation", "Frame generation", {"Off", "2x", "3x", "4x"}, 0,
      "Adds a generated frame between game frames. FSR FG supports 2x only. Experimental 3x/4x can have uneven pacing under FPS limits. Requires a restart.", true},
 };

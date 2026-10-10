@@ -14,6 +14,15 @@ bbhost includes independent Vulkan adapters for AMD FidelityFX Super Resolution:
   with linear derivative groups for this provider's embedded optical-flow shaders.
   Unsupported devices retain ordinary presentation.
 
+### FSR 4 (source-v07)
+- Vulkan 1.3 with:
+  - `shaderFloat16` and `shaderInt8` (Vulkan 1.2)
+  - `shaderInt16` (Vulkan 1.0)
+  - `shaderIntegerDotProduct` (Vulkan 1.3)
+  - `shaderStorageImageExtendedFormats` (Vulkan 1.0)
+- Neural network model shaders & weights installed in `fsr4_shaders/` (or specified by `BBHOST_FSR4_ASSETS` / `BB_FSR4_DIR`).
+- If hardware features or asset files are unavailable, FSR 4 automatically logs a message once and falls back cleanly to FSR 3.1.5.
+
 ## Selecting providers
 
 Setup's Start-up and display section and the F10 menu offer separate
@@ -40,15 +49,6 @@ reconstruction is selected; it does not provide FSR 4 ML frame generation.
 The optional source-v07 FSR 4 model is experimental and is not the newer FSR
 4.1.1 runtime.
 
-### FSR 4 (source-v07)
-- Vulkan 1.3 with:
-  - `shaderFloat16` and `shaderInt8` (Vulkan 1.2)
-  - `shaderInt16` (Vulkan 1.0)
-  - `shaderIntegerDotProduct` (Vulkan 1.3)
-  - `shaderStorageImageExtendedFormats` (Vulkan 1.0)
-- Neural network model shaders & weights installed in `fsr4_shaders/` (or specified by `BBHOST_FSR4_ASSETS` / `BB_FSR4_DIR`).
-- If hardware features or asset files are unavailable, FSR 4 automatically logs a message once and falls back cleanly to FSR 3.1.5.
-
 ## Installing FSR 4 Assets on Windows
 
 Run the installation script to download and verify the model bundle:
@@ -64,3 +64,13 @@ tools\win\Install-FSR4.bat
 ```
 
 The script downloads the MIT-licensed FSR 4 v07 INT8/DOT4 shader assets from the upstream Q2RTX repository and verifies file sizes and SHA-256 hashes against the manifest.
+
+## Validation and limits
+
+See [FSR validation](fsr-validation.md) for the local GPU pixel checks,
+paired validation captures and gameplay measurements. Rapid camera sweeps at
+30 game FPS can show visible interpolation warping. Passing pixel and cadence
+checks does not establish artifact-free image quality or certify input latency.
+FSR generation remains an experimental provider pending wider hardware and
+long-session testing. Multiplayer should keep the game's simulation at 60 FPS;
+generated frames change presentation only.
