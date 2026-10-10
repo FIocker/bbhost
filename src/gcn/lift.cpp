@@ -2063,24 +2063,71 @@ private:
         ++buffer_loads;
     }
 
+    // TranslateOptions::vertex_formats_from_params, as translate.cpp
+    // load_vertex_element_from_params: the element converted by its descriptor
+    // (vertex_format_descriptor) - specialization constant kVertexFormatSpecId
+    // + location, which an optimized relink gives the pipeline's own, or
+    // StageParams::vertex_formats where that is 0 - each candidate the
+    // translator's own expression, constants included (a divisor the driver
+    // sees only at run time rounds differently from a constant one).
+    std::map<std::uint32_t, Id> vertex_format_spec;  // one per location, whichever call site loads it
+    std::size_t param_format_elements = 0;
+    void load_vertex_element_from_params(const VertexElement& el, Id var) {
+        if (el.location >= 16) {
+            reject("vertex input: formats from params need locations below 16");
+            return;
+        }
+        std::vector<Id> out;
+        {
+            EntryScope entry(m);  // inputs and their conversions dominate every block
+            const Id raw = m.load(t_v4u, var);
+            Id& spec = vertex_format_spec[el.location];
+            if (!spec) spec = m.spec_const_u32(0, kVertexFormatSpecId + el.location);
+            const Id from_params = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(7), cu(el.location / 4), cu(el.location % 4)}));
+            const Id d = m.emit(spv::OpSelect, t_u32, {m.emit(spv::OpINotEqual, t_bool, {spec, cu(0)}), spec, from_params});
+            const Id kind = ibin(spv::OpBitwiseAnd, d, cu(7));
+            const Id count = ibin(spv::OpBitwiseAnd, ibin(spv::OpShiftRightLogical, d, cu(4)), cu(7));
+            const Id integer = m.emit(spv::OpLogicalOr, t_bool, {ieq(kind, cu(2)), ieq(kind, cu(4))});
+            const Id one = m.emit(spv::OpSelect, t_u32, {integer, cu(1), cu(std::bit_cast<std::uint32_t>(1.0f))});
+            for (std::uint32_t k = 0; k < el.count && k < 4; ++k) {
+                const Id c = extract(t_u32, raw, k);
+                const Id unorm8 = m.emit(spv::OpBitcast, t_u32, {fdiv(m.emit(spv::OpConvertUToF, t_f32, {c}), cf(255.0f))});
+                const Id sint16 = from_i(m.emit(spv::OpBitFieldSExtract, t_i32, {to_i(c), cu(0), cu(16)}));
+                // kinds 1 and 2: the raw bits
+                const Id converted = m.emit(spv::OpSelect, t_u32, {ieq(kind, cu(3)), unorm8, m.emit(spv::OpSelect, t_u32, {ieq(kind, cu(4)), sint16, c})});
+                // DST_SEL 1 or 0 past the format's components
+                const Id past = m.emit(spv::OpSelect, t_u32, {m.emit(spv::OpINotEqual, t_bool, {ibin(spv::OpBitwiseAnd, d, cu(0x100u << k)), cu(0)}), one, cu(0)});
+                out.push_back(m.emit(spv::OpSelect, t_u32, {m.emit(spv::OpULessThan, t_bool, {cu(k), count}), converted, past}));
+            }
+        }
+        for (std::size_t k = 0; k < out.size(); ++k) write_v(static_cast<int>(el.vdata + k), word(out[k]));
+        ++param_format_elements;
+    }
+
     // TranslateOptions::vertex_input, as translate.cpp load_vertex_input: each
     // element from its input location (raw unsigned components; a packed
-    // format as one dword), converted by its number format and DST_SEL.
+    // format as one dword), converted by its number format and DST_SEL - or,
+    // with vertex_formats_from_params, by its descriptor in the params.
     void load_vertex_input() {
         inst_uniform = false;  // per vertex
         for (const VertexElement& el : opt.vertex_input) {
-            const std::uint32_t dfmt = (el.w3 >> 15) & 0xf, nfmt = (el.w3 >> 12) & 7;
-            int count = 0, bits[4] = {};
-            if (!format_layout(dfmt, count, bits)) {
-                reject("vertex input: unsupported buffer data format " + std::to_string(dfmt));
-                return;
-            }
             Id& var = vertex_in_vars[el.location];
             if (!var) {
                 var = m.global_variable(p_in_v4u, spv::ScInput);
                 m.decorate(var, spv::DecLocation, {el.location});
                 m.name(var, "vertex_in" + std::to_string(el.location));
                 interface.push_back(var);
+            }
+            if (opt.vertex_formats_from_params) {
+                load_vertex_element_from_params(el, var);
+                if (!res.rejections.empty()) return;
+                continue;
+            }
+            const std::uint32_t dfmt = (el.w3 >> 15) & 0xf, nfmt = (el.w3 >> 12) & 7;
+            int count = 0, bits[4] = {};
+            if (!format_layout(dfmt, count, bits)) {
+                reject("vertex input: unsupported buffer data format " + std::to_string(dfmt));
+                return;
             }
             const bool packed = dfmt >= 6 && dfmt <= 9;
             const Id one = nfmt == 4 || nfmt == 5 ? cu(1) : as_u(float_const(1.0f));
@@ -2329,16 +2376,19 @@ private:
 
     // The sampled image for the reference's image and sampler bindings `ii`,
     // `si` (the image itself in `image`): the bindings, or bindless their slots
-    // from the params block (StageParams::image_index / sampler_index, members
-    // 7 and 8 here).
+    // from the params block (StageParams::image_index / sampler_index, the
+    // members after what the stage declares).
+    std::uint32_t bindless_image_member = 7, bindless_sampler_member = 8;
     Id sampled_image(std::uint32_t ii, std::uint32_t si, Id& image) {
         Id sampler;
         if (ref.bindless) {
             const auto slot = [&](std::uint32_t member, std::uint32_t k) {
                 return m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(member), cu(k / 4), cu(k % 4)}));
             };
-            image = m.load(image_types[ii], m.access_chain(m.type_pointer(spv::ScUniformConstant, image_types[ii]), image_vars[ii], {slot(7, ii)}));
-            sampler = m.load(m.type_sampler(), m.access_chain(m.type_pointer(spv::ScUniformConstant, m.type_sampler()), sampler_vars[si], {slot(8, si)}));
+            image = m.load(image_types[ii], m.access_chain(m.type_pointer(spv::ScUniformConstant, image_types[ii]), image_vars[ii],
+                                                           {slot(bindless_image_member, ii)}));
+            sampler = m.load(m.type_sampler(), m.access_chain(m.type_pointer(spv::ScUniformConstant, m.type_sampler()), sampler_vars[si],
+                                                             {slot(bindless_sampler_member, si)}));
         } else {
             image = m.load(image_types[ii], image_vars[ii]);
             sampler = m.load(m.type_sampler(), sampler_vars[si]);
@@ -4360,14 +4410,19 @@ private:
 
         // StageParams, as the translator declares it: { u64 l1_table; u64
         // reserved; uvec4 user[4]; uint cb_valid; uvec4 cb_bias_dw[4];
-        // uvec4 cb_stride[4]; uvec4 cb_w3[4] }.
+        // uvec4 cb_stride[4]; uvec4 cb_w3[4] }, then a vertex stage's
+        // uvec4 vertex_formats[4] when it reads its formats from them.
         const Id t_user_arr = m.type_array(t_v4u, cu(4));
         m.decorate(t_user_arr, spv::DecArrayStride, {16});
         const Id t_bias_arr = t_user_arr;  // the same uvec4[4] type (types are deduplicated): decorated once
         // With the reference bindless (TranslateOptions::bindless), the image
         // and sampler slots follow, at StageParams's own offsets.
         std::vector<Id> members = {t_u64, t_u64, t_user_arr, t_u32, t_bias_arr, t_bias_arr, t_bias_arr};
+        const bool vertex_formats = opt.stage == Stage::Vertex && opt.vertex_formats_from_params && !opt.vertex_input.empty();
+        if (vertex_formats) members.push_back(t_bias_arr);
         if (ref.bindless) {
+            bindless_image_member = static_cast<std::uint32_t>(members.size());
+            bindless_sampler_member = bindless_image_member + 1;
             members.push_back(t_bias_arr);
             members.push_back(t_bias_arr);
         }
@@ -4380,9 +4435,10 @@ private:
         m.member_decorate(t_ubo, 4, spv::DecOffset, {96});
         m.member_decorate(t_ubo, 5, spv::DecOffset, {160});
         m.member_decorate(t_ubo, 6, spv::DecOffset, {224});
+        if (vertex_formats) m.member_decorate(t_ubo, 7, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, vertex_formats))});
         if (ref.bindless) {
-            m.member_decorate(t_ubo, 7, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, image_index))});
-            m.member_decorate(t_ubo, 8, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, sampler_index))});
+            m.member_decorate(t_ubo, bindless_image_member, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, image_index))});
+            m.member_decorate(t_ubo, bindless_sampler_member, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, sampler_index))});
         }
         ubo_var = m.global_variable(m.type_pointer(spv::ScUniform, t_ubo), spv::ScUniform);
         m.decorate(ubo_var, spv::DecDescriptorSet, {opt.descriptor_set});
@@ -4660,6 +4716,10 @@ private:
         head.push_back(std::to_string(exports.size()) + " colour exports with EXEC set");
         head.push_back(std::to_string(buffer_loads) + " scalar loads, every one from a storage buffer the reference binds; " +
                        std::to_string(masked_writes) + " VGPR writes under a varying EXEC become selects");
+        if (param_format_elements) {
+            head.push_back(std::to_string(param_format_elements) + " vertex elements converted by their descriptor - the relink's "
+                           "specialization constant, else the params block's - with the translator's expression for each kind");
+        }
         if (swizzles) {
             head.push_back(std::to_string(swizzles) + " ds_swizzle_b32 within a quad as quad operations in uniform control flow: each under EXEC "
                            "known set in whole-quad mode, of a value the quad's helper lanes computed as on GCN, and no kill region where "
@@ -4714,11 +4774,6 @@ LiftResult lift_pixel_shader(const Program& program, const TranslateOptions& opt
 }
 
 LiftResult lift_vertex_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference) {
-    if (options.vertex_formats_from_params) {  // translate.cpp load_vertex_element_from_params has no lifted counterpart yet
-        LiftResult r;
-        r.rejections.push_back("vertex formats from the params block");
-        return r;
-    }
     if (options.vs_out_cntl & TranslateOptions::kVsOutCntlClipVarying) {
         LiftResult r;
         r.rejections.push_back("clip distances as a varying");

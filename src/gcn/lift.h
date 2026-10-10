@@ -36,8 +36,11 @@ struct LiftResult {
 LiftResult lift_pixel_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference);
 
 // Lifts a vertex shader on Vulkan vertex input (TranslateOptions::vertex_input,
-// no inlined fetch shader) under the same rules: inputs at s_swappc_b64, the
-// position and params exported with EXEC known set, samples at level 0.
+// no inlined fetch shader) under the same rules: inputs at s_swappc_b64, each
+// element converted as the translator converts it - by its formats as
+// constants, or with vertex_formats_from_params by its descriptor in the params
+// block or the relink's specialization constant -, the position and params
+// exported with EXEC known set, samples at level 0.
 LiftResult lift_vertex_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference);
 
 }  // namespace gcn

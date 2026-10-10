@@ -51,11 +51,11 @@ before they are needed. There are two compilers:
   data - and handles every shader the game uses;
 - the *lifter* (`src/gcn/lift.cpp`) decompiles a shader into typed,
   structured SPIR-V, the form a person could read and edit. It is used for
-  every pixel shader it accepts, and for vertex shaders that keep their vertex
-  formats in the shader (when the driver fast-links pipelines, as NVIDIA's
-  does, vertex formats are specialisation constants and the lifts are pixel
-  shaders); the rest keep the translation. `tools/lift_verify.py` compares the
-  two compilers' output byte for byte.
+  every pixel shader, and every vertex shader on vertex input, it accepts -
+  with the vertex formats read from the shader's parameters, or as
+  specialisation constants, the way the translator reads them; the rest keep
+  the translation. `tools/lift_verify.py` compares the two compilers' output
+  byte for byte.
 
 All 13,394 vertex, pixel and compute shaders in the game's bundles translate
 to valid SPIR-V (`gcn2spv --check`). Domain, hull and local shaders run on the

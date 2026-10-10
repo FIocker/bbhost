@@ -2450,8 +2450,269 @@ void run() {
 
 }  // namespace lane_ops
 
+// ---- vertex shaders on vertex input, hand-encoded ---------------------------------------
+// The elements load at s_swappc_b64 (the fetch shader's call). With
+// vertex_formats_from_params the lift converts each element by its descriptor
+// in the params block - or the relink's specialization constant - as the
+// translator does; run through a straight-line interpreter of one vertex, it
+// must compute what the lift with the same formats as constants computes
+// (TranslateOptions::vertex_input's own conversions), for every kind the
+// loader serves, every component count and DST_SEL's ones and zeros past them.
+namespace vertex {
+
+std::uint32_t sop1(std::uint32_t op, std::uint32_t sdst, std::uint32_t ssrc) { return 0xbe800000u | sdst << 16 | op << 8 | ssrc; }
+// exp <tgt> v0..v3, all four components, done where asked.
+void export_vec(std::vector<std::uint32_t>& w, std::uint32_t tgt, std::uint32_t v, bool done = false) {
+    w.push_back(0xf8000000u | (done ? 1u << 11 : 0u) | tgt << 4 | 0xfu);
+    w.push_back((v + 3) << 24 | (v + 2) << 16 | (v + 1) << 8 | v);
+}
+constexpr std::uint32_t kEndpgm = 0xbf810000u;
+
+// s_swappc_b64 s[0:1], s[2:3]; the position from v4-v7, param 0 from v8-v11,
+// then `extra` exports; two elements at v4 and v8.
+std::vector<std::uint32_t> program(const std::function<void(std::vector<std::uint32_t>&)>& extra = {}) {
+    std::vector<std::uint32_t> w = {sop1(33, 0, 2)};
+    export_vec(w, 12, 4);
+    export_vec(w, 32, 8);
+    if (extra) extra(w);
+    w.push_back(kEndpgm);
+    return w;
+}
+
+gcn::TranslateOptions options(std::uint32_t w3_a, std::uint32_t w3_b, bool from_params) {
+    gcn::TranslateOptions o;
+    o.stage = gcn::Stage::Vertex;
+    o.rsrc1 = 3u << 24;  // VGPR_COMP_CNT 3
+    o.descriptor_set = 0;
+    o.cb_ssbo = true;
+    o.cb_no_fallback = true;
+    o.link_outputs = true;
+    for (std::uint8_t r = 0; r < 32; ++r) o.output_links.push_back(r);
+    o.vertex_input = {{0, 4, 4, from_params ? 0u : w3_a}, {1, 8, 4, from_params ? 0u : w3_b}};
+    o.vertex_formats_from_params = from_params;
+    return o;
+}
+
+struct Lifted {
+    gcn::TranslateResult ref;
+    gcn::LiftResult lift;
+};
+Lifted lift_vs(const std::vector<std::uint32_t>& words, const gcn::TranslateOptions& o) {
+    const gcn::Program p = gcn::decode(words.data(), words.size());
+    Lifted r;
+    r.ref = gcn::translate(p, o);
+    if (!r.ref.ok()) std::fprintf(stderr, "reference failed: %s\n", r.ref.errors[0].c_str());
+    r.lift = gcn::lift_vertex_shader(p, o, r.ref);
+    return r;
+}
+
+// One vertex through the lifted module: `inputs` at their locations, the
+// params' vertex_formats, the specialization constants by SpecId. Returns
+// the position, the params by location and the clip distances.
+struct VertexRun {
+    bool ok = false;
+    std::string error;
+    std::array<std::uint32_t, 4> position{};
+    std::map<std::uint32_t, std::array<std::uint32_t, 4>> params;
+    std::map<std::uint32_t, std::uint32_t> clip;
+};
+VertexRun run_vertex(const std::vector<std::uint32_t>& spv, const std::map<std::uint32_t, std::array<std::uint32_t, 4>>& inputs,
+                     const std::array<std::uint32_t, 16>& formats, const std::map<std::uint32_t, std::uint32_t>& spec = {}) {
+    VertexRun run;
+    using Vec = std::array<std::uint32_t, 4>;
+    std::map<std::uint32_t, Vec> val;
+    std::map<std::uint32_t, std::uint32_t> constants, builtin, location, storage, spec_id, spec_default;
+    struct Chain {
+        std::uint32_t base;
+        std::vector<std::uint32_t> idx;
+    };
+    std::map<std::uint32_t, Chain> chains;
+    std::uint32_t ubo = 0;
+    const auto fail = [&](const std::string& why) {
+        run.error = why;
+        return run;
+    };
+    bool in_body = false;
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+        if (n == 0 || i + n > spv.size()) return fail("malformed module");
+        const std::uint32_t* a = &spv[i + 1];
+        i += n;
+        switch (op) {
+        case 71:  // OpDecorate
+            if (a[1] == 11) builtin[a[0]] = a[2];
+            if (a[1] == 30) location[a[0]] = a[2];
+            if (a[1] == 1) spec_id[a[0]] = a[2];
+            continue;
+        case 59:  // OpVariable
+            storage[a[1]] = a[2];
+            if (a[2] == 2) ubo = a[1];  // Uniform: the params block
+            continue;
+        case 43: constants[a[1]] = a[2]; continue;      // OpConstant (low word)
+        case 41: constants[a[1]] = 1; continue;         // OpConstantTrue
+        case 42: constants[a[1]] = 0; continue;         // OpConstantFalse
+        case 50: spec_default[a[1]] = a[2]; continue;   // OpSpecConstant
+        case 248: in_body = true; continue;             // OpLabel
+        default: break;
+        }
+        if (!in_body) continue;
+        const auto get = [&](std::uint32_t id) -> Vec {
+            if (const auto c = constants.find(id); c != constants.end()) return {c->second, 0, 0, 0};
+            if (const auto s = spec_default.find(id); s != spec_default.end()) {
+                const auto given = spec_id.count(id) ? spec.find(spec_id.at(id)) : spec.end();
+                return {given != spec.end() ? given->second : s->second, 0, 0, 0};
+            }
+            return val[id];
+        };
+        const auto g0 = [&](std::uint32_t id) { return get(id)[0]; };
+        const auto f = [](std::uint32_t b) { return std::bit_cast<float>(b); };
+        const auto u = [](float x) { return std::bit_cast<std::uint32_t>(x); };
+        const auto set = [&](std::uint32_t id, std::uint32_t v) { val[id] = {v, 0, 0, 0}; };
+        switch (op) {
+        case 65: {  // OpAccessChain
+            Chain c{a[2], {}};
+            for (std::uint32_t k = 3; k < n - 1; ++k) c.idx.push_back(g0(a[k]));
+            chains[a[1]] = c;
+            break;
+        }
+        case 61: {  // OpLoad
+            const std::uint32_t ptr = a[2];
+            if (const auto c = chains.find(ptr); c != chains.end()) {
+                if (c->second.base != ubo || c->second.idx.size() != 3 || c->second.idx[0] != 7) return fail("a params load outside vertex_formats");
+                set(a[1], formats.at(c->second.idx[1] * 4 + c->second.idx[2]));
+            } else if (storage[ptr] == 1 && location.count(ptr) && !builtin.count(ptr)) {
+                const auto in = inputs.find(location[ptr]);
+                if (in == inputs.end()) return fail("an input location the test does not give");
+                val[a[1]] = in->second;
+            } else {
+                return fail("a load of something other than a vertex input or the params");
+            }
+            break;
+        }
+        case 62: {  // OpStore
+            const std::uint32_t ptr = a[0];
+            if (const auto c = chains.find(ptr); c != chains.end()) {
+                if (!builtin.count(c->second.base) || builtin[c->second.base] != 3 || c->second.idx.size() != 1) return fail("a chained store outside ClipDistance");
+                run.clip[c->second.idx[0]] = g0(a[1]);
+            } else if (builtin.count(ptr) && builtin[ptr] == 0) {
+                run.position = get(a[1]);
+            } else if (storage[ptr] == 3 && location.count(ptr)) {
+                run.params[location[ptr]] = get(a[1]);
+            } else {
+                return fail("a store to something other than the position, a param or a clip distance");
+            }
+            break;
+        }
+        case 81: set(a[1], get(a[2])[a[3]]); break;  // OpCompositeExtract
+        case 80: {                                   // OpCompositeConstruct
+            Vec v{};
+            for (std::uint32_t k = 2; k < n - 1 && k < 6; ++k) v[k - 2] = g0(a[k]);
+            val[a[1]] = v;
+            break;
+        }
+        case 124: val[a[1]] = get(a[2]); break;                           // OpBitcast
+        case 112: set(a[1], u(static_cast<float>(g0(a[2])))); break;      // OpConvertUToF
+        case 136: set(a[1], u(f(g0(a[2])) / f(g0(a[3])))); break;         // OpFDiv
+        case 133: set(a[1], u(f(g0(a[2])) * f(g0(a[3])))); break;         // OpFMul
+        case 129: set(a[1], u(f(g0(a[2])) + f(g0(a[3])))); break;         // OpFAdd
+        case 170: set(a[1], g0(a[2]) == g0(a[3])); break;                 // OpIEqual
+        case 171: set(a[1], g0(a[2]) != g0(a[3])); break;                 // OpINotEqual
+        case 176: set(a[1], g0(a[2]) < g0(a[3])); break;                  // OpULessThan
+        case 194: set(a[1], g0(a[2]) >> (g0(a[3]) & 31)); break;          // OpShiftRightLogical
+        case 199: set(a[1], g0(a[2]) & g0(a[3])); break;                  // OpBitwiseAnd
+        case 166: set(a[1], g0(a[2]) | g0(a[3])); break;                  // OpLogicalOr
+        case 169: val[a[1]] = g0(a[2]) ? get(a[3]) : get(a[4]); break;    // OpSelect
+        case 202: {                                                       // OpBitFieldSExtract
+            const std::uint32_t off = g0(a[3]), count = g0(a[4]);
+            if (count == 0 || off + count > 32) return fail("a bit field outside the word");
+            const std::int32_t x = static_cast<std::int32_t>(g0(a[2]) << (32 - off - count)) >> (32 - count);
+            set(a[1], static_cast<std::uint32_t>(x));
+            break;
+        }
+        case 253: case 56: break;  // OpReturn, OpFunctionEnd
+        default: return fail("unsupported opcode " + std::to_string(op));
+        }
+    }
+    run.ok = true;
+    return run;
+}
+
+void formats() {
+    // Word 3 of an element: DST_SEL x,y,z,w in place (0xfac), data format
+    // [18:15], number format [14:12]; past a format's components DST_SEL 1 or 0.
+    const auto w3 = [](std::uint32_t dfmt, std::uint32_t nfmt, std::uint32_t sel) { return dfmt << 15 | nfmt << 12 | sel; };
+    std::vector<std::uint32_t> words3;
+    for (const auto [dfmt, nfmt] : {std::pair{14u, 7u}, {13u, 7u}, {11u, 7u}, {4u, 7u},  // 32-bit floats: the raw bits
+                                    {14u, 4u}, {11u, 4u}, {4u, 5u}, {13u, 5u},            // 32-bit integers
+                                    {14u, 0u}, {4u, 1u},                                  // 32-bit unorm, snorm: the raw bits too
+                                    {10u, 0u}, {3u, 0u}, {1u, 0u},                        // unorm8
+                                    {12u, 5u}, {5u, 5u}, {2u, 5u}}) {                     // sint16
+        int count = dfmt == 14 || dfmt == 10 || dfmt == 12 ? 4 : dfmt == 13 ? 3 : dfmt == 11 || dfmt == 3 || dfmt == 5 ? 2 : 1;
+        std::uint32_t in_place = 0;
+        for (int k = 0; k < count; ++k) in_place |= (4u + static_cast<std::uint32_t>(k)) << (3 * k);
+        // Past the components: all zero, all one, and alternating.
+        std::uint32_t ones = in_place, mixed = in_place;
+        for (int k = count; k < 4; ++k) {
+            ones |= 1u << (3 * k);
+            if (k & 1) mixed |= 1u << (3 * k);
+        }
+        for (const std::uint32_t sel : {in_place, ones, mixed}) {
+            words3.push_back(w3(dfmt, nfmt, sel));
+            CHECK(gcn::vertex_format_descriptor(words3.back()) != 0);
+        }
+    }
+    const std::vector<std::array<std::uint32_t, 4>> raws = {
+        {0x3f800000u, 0xbf000000u, 0x7f7fffffu, 0x00000001u},  // floats, a denormal
+        {0, 255, 128, 1},                                      // unorm8 edges
+        {0xffffu, 0x8000u, 0x7fffu, 0x1234u},                  // sint16 edges
+        {0x12345678u, 0xfffffffeu, 0x80000000u, 0x7fc00000u},  // NaN bits, integers
+    };
+    const std::vector<std::uint32_t> words = program();
+    std::size_t compared = 0;
+    for (std::size_t i = 0; i < words3.size(); ++i) {
+        const std::uint32_t a = words3[i], b = words3[(i + 7) % words3.size()];
+        const Lifted constant = lift_vs(words, options(a, b, false));
+        const Lifted params = lift_vs(words, options(a, b, true));
+        CHECK(lifted(constant.lift) && lifted(params.lift));
+        if (!constant.lift.ok() || !params.lift.ok()) continue;
+        CHECK(proof_says(params.lift, "2 vertex elements converted by their descriptor"));
+        std::array<std::uint32_t, 16> formats{};
+        formats[0] = gcn::vertex_format_descriptor(a);
+        formats[1] = gcn::vertex_format_descriptor(b);
+        for (const auto& ra : raws) {
+            for (const auto& rb : raws) {
+                const std::map<std::uint32_t, std::array<std::uint32_t, 4>> inputs = {{0, ra}, {1, rb}};
+                const VertexRun want = run_vertex(constant.lift.spirv, inputs, {});
+                const VertexRun got = run_vertex(params.lift.spirv, inputs, formats);
+                // The relink's specialization constants win over the params.
+                const std::array<std::uint32_t, 16> garbage = {7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
+                const VertexRun spec = run_vertex(params.lift.spirv, inputs, garbage,
+                                                  {{gcn::kVertexFormatSpecId + 0, formats[0]}, {gcn::kVertexFormatSpecId + 1, formats[1]}});
+                for (const VertexRun* r : {&want, &got, &spec}) {
+                    if (!r->ok) std::fprintf(stderr, "vertex run failed: %s\n", r->error.c_str());
+                    CHECK(r->ok);
+                }
+                if (!want.ok || !got.ok || !spec.ok) return;
+                const bool same = got.position == want.position && got.params == want.params && spec.position == want.position && spec.params == want.params;
+                if (!same) {
+                    std::fprintf(stderr, "formats %08x/%08x: the lift from params differs from the constant-format lift\n", a, b);
+                    ++g_failures;
+                    return;
+                }
+                ++compared;
+            }
+        }
+    }
+    CHECK(compared == words3.size() * raws.size() * raws.size());
+}
+
+void run() { formats(); }
+
+}  // namespace vertex
+
 int main(int argc, char** argv) {
     // Hand-encoded programs first: they need no game files.
+    vertex::run();
     control_flow::run();
     cndmask_modifiers();
     packed_exports();
