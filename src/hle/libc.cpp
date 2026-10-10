@@ -7,6 +7,7 @@
 #include "hle/libc_ctype.h"
 #include "hle/libc_abi.h"
 #include "hle/libc_stdio.h"
+#include "hle/libc_float.h"
 #include "hle/libc_random.h"
 #include "hle/fs.h"
 #include "core/tls_rewrite.h"
@@ -876,21 +877,8 @@ GUEST_ABI int hle_swscanf_body(const Gwchar* s, const Gwchar* fmt, SysvVaList* a
     }
     return sysv_vsscanf(ns.c_str(), nf.c_str(), ap);
 }
-GUEST_ABI double hle_wstod(const Gwchar* s, Gwchar** end, long) {
-    std::string tmp;
-    if (s) {
-        for (const Gwchar* p = s; *p && tmp.size() < 64; ++p) {
-            tmp.push_back(static_cast<char>(*p));
-        }
-    }
-    char* e = nullptr;
-    double v = std::strtod(tmp.c_str(), &e);
-    if (end && s) {
-        *end = const_cast<Gwchar*>(s) + (e ? (e - tmp.c_str()) : tmp.size());
-    }
-    return v;
-}
-GUEST_ABI float hle_wstof(const Gwchar* s, Gwchar** end, long) {
+GUEST_ABI double hle_wstod(const Gwchar* s, Gwchar** end, std::int64_t) { return bb::libc::wide_stod(s, end); }
+GUEST_ABI float hle_wstof(const Gwchar* s, Gwchar** end, std::int64_t) {
     return static_cast<float>(hle_wstod(s, end, 0));
 }
 

@@ -1,4 +1,5 @@
 #include "hle/libc_abi.h"
+#include "hle/libc_float.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -118,5 +119,14 @@ int main() {
     const char16_t nonascii[] = {u'2', 0x0131, u'3', 0};
     const auto stop = parse_signed(nonascii, 10);
     CHECK(stop.value == 2 && stop.end == nonascii + 1);
+    const std::u16string long_float = std::u16string(100, u'0') + u"2.5!";
+    char16_t* float_end;
+    CHECK(wide_stod(long_float.c_str(), &float_end) == 2.5 && *float_end == u'!');
+    const char16_t wide_digit[] = {u'2', 0x0131, u'3', 0};
+    CHECK(wide_stod(wide_digit, &float_end) == 2 && float_end == wide_digit + 1);
+    const char16_t wide_space[] = {0x0120, u'2', 0};
+    CHECK(wide_stod(wide_space, &float_end) == 0 && float_end == wide_space);
+    // Native _WStof also rounds this vector to 1.0. Host strtof would differ.
+    CHECK(static_cast<float>(wide_stod(u"1.0000000596046448", nullptr)) == 1.0f);
     std::puts("libc ABI tests passed");
 }

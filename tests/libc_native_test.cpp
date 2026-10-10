@@ -2,6 +2,7 @@
 // must name the user's decrypted sce_module/libc.elf.
 #include "hle/libc_abi.h"
 #include "hle/libc_stdio.h"
+#include "hle/libc_float.h"
 
 #include <elf.h>
 #include <sys/mman.h>
@@ -194,6 +195,22 @@ int main() {
     for (unsigned c = 1; c < 65536; ++c) {
         const char16_t wide[] = {static_cast<char16_t>(c), u'1', u'2', 0};
         compare_wide(wide, 10);
+    }
+    const auto native_wstod = lib.function<double(*)(const char16_t*, char16_t**, std::int64_t)>("4nRn+exUJAM");
+    const auto native_wstof = lib.function<float(*)(const char16_t*, char16_t**, std::int64_t)>("GUuiOcxL-r0");
+    for (const auto& text : {std::u16string(100, u'0') + u"2.5!", std::u16string(u"1.0000000596046448")}) {
+        char16_t *native_end, *host_end;
+        const double native = native_wstod(text.c_str(), &native_end, 0);
+        const double host = wide_stod(text.c_str(), &host_end);
+        CHECK(native == host && native_end == host_end);
+        CHECK(native_wstof(text.c_str(), &native_end, 0) == static_cast<float>(host));
+        CHECK(native_end == host_end);
+    }
+    for (unsigned c = 128; c < 65536; ++c) {
+        const char16_t text[] = {u'2', static_cast<char16_t>(c), u'3', 0};
+        char16_t *native_end, *host_end;
+        CHECK(native_wstod(text, &native_end, 0) == wide_stod(text, &host_end));
+        CHECK(native_end == host_end && native_end == text + 1);
     }
     const auto lc = lib.function<const Lconv*(*)()>("0hlfW1O4Aa4")();
     const Lconv expected;
