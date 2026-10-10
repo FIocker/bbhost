@@ -326,7 +326,9 @@ GUEST_ABI std::int64_t hle_time(std::int64_t* t) {
 }
 GUEST_ABI std::int64_t hle_clock() {
     g_hle_clock_reads.clock.add();
-    return static_cast<std::int64_t>(std::clock());
+    // Native clock is a tail call to sceKernelGetProcessTime (microseconds),
+    // not the host CRT's CLOCKS_PER_SEC (1000 on Windows).
+    return static_cast<std::int64_t>(host_clock_monotonic_ns() / 1000ull);
 }
 GUEST_ABI double hle_difftime(std::int64_t a, std::int64_t b) {
     return std::difftime(static_cast<std::time_t>(a), static_cast<std::time_t>(b));
