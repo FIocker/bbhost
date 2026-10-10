@@ -29,7 +29,7 @@ std::string translation_switches() {
     };
     std::string s = std::string("offsets=") + (runtime_sample_offsets() ? "1" : "0") + ";half_rtz=" + (native_half_rtz() ? "1" : "0") +
                     ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_min_form() ? "min" : "select") + ";";
-    for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS"}) s += env(name);
+    for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS"}) s += env(name);
     return s;
 }
 
@@ -196,12 +196,25 @@ struct Translator {
     // (sym_key), or "?" for any other write. A V# bound once per draw is sound
     // only if the definitions of its registers that can reach the load are all
     // that V#'s words (see translate()).
+    //
+    // A copy - s_mov_b32/b64 of an SGPR, a v_readlane_b32 of a spill cell,
+    // and the v_writelane_b32 that fills the cell (a definition of the cell,
+    // kept under cell_def's register number) - records what it copies, and
+    // translate() gives it the key that holds there on every path in
+    // (resolve_copy_keys): a V# that comes back from a spill is the V#.
     struct SgprDef {
         std::uint64_t seq;
         std::string key;
         std::uint32_t block;  // start offset of the block it is in (straight-line: 0)
+        int copy_of = -1;     // a copy: the SGPR or cell (cell_def) it copies
     };
     std::map<int, std::vector<SgprDef>> sgpr_defs;
+    static constexpr int kCellDefBase = 1 << 16;
+    static int cell_def(int vgpr, int lane) { return kCellDefBase + vgpr * 64 + lane; }
+    // The definition write_s just made of `dst` copies `src`.
+    void note_copy(int dst, int src) {
+        if (dst < 104 && !in_smrd_write && !sgpr_defs[dst].empty()) sgpr_defs[dst].back().copy_of = src;
+    }
     std::uint64_t def_seq = 0;
     std::uint32_t cur_block = 0;  // block being emitted, in straight-line and forward-only programs
     std::map<std::uint32_t, std::set<std::uint32_t>> block_succ;  // forward-only programs: each block's successors
@@ -1197,14 +1210,16 @@ struct Translator {
         case 1: {  // v_readlane_b32 sdst, vsrc, lane
             int cell_lane = 0;
             Id v;
-            if (spill.reads.count(cur_offset) && in.src0 >= 256 &&
-                const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), cell_lane)) {
+            const bool cell = spill.reads.count(cur_offset) && in.src0 >= 256 &&
+                              const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), cell_lane);
+            if (cell) {
                 v = ld(spill_cell(in.src0 - 256, cell_lane));  // a spilled scalar: the cell its v_writelane_b32 filled
             } else {
                 const Id lane_sel = iand(s1, cu(63));
                 v = m.emit(spv::OpGroupNonUniformShuffle, t_u32, {cu(spv::ScopeSubgroup), s0, lane_sel});
             }
             write_s(in.dst, v);
+            if (cell) note_copy(in.dst, cell_def(in.src0 - 256, cell_lane));
             // A spilled scalar coming back (lane_syms): its resource path too.
             int ln = 0;
             if (in.dst < 104 && in.src0 >= 256 && const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), ln)) {
@@ -1222,6 +1237,7 @@ struct Translator {
             if (cur_offset < kFetchBias && !spill.cells.empty() &&
                 const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), ln) && spill.cells.count({in.dst, ln})) {
                 m.store(spill_cell(in.dst, ln), s0);  // GCN's writelane ignores EXEC: so does the cell
+                sgpr_defs[cell_def(in.dst, ln)].push_back({def_seq++, "?", cur_block, in.src0 < 104 ? static_cast<int>(in.src0) : -1});
             }
             if (const_lane(vop3 ? in.src1 : static_cast<std::uint16_t>(in.src1 - 256), ln)) {
                 const SymVal sv = in.src0 < 104 ? sym_of(in.src0) : SymVal{};
@@ -1809,6 +1825,7 @@ struct Translator {
             const SymVal sv = in.src0 < 104 ? sym_of(in.src0) : SymVal{};
             write_s(in.dst, S0());
             if (in.dst < 104 && sv.kind != SymVal::Unknown) sym[in.dst] = sv;
+            if (in.src0 < 104) note_copy(in.dst, in.src0);
             break;
         }
         case 4: {
@@ -1820,6 +1837,10 @@ struct Translator {
             if (in.dst < 104) {
                 if (s0.kind != SymVal::Unknown) sym[in.dst] = s0;
                 if (s1.kind != SymVal::Unknown) sym[in.dst + 1] = s1;
+            }
+            if (in.src0 + 1 < 104) {
+                note_copy(in.dst, in.src0);
+                note_copy(in.dst + 1, in.src0 + 1);
             }
             break;
         }
@@ -4162,9 +4183,102 @@ struct Translator {
 
 }  // namespace
 
+namespace {
+// Translator::SgprDef: each copy takes the key of what it copies where it
+// runs - the one definition of the source reaching it, or every one reaching
+// it agreeing - or "?" otherwise. The source's value at the program's entry
+// counts as a definition here (user data for a user SGPR, unknown for any
+// other register or a cell), so a path that reaches the copy without one is
+// counted, and a spill of user data is the user data. Copies start unknown
+// and become known only when everything reaching them is, until nothing
+// changes; a copy in a cycle of copies stays unknown. Straight-line programs
+// and guarded blocks (forward-only, or with loops of direct branches, whose
+// back edges the reaching sets follow) only: in the dispatcher's programs
+// copies stay unknown, as every other write.
+// BBHOST_COPY_DEFS=0: every copy is unknown, as before.
+void resolve_copy_keys(Translator& t) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_COPY_DEFS");
+        return !(e && e[0] == '0');
+    }();
+    if (!on) return;
+    std::vector<Translator::SgprDef*> copies;
+    for (auto& [reg, defs] : t.sgpr_defs) {
+        for (auto& d : defs) {
+            if (d.copy_of >= 0) copies.push_back(&d);
+        }
+    }
+    if (copies.empty() || (!t.ordered && !t.dag)) return;
+    const int nuser = t.user_sgpr_count();
+    const auto entry_key = [nuser](int reg) { return reg < nuser ? "u" + std::to_string(reg) + "#0" : std::string("?"); };
+    for (int round = 0; round < 64; ++round) {
+        // The keys reaching each block's entry, the entry values included.
+        std::map<std::uint32_t, std::map<int, std::set<std::string>>> in;
+        if (t.dag && !t.block_starts.empty()) {
+            std::map<std::uint32_t, std::map<int, std::pair<std::uint64_t, std::string>>> last_def;
+            for (const auto& [reg, defs] : t.sgpr_defs) {
+                for (const auto& d : defs) {
+                    auto& slot = last_def[d.block][reg];
+                    if (slot.second.empty() || d.seq > slot.first) slot = {d.seq, d.key};
+                }
+            }
+            auto& entry = in[*t.block_starts.begin()];
+            for (const auto& [reg, defs] : t.sgpr_defs) entry[reg].insert(entry_key(reg));
+            for (bool added = true; added;) {
+                added = false;
+                for (std::uint32_t b : t.block_starts) {
+                    std::map<int, std::set<std::string>> out = in[b];
+                    for (const auto& [reg, def] : last_def[b]) out[reg] = {def.second};
+                    for (std::uint32_t s : t.block_succ[b]) {
+                        for (const auto& [reg, keys] : out) {
+                            std::set<std::string>& into = in[s][reg];
+                            const std::size_t before = into.size();
+                            into.insert(keys.begin(), keys.end());
+                            added |= into.size() != before;
+                        }
+                    }
+                }
+            }
+        }
+        bool changed = false;
+        for (Translator::SgprDef* c : copies) {
+            std::set<std::string> keys;
+            const Translator::SgprDef* latest = nullptr;
+            if (const auto it = t.sgpr_defs.find(c->copy_of); it != t.sgpr_defs.end()) {
+                for (const auto& d : it->second) {
+                    if (d.block == c->block && d.seq < c->seq && (!latest || d.seq > latest->seq)) latest = &d;
+                }
+            }
+            if (latest) {
+                keys.insert(latest->key);
+            } else if (t.dag) {
+                const auto bi = in.find(c->block);
+                const auto ri = bi == in.end() ? decltype(bi->second.end()){} : bi->second.find(c->copy_of);
+                if (bi != in.end() && ri != bi->second.end()) {
+                    keys = ri->second;
+                } else if (!t.sgpr_defs.count(c->copy_of)) {
+                    keys.insert(entry_key(c->copy_of));  // never written: its entry value everywhere
+                } else {
+                    keys.insert("?");  // a block no edge reaches
+                }
+            } else {
+                keys.insert(entry_key(c->copy_of));  // straight-line: nothing before it in the one block
+            }
+            const std::string key = keys.size() == 1 ? *keys.begin() : std::string("?");
+            if (key != c->key) {
+                c->key = key;
+                changed = true;
+            }
+        }
+        if (!changed) break;
+    }
+}
+}  // namespace
+
 TranslateResult translate(const Program& program, const TranslateOptions& options) {
     Translator t(program, options);
     t.run();
+    resolve_copy_keys(t);
     // A bound V# must hold wherever its loads run. The symbolic tracking
     // follows instruction order, not the control-flow graph. In a straight-line
     // or forward-only program (no inlined fetch shader) instruction order is
@@ -4180,8 +4294,10 @@ TranslateResult translate(const Program& program, const TranslateOptions& option
     // - otherwise they must all be.
     // Elsewhere (the dispatcher loop, the fetch shader's call and return)
     // every definition of those registers must be. A user-data V#'s registers
-    // must not be written where it counts. Failing that, the V# goes back to
-    // the page-table path.
+    // must not be written where it counts, except by a copy of the same user
+    // data. A copy's definition is what it copies (resolve_copy_keys), so a V#
+    // that went through a spill or an s_mov is still the V#. Failing that, the
+    // V# goes back to the page-table path.
     TranslateOptions again = options;
     const bool ordered = t.ordered;
     // Programs of guarded blocks: the definitions reaching each block's entry,
@@ -4234,7 +4350,7 @@ TranslateResult translate(const Program& program, const TranslateOptions& option
                 if (reach && d.block != site_block) continue;
                 if (d.seq < site_seq && (!latest || d.seq > latest->seq)) latest = &d;
             }
-            if (latest && latest->block == site_block) return expect[0] == 'l' && latest->key == expect;
+            if (latest && latest->block == site_block) return expect != "?" && latest->key == expect;
             if (!reach) return true;
             {
                 const auto bi = reach_in.find(site_block);
@@ -4242,14 +4358,14 @@ TranslateResult translate(const Program& program, const TranslateOptions& option
                 const auto ri = bi->second.find(reg);
                 if (ri == bi->second.end()) return true;
                 for (const std::string& key : ri->second) {
-                    if (expect[0] != 'l' || key != expect) return false;
+                    if (expect == "?" || key != expect) return false;
                 }
                 return true;
             }
         }
         for (const auto& d : it->second) {
             if (ordered && d.seq > site_seq) continue;
-            if (expect[0] != 'l' || d.key != expect) return false;
+            if (expect == "?" || d.key != expect) return false;
         }
         return true;
     };

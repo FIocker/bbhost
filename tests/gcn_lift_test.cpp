@@ -2129,7 +2129,9 @@ constexpr std::uint32_t kSampleLz = 39;                                        /
 
 // Translates as the renderer's no-fallback variant (user SGPRs s0..s3,
 // interpolation at the centre) and lifts against that reference.
-gcn::LiftResult lift_words(const std::vector<std::uint32_t>& words, gcn::Program* out = nullptr) {
+// `exclude`: resource paths left to the page table (cb_ssbo_exclude).
+gcn::LiftResult lift_words(const std::vector<std::uint32_t>& words, gcn::Program* out = nullptr, gcn::TranslateResult* reference = nullptr,
+                           const std::vector<std::string>& exclude = {}) {
     const gcn::Program p = gcn::decode(words.data(), words.size());
     CHECK(p.errors.empty());
     if (out) *out = p;
@@ -2140,9 +2142,11 @@ gcn::LiftResult lift_words(const std::vector<std::uint32_t>& words, gcn::Program
     o.descriptor_set = 1;
     o.cb_ssbo = true;
     o.cb_no_fallback = true;
+    o.cb_ssbo_exclude = exclude;
     const gcn::TranslateResult ref = gcn::translate(p, o);
     if (!ref.ok()) std::fprintf(stderr, "reference failed: %s\n", ref.errors[0].c_str());
     CHECK(ref.ok());
+    if (reference) *reference = ref;
     return gcn::lift_pixel_shader(p, o, ref);
 }
 
@@ -2325,9 +2329,10 @@ void spills() {
 }
 
 void descriptor_loads() {
-    // s[2:3] copied to s[20:21]: the reference stops binding the table (its
-    // registers are written) and walks the page table for both loads. They
-    // are a T# and an S#, which the sample binds by path.
+    // s[2:3] copied to s[20:21], the table left to the page table (as the
+    // translator leaves a V# it cannot show holds at every load): the
+    // reference walks the page table for both loads. They are a T# and an S#,
+    // which the sample binds by path.
     const auto sample = [](const std::function<void(Asm&)>& after) {
         Asm a;
         a.sop1(kSMov, 20, 2);
@@ -2343,15 +2348,120 @@ void descriptor_loads() {
         a.endpgm();
         return a.w;
     };
-    const gcn::LiftResult ok = lift_words(sample([](Asm&) {}));
+    const std::vector<std::string> table = {"user_sgpr[2]"};
+    const gcn::LiftResult ok = lift_words(sample([](Asm&) {}), nullptr, nullptr, table);
     CHECK(lifted_valid(ok));
     CHECK(proof_has(ok, "2 scalar loads the reference walks the page table for hold descriptors only"));
     // A word of them read as data: the reference reads it from guest memory.
-    CHECK(rejected_with(lift_words(sample([](Asm& a) {
-                            a.vop1(kVMov, 6, 16);       // v_mov_b32 v6, s16 (a copy is still a descriptor)
-                            a.vop2(kVAdd, 0, kV + 0, 6);  // v_add_f32 v0, v0, v6
-                        })),
-                        "data from a scalar load the reference walks the page table for"));
+    const auto as_data = [](Asm& a) {
+        a.vop1(kVMov, 6, 16);         // v_mov_b32 v6, s16 (a copy is still a descriptor)
+        a.vop2(kVAdd, 0, kV + 0, 6);  // v_add_f32 v0, v0, v6
+    };
+    CHECK(rejected_with(lift_words(sample(as_data), nullptr, nullptr, table), "data from a scalar load the reference walks the page table for"));
+    // Not excluded, the copies of s[2:3] are its definitions (the translator's
+    // resolve_copy_keys): the table is bound, and its words are data like any.
+    gcn::TranslateResult ref;
+    const gcn::LiftResult bound = lift_words(sample(as_data), nullptr, &ref);
+    CHECK(lifted_valid(bound));
+    CHECK(ref.buffers.size() == 1 && ref.buffers[0].path.str() == "user_sgpr[2]" && ref.buffer_at.count(8) && ref.buffer_at.count(12));
+}
+
+// Copies of a V#: a spill to lanes of a VGPR and back (v_writelane_b32 /
+// v_readlane_b32 of a spill cell), or s_mov, define what they copy, so a
+// constant buffer read through a copy of its V# is bound - where every copy
+// reaching the load copies that V#. Otherwise it stays on the page table and
+// its data is not lifted.
+void copies() {
+    constexpr std::uint32_t kBufferLoad = 8;  // SMRD s_buffer_load_dword
+    // s[16:19] (the V# at dword 4 of the table s[2:3]) and s[24:27] (at dword
+    // 8) loaded; `spill` parks one in lanes 4-7 of v3; s[16:19] clobbered;
+    // s[20:23] from the lanes; s_buffer_load_dword s0, s[20:23], 0x2 as data.
+    const auto program = [](const std::function<void(Asm&)>& spill) {
+        Asm a;
+        a.smrd(kLoadX4, 16, 2, 4);
+        a.smrd(kLoadX4, 24, 2, 8);
+        a.sopp(kWaitcnt, 0);
+        spill(a);
+        for (std::uint32_t k = 0; k < 4; ++k) a.sop1(kSMov, 16 + k, kC0);  // s16..s19 = 0
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop2(kReadlane, 20 + k, kV + 3, kC0 + 4 + k);  // v_readlane_b32 s(20+k), v3, 4+k
+        a.smrd(kBufferLoad, 0, 20, 2);
+        a.sopp(kWaitcnt, 0);
+        a.vop1(kVMov, 0, 0);  // v_mov_b32 v0, s0
+        a.exp_mrt0(0, 0, 0, 0);
+        a.endpgm();
+        return a.w;
+    };
+    const auto park = [](Asm& a, std::uint32_t s) {
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop2(kWritelane, 3, s + k, kC0 + 4 + k);  // v_writelane_b32 v3, s(s+k), 4+k
+    };
+    const auto bound_at = [](const gcn::TranslateResult& ref, std::uint32_t at, const char* path) {
+        const auto it = ref.buffer_at.find(at);
+        return it != ref.buffer_at.end() && it->second < ref.buffers.size() && ref.buffers[it->second].path.str() == path;
+    };
+    {  // straight-line: the cell holds the V# at dword 4
+        gcn::TranslateResult ref;
+        const gcn::LiftResult r = lift_words(program([&](Asm& a) { park(a, 16); }), nullptr, &ref);
+        CHECK(lifted_valid(r));
+        CHECK(bound_at(ref, 0x3c, "user_sgpr[2]->load(+16)"));  // the path counts bytes
+        CHECK(ref.walks.empty());
+    }
+    // An if on user data whose arms park different V#s: the cell is one or
+    // the other, so the load stays on the page table (the walk's order would
+    // have said the else arm's).
+    const auto two_arms = [&](std::uint32_t then_v, std::uint32_t else_v) {
+        return program([&, then_v, else_v](Asm& a) {
+            a.sopc(kSCmpEqU32, 0, kC0);  // s_cmp_eq_u32 s0, 0
+            const std::size_t branch = a.w.size();
+            a.sopp(kScc1, 0);  // patched below
+            park(a, then_v);
+            const std::size_t jump = a.w.size();
+            a.sopp(kBranch, 0);
+            const std::uint32_t else_at = a.at();
+            park(a, else_v);
+            const std::uint32_t join = a.at();
+            a.w[branch] = 0xbf800000u | kScc1 << 16 | static_cast<std::uint16_t>((else_at - static_cast<std::uint32_t>(branch * 4) - 4) / 4);
+            a.w[jump] = 0xbf800000u | kBranch << 16 | static_cast<std::uint16_t>((join - static_cast<std::uint32_t>(jump * 4) - 4) / 4);
+        });
+    };
+    {
+        gcn::TranslateResult ref;
+        const std::vector<std::uint32_t> w = two_arms(16, 24);
+        CHECK(rejected_with(lift_words(w, nullptr, &ref), "data from a scalar load the reference walks the page table for"));
+        bool walked = false;
+        for (const auto& [why, n] : ref.walks) walked |= why.find("registers reused") != std::string::npos;
+        CHECK(walked);
+    }
+    {  // both arms park the same V#: bound
+        gcn::TranslateResult ref;
+        const std::vector<std::uint32_t> w = two_arms(16, 16);
+        CHECK(lifted_valid(lift_words(w, nullptr, &ref)));
+        CHECK(ref.walks.empty());
+    }
+    {  // user data: the V# s[0:3] parked, s0 clobbered, back in s[8:11]
+        Asm a;
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop2(kWritelane, 3, k, kC0 + k);
+        a.sop1(kSMov, 0, kC0);
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop2(kReadlane, 8 + k, kV + 3, kC0 + k);
+        a.smrd(kBufferLoad, 4, 8, 1);  // s_buffer_load_dword s4, s[8:11], 0x1
+        a.sopp(kWaitcnt, 0);
+        a.vop1(kVMov, 0, 4);
+        a.exp_mrt0(0, 0, 0, 0);
+        a.endpgm();
+        gcn::TranslateResult ref;
+        CHECK(lifted_valid(lift_words(a.w, nullptr, &ref)));
+        CHECK(bound_at(ref, 0x24, "user_sgpr[0]"));
+        // ... but not when the clobber reaches the load instead of the copy.
+        Asm b;
+        b.sop1(kSMov, 0, kC0);
+        b.smrd(kBufferLoad, 4, 0, 1);  // s_buffer_load_dword s4, s[0:3], 0x1
+        b.sopp(kWaitcnt, 0);
+        b.vop1(kVMov, 0, 4);
+        b.exp_mrt0(0, 0, 0, 0);
+        b.endpgm();
+        gcn::TranslateResult ref_b;
+        lift_words(b.w, nullptr, &ref_b);
+        CHECK(!bound_at(ref_b, 4, "user_sgpr[0]"));
+    }
 }
 
 void cselect() {
@@ -2444,6 +2554,7 @@ void lshl_b64() {
 void run() {
     spills();
     descriptor_loads();
+    copies();
     cselect();
     lshl_b64();
 }
