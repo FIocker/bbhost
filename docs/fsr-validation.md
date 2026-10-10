@@ -58,7 +58,6 @@ rates alone do not establish complete scanouts, perceived smoothness or latency.
 | FSR 3 Quality / 2x | 60 | 58.32 | 118.49 | 11.25 ms |
 | Reconstruction off / FSR 2x | 30 | 30.00 | 60.00 | 18.64 ms |
 | FSR 4 Quality / FSR 2x | 30 | 30.00 | 60.00 | 24.71 ms |
-
 | DLSS Quality / DLSS 2x regression | 30 | 30.00 | 60.00 | 24.60 ms |
 
 All measured windows have no missing display intervals. Generation windows
