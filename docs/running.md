@@ -26,7 +26,8 @@ And a PC with:
 
 - x86-64 Windows 10/11 or Linux
 - a GPU with a Vulkan 1.3 driver (recent NVIDIA, AMD or Intel; the Steam Deck works)
-- 16 GB of RAM and 8 GB of video memory are recommended
+- 16 GB of RAM and 8 GB of video memory are recommended; 6 GB NVIDIA cards
+  play at 1080p too
 
 ## First run
 
@@ -156,10 +157,16 @@ fifth of the size on disk, written over a few seconds in the background.
 `BBHOST_F12_TEXTURES=1` adds every texture the frame sampled, and the game
 pauses while it writes them.
 
-**Black or broken image in the world.** On cards with little video memory,
-check the log for `video memory is full`. bbhost sizes its own buffers to the
-card's budget and falls back to system memory rather than failing, but other
-programs holding video memory reduce what is left.
+**Black or broken image in the world, or slow on a card with little video
+memory.** bbhost follows the driver's video memory budget as the game runs:
+it keeps the last 512 MiB for render targets, puts textures in system memory
+when the card is down to that, and moves them back once there is room. Every
+five seconds the log says `video memory: headroom ...`; look there, and for
+`video memory is full`, before anything else. Other programs holding video
+memory (browsers, OBS, a second game) shrink the budget. On a GPU with under
+7.5 GB free bbhost also holds less memory ahead (the log says `small video
+memory`). `BBHOST_VRAM_RESERVE_MB=0` goes back to placing everything until
+an allocation fails, `BBHOST_SMALL_VRAM=0` turns the small mode off.
 
 **AMD on Linux, no picture.** AMD's kernel driver only imports anonymous
 memory, so bbhost passes the game's memory to the GPU through `/dev/udmabuf`.
