@@ -206,35 +206,66 @@ const bool g_present_on_arrival = [] {
 //   menutap <button> [<ms>]  the same, only while one of the game's menus has the
 //                         input - the way through the title that cannot press
 //                         anything in the world, however late it arrives
-// The folder is read ten times a second, on the flips.
+// A thread of its own (bb-test-req) reads the folder ten times a second and
+// queues what it finds; the flips carry the queue out. Read on the flip, the
+// folder held the flip clock whenever the file system was slow to answer: on
+// NFS, a listing queued behind a shader cache's write-back stopped every flip
+// for 1.5 s, the harness runs' freeze every ~90 s.
+struct TestRequest {
+    std::string name, verb, arg, arg2;
+};
+std::mutex g_test_req_mu;
+std::deque<TestRequest> g_test_reqs;  // under g_test_req_mu
+
+void test_requests_read(const std::string& dir) {
+    namespace fs = std::filesystem;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::error_code ec;
+        std::vector<fs::path> found;
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            if (it->path().extension() == ".req") found.push_back(it->path());
+        }
+        std::sort(found.begin(), found.end());
+        for (const fs::path& p : found) {
+            TestRequest r;
+            r.name = p.filename().string();
+            {
+                std::ifstream f(p);
+                f >> r.verb >> r.arg >> r.arg2;
+            }
+            fs::remove(p, ec);
+            std::lock_guard<std::mutex> lk(g_test_req_mu);
+            g_test_reqs.push_back(std::move(r));
+        }
+    }
+}
+
 void test_requests(std::uint64_t display_va, std::uint64_t count) {
     static const std::string dir = [] {
         const char* e = std::getenv("BBHOST_TEST_REQUESTS");
         return std::string(e && *e ? e : "");
     }();
     if (dir.empty()) return;
-    // The vblank's flips and the uncapped ones come here from two threads.
+    static std::once_flag reader;
+    std::call_once(reader, [] {
+        std::thread([] {
+            host_thread_set_name("bb-test-req");
+            test_requests_read(dir);
+        }).detach();
+    });
+    // The vblank's flips and the uncapped ones come here from two threads:
+    // one at a time carries the queue out, in order.
     static std::mutex mu;
     std::unique_lock<std::mutex> lock(mu, std::try_to_lock);
     if (!lock.owns_lock()) return;
-    static std::chrono::steady_clock::time_point last{};
-    const auto now = std::chrono::steady_clock::now();
-    if (now - last < std::chrono::milliseconds(100)) return;
-    last = now;
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    std::vector<fs::path> requests;
-    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-        if (it->path().extension() == ".req") requests.push_back(it->path());
+    std::deque<TestRequest> todo;
+    {
+        std::lock_guard<std::mutex> lk(g_test_req_mu);
+        todo.swap(g_test_reqs);
     }
-    std::sort(requests.begin(), requests.end());
-    for (const fs::path& p : requests) {
-        std::string verb, arg, arg2;
-        {
-            std::ifstream f(p);
-            f >> verb >> arg >> arg2;
-        }
-        fs::remove(p, ec);
+    for (const TestRequest& r : todo) {
+        const std::string &verb = r.verb, &arg = r.arg, &arg2 = r.arg2;
         if (verb == "dump" && !arg.empty()) {
             const bool ok = display_va && host_gpu_dump_display(display_va, arg.c_str());
             host_log("test: frame dump at flip %llu to %s%s", static_cast<unsigned long long>(count), arg.c_str(), ok ? "" : " failed");
@@ -257,7 +288,7 @@ void test_requests(std::uint64_t display_va, std::uint64_t count) {
                          static_cast<unsigned long long>(count));
             }
         } else {
-            host_log("test: request %s not understood: %s %s", p.filename().string().c_str(), verb.c_str(), arg.c_str());
+            host_log("test: request %s not understood: %s %s", r.name.c_str(), verb.c_str(), arg.c_str());
         }
     }
 }
