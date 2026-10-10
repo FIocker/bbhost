@@ -212,6 +212,11 @@ int main() {
         CHECK(native_wstod(text, &native_end, 0) == wide_stod(text, &host_end));
         CHECK(native_end == host_end && native_end == text + 1);
     }
+    const auto native_strerror = lib.function<const char*(*)(int)>("RIa6GnWp+iU");
+    CHECK(std::strcmp(native_strerror(11), "Resource deadlock avoided") == 0);
+    CHECK(std::strcmp(native_strerror(35), "Resource temporarily unavailable") == 0);
+    CHECK(std::strcmp(native_strerror(63), "File name too long") == 0);
+    CHECK(std::strcmp(native_strerror(66), "Directory not empty") == 0);
     const auto lc = lib.function<const Lconv*(*)()>("0hlfW1O4Aa4")();
     const Lconv expected;
     CHECK(std::strcmp(lc->decimal_point, expected.decimal_point) == 0);
