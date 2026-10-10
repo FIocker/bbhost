@@ -643,6 +643,62 @@ class FrameTest(unittest.TestCase):
         self.assertEqual((len(tiny["blocks"]), len(tiny["blocks"][0])), (2, 3))
         self.assertAlmostEqual(tiny["max_block"], 10.0, places=3)
 
+    def test_frames_are_scored_on_the_picture(self):
+        """A dump is the whole display buffer; the picture is its top-left at
+        the render size. The black 4K world with a grey band, scored over the
+        buffer, read brighter than a good frame: cropped it does not, and the
+        band's edge is flagged."""
+        def frame(dw, dh, w, h, pixel, outside=200):
+            px = bytearray()
+            for y in range(dh):
+                for x in range(dw):
+                    v = pixel(x, y) if x < w and y < h else outside
+                    px += bytes((v, v, v))
+            return ac.Image(dw, dh, bytes(px))
+        # The buffer around the picture holds what the game left there.
+        black = frame(96, 60, 64, 40, lambda x, y: 3 if x < 48 else 160, outside=230)
+        good = frame(96, 60, 64, 40, lambda x, y: 60 + (x * 7 + y * 3) % 23, outside=10)
+        self.assertGreater(ac.image_stats(black)["mean_luma"], ac.image_stats(good)["mean_luma"])  # the old reading
+        b, g = ac.crop_image(black, 64, 40), ac.crop_image(good, 64, 40)
+        self.assertEqual((b.width, b.height), (64, 40))
+        self.assertLess(ac.image_stats(b)["mean_luma"], ac.image_stats(g)["mean_luma"])
+        self.assertAlmostEqual(ac.image_stats(b)["mean_luma"], (48 * 3 + 16 * 160) / 64.0, places=1)
+        edge = ac.band_edges(b)["column"]
+        self.assertTrue(edge["flagged"])
+        self.assertEqual((edge["at"], edge["from"], edge["to"]), (48, 3.0, 160.0))
+        self.assertFalse(ac.band_edges(b)["row"]["flagged"])
+        self.assertFalse(any(e["flagged"] for e in ac.band_edges(g).values()))
+        # A scene's own edge runs part of the way: a lit doorway in the middle rows.
+        door = ac.crop_image(frame(64, 40, 64, 40, lambda x, y: 200 if 30 <= x < 40 and 12 <= y < 28 else 20), 64, 40)
+        self.assertFalse(any(e["flagged"] for e in ac.band_edges(door).values()))
+        # A band across: the bottom rows grey (an ultrawide's).
+        low = ac.crop_image(frame(64, 40, 64, 40, lambda x, y: 4 if y < 27 else 150), 64, 40)
+        e = ac.band_edges(low)
+        self.assertTrue(e["row"]["flagged"])
+        self.assertEqual(e["row"]["at"], 27)
+        self.assertFalse(e["column"]["flagged"])
+        # A crop no smaller than the frame is the frame; the same without numpy.
+        self.assertIs(ac.crop_image(g, 64, 40), g)
+        self.assertIs(ac.crop_image(g, 0, 0), g)
+        saved = ac.np
+        try:
+            ac.np = None
+            slow_crop = ac.crop_image(black, 64, 40)
+            slow = ac.band_edges(slow_crop)
+        finally:
+            ac.np = saved
+        self.assertEqual(slow_crop.rgb, b.rgb)
+        self.assertEqual(slow["column"]["at"], 48)
+        self.assertTrue(slow["column"]["flagged"])
+        self.assertFalse(slow["row"]["flagged"])
+        # A black picture is a problem of its own; a dark scene is not.
+        rep = {"run": {}, "passes": {}, "areas": {"x": {"status": "ok", "frames": {
+            "a": {"ok": True, "stats": {"mean_luma": 0.5, "width": 4, "height": 4}, "bands": {}},
+            "b": {"ok": True, "stats": {"mean_luma": 19.0, "width": 4, "height": 4}, "bands": {}}}}}}
+        self.assertEqual(ac.problems_of(rep), ["x: frame a is black (luma 0.5)"])
+        self.assertIn("BLACK", ac.frame_note(rep["areas"]["x"]["frames"]["a"]))
+        self.assertNotIn("BLACK", ac.frame_note(rep["areas"]["x"]["frames"]["b"]))
+
     def test_verdict_against_the_noise_floor(self):
         noise = [{"changed_pct": 12.0, "max_block": 3.0, "blurred_pct": 1.0, "mean_signed": 0.4}]
         within = [{"changed_pct": 14.0, "max_block": 3.5, "blurred_pct": 1.2, "mean_signed": 0.5}]
@@ -753,6 +809,7 @@ out = sys.stdout
 def log(s):
     out.write("[bbhost] " + s + "\n")
 log("bbhost v9.9.9-test (abc, Linux x86-64)")
+log("resolution: display buffers 8x8, rendering 4x4")
 log("world: the first in-game frame, flip 900, 30.0 s after start")
 t, flip, block, step = 1000.0, 1000, "15000000", 0
 at = ["1.000", "2.000", "3.000"]
@@ -792,8 +849,9 @@ for line in tour:
             t += 1
             flip += 60
     elif w[0] == "dump":
-        p = dumps / (w[1] + ".ppm")
-        p.write_bytes(b"P6\n4 4\n255\n" + bytes([100]) * 48)
+        p = dumps / (w[1] + ".ppm")  # the picture top-left in a display buffer twice its size
+        p.write_bytes(b"P6\n8 8\n255\n" + b"".join(bytes([100]) * 12 + bytes([255]) * 12 if y < 4 else bytes([255]) * 24 for y in range(8)))
+        (Path("build") / "frame-1000.ppm").write_bytes(b"P6\n1 1\n255\n" + bytes(3))  # BBHOST_DUMP_FRAME's own, under the cwd
         log("test: frame dump at flip %d to %s" % (flip, p))
     elif w[0] == "capture" and int(w[1]) > 0:
         for k in range(min(2, int(w[1]))):
@@ -839,7 +897,7 @@ class EndToEndTest(unittest.TestCase):
         d = self.d
         args = ["run", "--bbhost", str(d / "build" / "bbhost"), "--app0", str(d / "app0"), "--eboot", str(d / "eboot.bin"),
                 "--seed", str(d / "seed"), "--out", str(d / name), "--areas", "central-yharnam,moonside-lake", "--numa-node", "none",
-                "--captures", "2", "--capture-window", "3", "--settle", "3", "--measure", "6"]
+                "--captures", "2", "--capture-window", "3", "--settle", "3", "--measure", "6", "--width", "4", "--height", "4"]
         import contextlib
         import io
         with contextlib.redirect_stdout(io.StringIO()):
@@ -856,7 +914,10 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(cy["window"]["flips"], 5 * 60)  # 6 s, the first left out
         self.assertTrue(cy["window"]["exact_percentiles"])
         self.assertEqual(cy["window"]["draws"]["lifted"], 5 * 6000)
-        self.assertEqual(cy["frames"]["a"]["stats"]["mean_luma"], 100.0)
+        self.assertEqual(cy["frames"]["a"]["stats"]["mean_luma"], 100.0)  # the picture, not the buffer around it
+        self.assertEqual(cy["frames"]["a"]["crop"], [4, 4])
+        self.assertFalse(any(e["flagged"] for e in cy["frames"]["a"]["bands"].values()))
+        self.assertIn("build/frame-1000.ppm", rep["passes"]["perf"]["build_files"])  # relative to the pass's folder
         self.assertEqual(cy["arrival"]["new_pixel_shaders"]["lifted"], 1)
         self.assertEqual(cy["capture_pass"]["status"], "ok")
         self.assertEqual(cy["lift"]["totals"], {"identical": 2})

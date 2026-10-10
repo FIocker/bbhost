@@ -83,7 +83,12 @@ For each place the report says:
 - on arrival (the travel and the settle): the loads, pipeline compiles over
   30 ms, flip stalls over 40 ms, main-loop frames over 33 ms, and the pixel
   shaders met for the first time there, lifted or not and why;
-- the frames and their brightness;
+- the frames and their brightness, over the picture: a dump is the whole
+  display buffer (5120x2160 on Linux), and the game renders into its top-left
+  corner at the run's render size. A band edge - a step in brightness between
+  two neighbouring columns or rows that runs all the way across the picture,
+  as the 4K world that was black left of three quarters of the width had - is
+  flagged, and so is a black picture;
 - memory as the place was left, from the 5-second report: the device-local
   heaps' use, the image heap and everything bbhost allocated, and what the
   place added since the place before;
@@ -145,6 +150,11 @@ These are for test runs and off by default.
 | `BBHOST_TEST_REQUESTS=<dir>` | the game carries out requests a harness leaves there: a frame dump, a capture budget |
 | `BBHOST_CAPTURE_DRAW=*ps` | a draw capture of the first draw of each pixel shader |
 | `BBHOST_CAPTURE_ARMED=1` | captures only while a request has allowed them |
+
+Switches given with `--env` that write files relative to the game's folder -
+`BBHOST_DUMP_FRAME` (`build/frame-N.ppm`), `BBHOST_DUMP_AT_DRAW`
+(`build/rtd-*.ppm`) - write into the pass's own `build/`, which the run makes;
+the report lists what landed there.
 
 The flip log's `pixel shaders:` line, every 300 flips in any run, gives the
 same split of draws by pixel shader.

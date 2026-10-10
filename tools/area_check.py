@@ -43,9 +43,10 @@ main loop's work, the draws by how their pixel shader ran (lifted, translated,
 the page-table fallback's translation, none) and the draw failures by reason;
 for the arrival (the travel and the settle): the loads, pipeline compiles over
 30 ms, flip stalls over 40 ms, main-loop frames over 33 ms, and the pixel
-shaders met for the first time there, lifted or not and why; the frames;
-memory as the place was left; and the lift results. report.json holds all of
-it, summary.txt the same to read.
+shaders met for the first time there, lifted or not and why; the frames,
+scored over the picture (the top-left of the dumped display buffer at the
+render size) with band edges flagged; memory as the place was left; and the
+lift results. report.json holds all of it, summary.txt the same to read.
 
 A place counts only where the player was (presence): every mark in the
 place's map, a view's within VIEW_REACH of its standpoint, and from the
@@ -534,6 +535,7 @@ class Log:
         m = RENDERING.search(line)
         if m:
             self.rendering = [int(m.group(1)), int(m.group(2))]
+            self._ev(i, "rendering", size=list(self.rendering))
         if FATAL.search(line):
             self.fatal.append(line.strip()[:300])
         elif PROBLEM.search(line):
@@ -553,6 +555,17 @@ class Log:
             if d.get("t") is not None:
                 t = d["t"]
         return t
+
+    def rendering_at(self, index):
+        """The size the game rendered at as of a line: the last 'rendering
+        WxH' before it, or the run's last."""
+        size = None
+        for i, k, d in self.events:
+            if i > index:
+                break
+            if k == "rendering":
+                size = d["size"]
+        return size or self.rendering
 
     def seconds_between(self, start, end):
         """The seconds wholly inside (start, end): the first `frames:` line after
@@ -812,10 +825,11 @@ def area_report(log, area, seg, kind):
             rep["window"].update(hitches(inside))
             rep["window"]["problems"] = [d["text"] for _, k, d in inside if k == "problem"][:20]
         rep["frames"] = {}
-        for _, k, d in log.between(w1, marks.get("end", end), {"dump"}):
+        for i, k, d in log.between(w1, marks.get("end", end), {"dump"}):
             name = Path(d["path"]).stem
             prefix = area.id + "-"
-            rep["frames"][name[len(prefix):] if name.startswith(prefix) else name] = {"path": d["path"], "flip": d["flip"], "ok": d["ok"]}
+            rep["frames"][name[len(prefix):] if name.startswith(prefix) else name] = {
+                "path": d["path"], "flip": d["flip"], "ok": d["ok"], "crop": log.rendering_at(i)}
         if not rep["window"] and rep["status"] == "ok":
             rep["status"] = "no window"
     elif kind == "perf" and rep["status"] == "ok":
@@ -915,6 +929,83 @@ def image_stats(img):
         mean = [sum(img.rgb[c::3]) / n for c in range(3)]
     return {"width": img.width, "height": img.height, "mean_rgb": [round(v, 2) for v in mean],
             "mean_luma": round(0.299 * mean[0] + 0.587 * mean[1] + 0.114 * mean[2], 2)}
+
+
+def crop_image(img, w, h):
+    """The top-left w x h of a dumped frame: the picture, where bbhost's
+    display buffers are the largest size the Resolution setting offers
+    (5120x2160 on Linux) and the game renders into their corner. Scored over
+    the whole buffer, the black 4K frames once read brighter than the good
+    ones."""
+    if not w or not h or (w >= img.width and h >= img.height):
+        return img
+    w, h = min(w, img.width), min(h, img.height)
+    if np is not None:
+        a = np.frombuffer(img.rgb, np.uint8).reshape(img.height, img.width, 3)[:h, :w]
+        return Image(w, h, a.tobytes())
+    stride = img.width * 3
+    return Image(w, h, b"".join(bytes(img.rgb[y * stride:y * stride + w * 3]) for y in range(h)))
+
+
+# A band edge: a step in the picture's luma between two neighbouring columns
+# (or rows) that runs all the way down (or across) - the black world with a
+# grey band over its right quarter at 4K. A scene's own edges (a doorway, a
+# horizon) run part of the way or slant. Flagged: a step of BAND_MIN levels
+# or more that BAND_AGREE of BAND_SLABS slabs across the picture share, the
+# same way and at least half as large. Measured on the 1,185 frames of 100
+# earlier runs: the broken 4K and ultrawide frames step 74-197 levels in all
+# eight slabs; no other frame has a step of 12 levels shared by seven slabs
+# (the nearest: a loading screen's rule, 68 levels across six).
+BAND_MIN = 12.0
+BAND_SLABS = 8
+BAND_AGREE = 7
+# A picture this dark is black: nothing drawn (the 4K Forbidden Woods' 0.5).
+# The darkest scenes of earlier runs read 18 or more.
+BLACK_LUMA = 2.0
+
+
+def band_edges(img):
+    """{'column': edge, 'row': edge}: each axis's largest step, where it is
+    (at: the first column or row past it), its luma before and after, how
+    many slabs agree and whether that is a band edge."""
+    w, h = img.width, img.height
+    if w < 2 or h < 2:
+        return {}
+    if np is not None:
+        a = np.frombuffer(img.rgb, np.uint8).reshape(h, w, 3).astype(np.float32)
+        lum = a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+        rows = None
+    else:
+        d = img.rgb
+        rows = [[0.299 * d[k] + 0.587 * d[k + 1] + 0.114 * d[k + 2] for k in range((y * w) * 3, (y * w + w) * 3, 3)] for y in range(h)]
+    out = {}
+    for axis in ("column", "row"):
+        if np is not None:
+            m = lum if axis == "column" else lum.T  # m[i][j]: j along the axis the edge crosses
+            n, length = m.shape
+            prof = m.mean(axis=0).tolist()
+        else:
+            m = rows if axis == "column" else [list(c) for c in zip(*rows)]
+            n, length = len(m), len(m[0])
+            prof = [sum(r[j] for r in m) / n for j in range(length)]
+        if length < 2:
+            continue
+        steps = [prof[j + 1] - prof[j] for j in range(length - 1)]
+        j = max(range(length - 1), key=lambda k: abs(steps[k]))
+        slabs = min(BAND_SLABS, n)
+        agree = 0
+        for k in range(slabs):
+            lo, hi = k * n // slabs, (k + 1) * n // slabs
+            if np is not None:
+                sk = float((m[lo:hi, j + 1] - m[lo:hi, j]).mean())
+            else:
+                sk = sum(m[i][j + 1] - m[i][j] for i in range(lo, hi)) / (hi - lo)
+            if sk * steps[j] > 0 and abs(sk) >= 0.5 * abs(steps[j]):
+                agree += 1
+        out[axis] = {"axis": axis, "at": j + 1, "from": round(prof[j], 1), "to": round(prof[j + 1], 1), "step": round(steps[j], 1),
+                     "agree": agree, "slabs": slabs,
+                     "flagged": abs(steps[j]) >= BAND_MIN and agree >= min(BAND_AGREE, slabs)}
+    return out
 
 
 GRID = 8  # the frame in GRID x GRID blocks for the block table
@@ -1205,7 +1296,7 @@ def compare_frames(a_dirs, b_dirs, area_ids, out_dir=None):
             rep = json.loads((Path(run_dir) / "report.json").read_text())
         except (OSError, ValueError):
             return {}
-        return {aid: {n: f["path"] for n, f in (a.get("frames") or {}).items() if f.get("ok")}
+        return {aid: {n: (f["path"], tuple(f.get("crop") or (0, 0))) for n, f in (a.get("frames") or {}).items() if f.get("ok")}
                 for aid, a in rep.get("areas", {}).items() if a.get("status") == "ok"}
     fa = [frames_of(d) for d in a_dirs]
     fb = [frames_of(d) for d in b_dirs]
@@ -1214,7 +1305,7 @@ def compare_frames(a_dirs, b_dirs, area_ids, out_dir=None):
     def load(p):
         if p not in cache:
             try:
-                cache[p] = read_ppm(p)
+                cache[p] = crop_image(read_ppm(p[0]), *p[1])
             except (OSError, ValueError):
                 cache[p] = None
         return cache[p]
@@ -1275,6 +1366,10 @@ def summary_text(report):
                 "done" if p.get("tour_done") else "NOT done",
                 (", rendering %dx%d" % tuple(p["rendering"])) if p.get("rendering") else "",
                 ("; FATAL: " + p["fatal"][0]) if p.get("fatal") else ""))
+            files = p.get("build_files") or []
+            if files:
+                out.append("  written under %s/build: %s%s" % (kind, ", ".join(Path(f).name for f in files[:6]),
+                                                              " and %d more" % (len(files) - 6) if len(files) > 6 else ""))
     out.append("")
     for aid, a in report.get("areas", {}).items():
         out.append("%-19s %s (%s): %s" % (aid, a.get("name"), a.get("block"), a.get("status")))
@@ -1331,8 +1426,7 @@ def summary_text(report):
                 grew("image_heap_growth_mib"), fmt(m.get("allocated_mib"), "%d")))
         fr = a.get("frames")
         if fr:
-            out.append("  frames: " + ", ".join("%s %s" % (n, "luma %.1f" % f["stats"]["mean_luma"] if f.get("stats") else
-                                                           ("missing" if not f.get("ok") else "-")) for n, f in sorted(fr.items())))
+            out.append("  frames: " + ", ".join("%s %s" % (n, frame_note(f)) for n, f in sorted(fr.items())))
         lf = a.get("lift")
         if lf:
             tot = lf.get("totals", {})
@@ -1346,6 +1440,20 @@ def summary_text(report):
         out.append("")
         out.extend("problem: " + p for p in report["problems"])
     return "\n".join(out) + "\n"
+
+
+def frame_note(f):
+    """'luma 61.2 (1920x1080)', with a band edge's flag."""
+    if not f.get("ok"):
+        return "missing"
+    st = f.get("stats")
+    if not st:
+        return "-"
+    out = "luma %.1f (%dx%d)%s" % (st["mean_luma"], st["width"], st["height"], " BLACK" if st["mean_luma"] < BLACK_LUMA else "")
+    for edge in (f.get("bands") or {}).values():
+        if edge.get("flagged"):
+            out += " BAND EDGE at %s=%d (%.0f -> %.0f)" % ("x" if edge["axis"] == "column" else "y", edge["at"], edge["from"], edge["to"])
+    return out
 
 
 def ab_text(ab):
@@ -1479,7 +1587,9 @@ def prepare_pass(pass_dir, kind, areas, opts, paths):
     the config, the tour."""
     seed = Path(opts["seed"])
     pass_dir.mkdir(parents=True)
-    for sub in ("cfg", "requests", "frames", "captures"):
+    # build/: where BBHOST_DUMP_FRAME, BBHOST_DUMP_AT_DRAW and other switches
+    # write, relative to the game's folder - the pass's - and fail without it.
+    for sub in ("cfg", "requests", "frames", "captures", "build"):
         (pass_dir / sub).mkdir()
     shutil.copytree(seed, pass_dir / "data", symlinks=False)
     copy = world_baseline.file_inventory(pass_dir / "data")
@@ -1610,10 +1720,21 @@ def verify_lifts(pass_dir, areas, opts, say):
     return out
 
 
+def build_files(pass_dir, limit=200):
+    """What the game wrote under the pass's build/ (frame dumps a --env switch
+    asked for, render-target dumps, shader listings), relative to the pass."""
+    root = pass_dir / "build"
+    if not root.is_dir():
+        return []
+    found = sorted(str(p.relative_to(pass_dir)) for p in root.rglob("*") if p.is_file())
+    return found[:limit]
+
+
 def finish_pass(pass_dir, areas, kind, launched, opts):
     lines = (pass_dir / "run.log").read_text(errors="replace").splitlines() if (pass_dir / "run.log").is_file() else []
     rep = pass_report(lines, areas, kind)
     rep.update(launched or {})
+    rep["build_files"] = build_files(pass_dir)
     if not opts.get("keep_data"):
         shutil.rmtree(pass_dir / "data", ignore_errors=True)
     return rep
@@ -1628,7 +1749,9 @@ def merge(perf, capture, lifts, areas):
         for name, f in (ent.get("frames") or {}).items():
             if f.get("ok") and Path(f["path"]).is_file():
                 try:
-                    f["stats"] = image_stats(read_ppm(f["path"]))
+                    img = crop_image(read_ppm(f["path"]), *(f.get("crop") or (0, 0)))
+                    f["stats"] = image_stats(img)
+                    f["bands"] = band_edges(img)
                 except (OSError, ValueError) as exc:
                     f["error"] = str(exc)
         if capture:
@@ -1669,6 +1792,13 @@ def problems_of(report):
         pr = a.get("presence") or {}
         if a.get("status") == "ok" and settle and pr.get("settle_s") is not None and pr["settle_s"] < settle / 2:
             out.append("%s: settled %.0f s of the %.0f asked: the loading screen was still up at the arrival" % (aid, pr["settle_s"], settle))
+        for name, f in sorted((a.get("frames") or {}).items()):
+            if f.get("stats") and f["stats"]["mean_luma"] < BLACK_LUMA:
+                out.append("%s: frame %s is black (luma %.1f)" % (aid, name, f["stats"]["mean_luma"]))
+            for edge in (f.get("bands") or {}).values():
+                if edge.get("flagged"):
+                    out.append("%s: frame %s has a band edge at %s=%d (luma %.0f -> %.0f, %d of %d slabs)" % (
+                        aid, name, "x" if edge["axis"] == "column" else "y", edge["at"], edge["from"], edge["to"], edge["agree"], edge["slabs"]))
     return out
 
 
@@ -1786,7 +1916,7 @@ def do_run(args, bbhost=None, out=None, captures=True, say=print):
         launched = launch(out / k, plans[k], say_t)
         passes[k] = finish_pass(out / k, areas, k, launched, opts)
         report["passes"][k] = {x: passes[k].get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version",
-                                                             "rendering")}
+                                                             "rendering", "build_files")}
         say_t("%s after %.0f s" % (launched["stop_reason"], launched["elapsed_s"]))
         if k == "capture":
             lifts = verify_lifts(out / k, areas, opts, say_t)
@@ -1817,13 +1947,15 @@ def do_report(args):
         if (run / k / "run.log").is_file():
             passes[k] = pass_report((run / k / "run.log").read_text(errors="replace").splitlines(), areas, k)
             passes[k].update({x: (old.get("passes", {}).get(k) or {}).get(x) for x in ("stop_reason", "returncode", "elapsed_s")})
+            passes[k]["build_files"] = build_files(run / k)
     lifts = {}
     for a in areas:
         p = run / "capture" / "lift" / a.id / "summary.json"
         if p.is_file():
             lifts[a.id] = json.loads(p.read_text())
     report = {"schema": SCHEMA, "version": 1, "dir": str(run), "run": old.get("run", {}), "passes": {
-        k: {x: v.get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version", "rendering")}
+        k: {x: v.get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version", "rendering",
+                                  "build_files")}
         for k, v in passes.items()}}
     report["areas"] = merge(passes.get("perf"), passes.get("capture"), lifts, areas)
     report["problems"] = problems_of(report)
