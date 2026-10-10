@@ -503,6 +503,16 @@ GUEST_ABI int hle_gnm_submit_flip(unsigned count, void** dcb, unsigned* dcb_byte
                      static_cast<unsigned long long>(vs[kDrawVsLifted]), all ? 100.0 * static_cast<double>(vs[kDrawVsLifted]) / static_cast<double>(all) : 0.0,
                      static_cast<unsigned long long>(vs[kDrawVsTranslated]), static_cast<unsigned long long>(vs[kDrawVsOther]),
                      static_cast<unsigned long long>(vs[kDrawVsFallback]));
+            // ... the last of those by why.
+            if (vs[kDrawVsOther]) {
+                std::string why;
+                for (int i = 0; i < kVsWhyCount; ++i) {
+                    if (const std::uint64_t k = now.draws_vs_why[i] - last.draws_vs_why[i]) {
+                        why += (why.empty() ? "" : ", ") + std::string(host_gpu_vs_why_name(i)) + " " + std::to_string(k);
+                    }
+                }
+                host_log("  vertex shaders the lifter does not take: %s", why.c_str());
+            }
         }
         if (const std::string arena = hle_gnm_arena_report(); !arena.empty()) host_log("arena:%s", arena.c_str());
         std::string ph;

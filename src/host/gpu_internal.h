@@ -457,6 +457,7 @@ struct Gpu {
     // The draws by how their pixel shader ran (DrawPs, gpu.h), beside `draws`.
     std::atomic<std::uint64_t> draws_ps[4] = {};
     std::atomic<std::uint64_t> draws_vs[4] = {};  // ... and by how their vertex shader ran (DrawVs)
+    std::atomic<std::uint64_t> draws_vs_why[16] = {};  // kDrawVsOther by why (DrawVsWhy)
     // Why each failed draw failed (DrawFail), reported at exit beside the total.
     std::atomic<std::uint64_t> draw_fail_why[16] = {};
     // host_gpu_draw calls, and those that returned without drawing (no target, or no colour and no depth write).

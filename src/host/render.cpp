@@ -1923,6 +1923,10 @@ int draw_ps_kind(const GfxPipeline& p) {
     if (!p.ps.module && p.ps.meta().spirv.empty()) return kDrawPsNone;
     return p.lean ? kDrawPsTranslated : kDrawPsFallback;
 }
+// The draws whose vertex shader the lifter does not take (kDrawVsOther), by
+// program and why (DrawVsWhy), for render_report: what the rest of the vertex
+// side is made of. Under g.mu.
+std::map<std::string, std::array<std::uint64_t, kVsWhyCount>> g_vs_other;
 // ... and its vertex shader (GpuStats::draws_vs): the lifter takes only a
 // vertex shader on vertex input, and only a no-fallback stage - which a
 // fallback pipeline laid out from its no-fallback stages has too (layout_only).
@@ -7120,6 +7124,28 @@ void render_report() {
                  static_cast<unsigned long long>(g_plans_used), checked.c_str());
     }
     report_gx_state_compare();
+    if (!g_vs_other.empty()) {
+        // The vertex shaders the lifter does not take, by draws: the 40 most
+        // drawn, each with its draws by why.
+        std::vector<std::pair<std::uint64_t, const std::string*>> order;
+        std::uint64_t total = 0;
+        for (const auto& [name, by_why] : g_vs_other) {
+            std::uint64_t n = 0;
+            for (const std::uint64_t k : by_why) n += k;
+            total += n;
+            order.push_back({n, &name});
+        }
+        std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        host_log("render: vertex shaders the lifter does not take: %zu programs, %llu draws", order.size(), static_cast<unsigned long long>(total));
+        for (std::size_t i = 0; i < order.size() && i < 40; ++i) {
+            std::string why;
+            const auto& by_why = g_vs_other[*order[i].second];
+            for (int k = 0; k < kVsWhyCount; ++k) {
+                if (by_why[static_cast<std::size_t>(k)]) why += (why.empty() ? "" : ", ") + std::string(host_gpu_vs_why_name(k)) + " " + std::to_string(by_why[static_cast<std::size_t>(k)]);
+            }
+            host_log("render:   %s: %llu draws (%s)", order[i].second->c_str(), static_cast<unsigned long long>(order[i].first), why.c_str());
+        }
+    }
     if (g_view_extents) {
         host_log("render: GX target extents from their views' textures %llu (%llu of them view-less draws' from the GX texture at the target), "
                  "guessed from the scissor %llu%s",
@@ -9033,6 +9059,8 @@ bool vertex_table_from_memory(const std::vector<std::uint32_t>& fetch_words, std
 // Under g.mu.
 // `memo` (the input layout's by-id entry, or null) keeps the parse for the
 // layout: the map lookup then happens once per layout, not once per draw.
+// Why the last plan_vertex_input on this thread refused (DrawVsWhy).
+thread_local int t_vertex_input_refusal = kVsWhyShape;
 bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint64_t fetch_hash, const GxDrawObjects& o,
                        VertexInputPlan& p, FetchById* memo = nullptr) {
     auto keep = [&](const char* why) {
@@ -9066,6 +9094,7 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
                              static_cast<unsigned long long>(fetch_hash), fetch_words.size(), o.vtx_ud, static_cast<unsigned long long>(o.caller),
                              stop.empty() ? "no table slot" : stop.c_str(), hex.c_str());
                 }
+                t_vertex_input_refusal = o.vtx_ud < 15 ? kVsWhyShape : kVsWhyOwnTable;
                 return keep("not the GX input-layout shape");
             }
         }
@@ -9075,7 +9104,10 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             memo->vtx_ud = o.vtx_ud;
         }
     }
-    if (!pf->ok) return false;
+    if (!pf->ok) {
+        t_vertex_input_refusal = o.vtx_ud < 15 ? kVsWhyShape : kVsWhyOwnTable;
+        return false;
+    }
     const std::vector<FetchElement>& els = pf->elements;
     const std::size_t n = els.size();
     struct Placed {
@@ -9095,12 +9127,21 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
     std::size_t n_shadows = 0;
     for (std::size_t e = 0; e < n; ++e) {
         const FetchElement& fe = els[e];
-        if (!((o.vtx_valid >> fe.slot) & 1)) return keep("the vertex table has no record for an element");
+        if (!((o.vtx_valid >> fe.slot) & 1)) {
+            t_vertex_input_refusal = kVsWhyRecord;
+            return keep("the vertex table has no record for an element");
+        }
         const std::uint32_t* w = o.vtx_rec[fe.slot];
         const std::uint32_t dfmt = (w[3] >> 15) & 0xf, stride = (w[1] >> 16) & 0x3fff, bytes = vertex_format_bytes(dfmt);
         const VkFormat fmt = vertex_format(dfmt);
-        if (fmt == VK_FORMAT_UNDEFINED || !vertex_format_usable(fmt)) return keep("a data format with no vertex format");
-        if (stride < bytes) return keep("a stride shorter than its element");
+        if (fmt == VK_FORMAT_UNDEFINED || !vertex_format_usable(fmt)) {
+            t_vertex_input_refusal = kVsWhyFormat;
+            return keep("a data format with no vertex format");
+        }
+        if (stride < bytes) {
+            t_vertex_input_refusal = kVsWhyStride;
+            return keep("a stride shorter than its element");
+        }
         const std::uint64_t va = (static_cast<std::uint64_t>(w[0]) | (static_cast<std::uint64_t>(w[1] & 0xff) << 32)) + fe.offset;
         const std::uint64_t need = w[2] ? static_cast<std::uint64_t>(w[2] - 1) * stride + bytes : bytes;
         Located loc;
@@ -9108,7 +9149,10 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         if (version == kCopyVersionStraddles) copy_versions_put_in_place_locked(kCvStraddle);
         if (version != kCopyVersionInside) loc = locate(va, need);
         if (g_import_audit) audit_range(va, need, kUseMirror);
-        if (!loc.buffer || loc.avail < need) return keep("vertex data not within one imported buffer");
+        if (!loc.buffer || loc.avail < need) {
+            t_vertex_input_refusal = kVsWhyPlacement;
+            return keep("vertex data not within one imported buffer");
+        }
         // Read from device memory when the record's whole extent can be kept
         // there (buffer_shadow.cpp); every element of the record shares it.
         const RecordShadow* rs = nullptr;
@@ -13707,7 +13751,18 @@ static bool draw_impl(const GpuDraw& d) {
     cmds.publish();  // the diagnostics below may record or flush: they come after this draw
     bump(g.draws);  // the one writer, under g.mu: no locked add
     bump(g.draws_ps[draw_ps_kind(*bind_pl)]);
-    bump(g.draws_vs[draw_vs_kind(*bind_pl, use_vertex_input)]);
+    const int vs_kind = draw_vs_kind(*bind_pl, use_vertex_input);
+    bump(g.draws_vs[vs_kind]);
+    if (vs_kind == kDrawVsOther) {
+        const int why = s.tess_hw                          ? kVsWhyTessHw
+                        : s.domain_level                   ? kVsWhyDomain
+                        : fetch_words.empty()              ? kVsWhyNoFetch
+                        : !(gx_geometry && d.gx_render)    ? kVsWhyNoGx
+                        : !g_vertex_input                  ? kVsWhyInputOff
+                                                           : t_vertex_input_refusal;
+        bump(g.draws_vs_why[why]);
+        ++g_vs_other[vs_name][static_cast<std::size_t>(why)];
+    }
     draw_stamp.to(kRenderCostRecord);
     if (g_render_cost_enabled) report_render_split(false);
     if (capture_session) {

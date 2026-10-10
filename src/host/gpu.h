@@ -356,8 +356,10 @@ struct GpuStats {
     // reason (host_gpu_draw_fail_name).
     std::uint64_t draws_ps[4];
     std::uint64_t draw_fail_why[16];
-    // The same draws by how their vertex shader ran (DrawVs).
+    // The same draws by how their vertex shader ran (DrawVs), and those the
+    // lifter does not take (kDrawVsOther) by why (DrawVsWhy).
     std::uint64_t draws_vs[4];
+    std::uint64_t draws_vs_why[16];
 };
 // How a draw's pixel shader ran: its typed lift (BBHOST_DECOMP), a
 // translation in the no-fallback pipeline (not lifted, or not asked to be),
@@ -368,6 +370,19 @@ enum DrawPs { kDrawPsLifted, kDrawPsTranslated, kDrawPsFallback, kDrawPsNone, kD
 // translation the lifter does not take (the fetch shader inlined, or a
 // tessellation stage), or the page-table fallback pipeline's translation.
 enum DrawVs { kDrawVsLifted, kDrawVsTranslated, kDrawVsOther, kDrawVsFallback, kDrawVsCount };
+// Why a draw's vertex shader is one the lifter does not take (kDrawVsOther): a
+// tessellation stage - the host tessellator's evaluation stage, or the
+// emulated domain shader - or a vertex shader whose fetch shader stays inlined
+// because the draw has no vertex input: it calls none, the draw carries no GX
+// geometry (packets), vertex input is off, the game binds the vertex table
+// itself (no slot in the draw's user data), the fetch shader has another shape
+// than the GX input layouts', or an element has no record, no Vulkan vertex
+// format, a stride shorter than itself, or data outside one imported buffer.
+enum DrawVsWhy {
+    kVsWhyTessHw, kVsWhyDomain, kVsWhyNoFetch, kVsWhyNoGx, kVsWhyInputOff, kVsWhyOwnTable,
+    kVsWhyShape, kVsWhyRecord, kVsWhyFormat, kVsWhyStride, kVsWhyPlacement, kVsWhyCount
+};
+const char* host_gpu_vs_why_name(int why);
 // A draw failure reason's name ("pixel shader"), or null past the last.
 const char* host_gpu_draw_fail_name(int reason);
 enum GpuPhase { kPhaseDraw, kPhaseDispatch, kPhasePrefetch, kPhasePipeline, kPhaseBind, kPhaseExec, kPhaseWait, kPhaseLock, kPhaseCount };

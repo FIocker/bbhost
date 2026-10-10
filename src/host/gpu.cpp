@@ -5280,6 +5280,7 @@ GpuStats host_gpu_stats() {
     st.draws_empty = g.draws_empty.load();
     for (int i = 0; i < kDrawPsCount; ++i) st.draws_ps[i] = g.draws_ps[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kDrawVsCount; ++i) st.draws_vs[i] = g.draws_vs[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < kVsWhyCount; ++i) st.draws_vs_why[i] = g.draws_vs_why[i].load(std::memory_order_relaxed);
     for (int i = 0; i < 16; ++i) st.draw_fail_why[i] = g.draw_fail_why[i].load(std::memory_order_relaxed);
     return st;
 }
@@ -5292,6 +5293,13 @@ const char* host_gpu_draw_fail_name(int reason) {
                                                 "pipeline creation", "index buffer",       "indirect arguments",
                                                 "no GPU (device lost)"};
     return reason >= 0 && reason < kFailCount ? why[reason] : nullptr;
+}
+const char* host_gpu_vs_why_name(int why) {
+    static const char* const names[kVsWhyCount] = {"tessellation (host)", "tessellation (emulated domain)", "no fetch shader",
+                                                    "no GX geometry",      "vertex input off",               "the game's own vertex table",
+                                                    "another fetch shape", "a missing record",               "no vertex format",
+                                                    "a short stride",      "data outside one buffer"};
+    return why >= 0 && why < kVsWhyCount ? names[why] : nullptr;
 }
 void host_gpu_phase_add(int phase, std::uint64_t ns) { g.phase_ns[phase & 7].fetch_add(ns, std::memory_order_relaxed); }
 
