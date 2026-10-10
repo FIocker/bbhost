@@ -5,6 +5,7 @@
 #include "core/write_watch.h"
 #include "hle/common.h"
 #include "hle/libc_ctype.h"
+#include "hle/libc_abi.h"
 #include "hle/libc_random.h"
 #include "hle/fs.h"
 #include "core/tls_rewrite.h"
@@ -739,7 +740,7 @@ GUEST_ABI float hle_modff(float x, float* i) { return std::modf(x, i); }
 GUEST_ABI float hle_coshf(float x) { return std::cosh(x); }
 GUEST_ABI float hle_sinhf(float x) { return std::sinh(x); }
 
-GUEST_ABI ldiv_t hle_ldiv(long n, long d) { return std::ldiv(n, d); }
+GUEST_ABI bb::libc::Div64 hle_ldiv(std::int64_t n, std::int64_t d) { return bb::libc::divide(n, d); }
 
 // Orbis wchar_t is UTF-16. Linux wchar_t is UTF-32 — never wrap host wcs*.
 using Gwchar = char16_t;

@@ -26,6 +26,7 @@ run() {
     echo "$name: FAILED under wine"; fail=1
   fi
 }
+run libc_abi_test tests/libc_abi_test.cpp
 run sysv_va_test tests/sysv_va_test.cpp src/hle/sysv_va.cpp
 run thunk_args tests/thunk_args.cpp src/core/thunk.cpp src/core/tls_rewrite.cpp src/core/portable.cpp src/hle/sysv_va.cpp src/host/main_wait.cpp
 wineserver -k 2>/dev/null
