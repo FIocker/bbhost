@@ -16,10 +16,12 @@ namespace frame_rate_step {
 // This frame's step at a converted rate - the measured frame time clamped to
 // [target, 1/30], what the game's task step is - and 0 at the game's own 30.
 inline std::atomic<float> g_frame_seconds{0.0f};
-// The follow camera's per-frame weights hold Kyo's 60 fps values (the 60
-// FPS++ sites' parameter stores and kConstants' defaults are in): a weight
-// is converted from a 60 fps frame to this frame's length.
-inline std::atomic<bool> g_camera_60_tuned{false};
+// The rate the follow camera's per-frame weights are tuned for at a converted
+// rate (the Camera tuning option, engine/frame_rate.cpp): 60 with FPS++, Kyo's
+// 60 fps values in (the 60 FPS++ sites' parameter stores and the constructor's
+// defaults), 30 with Original, the game's own; a weight is converted from a
+// frame of that rate to this frame's length. 0: nothing is converted.
+inline std::atomic<int> g_camera_tuned_fps{0};
 
 // The functions are always inlined and local to each file that uses them, so
 // the leaf's copy is built with the leaf's flags (no stack protector), never

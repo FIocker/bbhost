@@ -28,6 +28,10 @@ struct HostSettings {
     float fov_scale = 1.0f;              // 1.0 the game's own; +5% a step
     float camera_distance_scale = 1.0f;  // 1.0 the game's own; 10% a step either way
     float camera_height_scale = 1.0f;
+    // The follow camera's tuning above 30 fps, read when the game starts
+    // (engine/frame_rate.cpp): false FPS++, Kyo's 60 fps retune; true
+    // Original, the game's own values. At 30 the camera is the game's either way.
+    bool camera_original = false;
 
     // Controls
     bool mouse_menu = true;     // the pointer drives the menus through the pad

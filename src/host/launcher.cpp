@@ -198,6 +198,8 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
     for (int k = 0; k < kCapCount; ++k) {
         if (kCaps[k] == frame_cap) cap_choice = k;
     }
+    // The follow camera's tuning above 30 fps: the setting's index, 0 FPS++, 1 Original.
+    int camera_tuning = host_opt_index("camera_tuning") == 1 ? 1 : 0;
     // The PC enhancements, through the same calls: each is read when the
     // game starts (main.cpp, config_set_enhancements).
     struct Enhancement {
@@ -321,6 +323,7 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         host_opt_set("skip_logos", skip_logos);
         host_opt_set("debug_camera", debug_camera);
         host_opt_set_frame_cap(kCaps[cap_choice]);
+        host_opt_set_index("camera_tuning", camera_tuning);
         host_opt_set_resolution_index(resolution);
         for (const Enhancement& x : enhancements) host_opt_set(x.key, x.on);
         host_options_save_now();
@@ -629,6 +632,11 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         ImGui::Combo("Frame rate", &cap_choice, kCapLabels, kCapCount);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("The game's own speed. Uncapped steps it by the frame time: the display's refresh rate with V-Sync on, up to 240 fps off.");
+        ImGui::SetNextItemWidth(200 * scale);
+        static const char* const kTuningLabels[] = {"FPS++ (Kyo)", "Original"};
+        ImGui::Combo("Camera tuning", &camera_tuning, kTuningLabels, 2);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Above 30 fps: FPS++ is the retuned camera from Kyo's 60 FPS++ patch, which trails the character more; Original is the game's own camera, as it moves at 30. At 30 fps both are the game's.");
         ImGui::SetNextItemWidth(200 * scale);
         ImGui::Combo("Render resolution", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
         ImGui::TextDisabled("F10 in the game has every other setting.");

@@ -61,6 +61,7 @@ enum SettingId {
     kFov,
     kCameraDistance,
     kCameraHeight,
+    kCameraTuning,
     kMouseMenu,
     kMouseCamera,
     kMouseSens,
@@ -133,6 +134,14 @@ Setting g_set[kSettingCount] = {
      "How far behind the character the camera sits. 5 is the game's own.", false},
     {"camera_height", "Camera height", {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, 5,
      "How high above the character the camera looks. 5 is the game's own.", false},
+    // The follow camera above 30 fps (engine/frame_rate.cpp, read when the game
+    // starts): FPS++ keeps the retune from Kyo's 60 FPS++ list, as every
+    // bbhost before this option did, so it is the default; Original runs the
+    // game's own values, the same camera at every frame rate. Both are
+    // converted to each frame's length; at 30 the camera is the game's.
+    {"camera_tuning", "Camera tuning", {"FPS++ (Kyo)", "Original"}, 0,
+     "Requires a restart. Above 30 fps: FPS++ is Kyo's retuned camera; Original is the game's own, as at 30.",
+     true},
     // On, as in DS3: a click only reaches the menus while one is open
     // (engine/menu_pointer.h), so it cannot swing a weapon in the world.
     {"mouse_menu", "Mouse in menus", {"Off", "On"}, 1,
@@ -251,6 +260,7 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
     {Row::Option, nullptr, kCameraHeight},
+    {Row::Option, nullptr, kCameraTuning},
     {Row::Header, "INPUT"},
     {Row::Option, nullptr, kMouseMenu},
     {Row::Option, nullptr, kMouseCamera},
@@ -649,7 +659,9 @@ void apply(int id) {
 // 3: frame_cap is the game's frame rate (30, 60, 90, Uncapped; 120 since
 // 2026-10-10, a new value, so the version stays); an older file's 90, 120,
 // 144 and Off were caps on presentation that ran the game at 60, and read as
-// 60.
+// 60. camera_tuning (2026-10-10) is a new key whose default, FPS++, is what
+// every older build ran, so a file without it reads as before and the
+// version stays.
 constexpr int kOptionsVersion = 3;
 
 void save() {
@@ -720,6 +732,7 @@ void rebuild_settings() {
     const auto around = [](int id) { return 0.5f + 0.1f * static_cast<float>(index_of(id)); };
     h.camera_distance_scale = around(kCameraDistance);
     h.camera_height_scale = around(kCameraHeight);
+    h.camera_original = index_of(kCameraTuning) == 1;
     {
         const char* e = std::getenv("BBHOST_FOV");
         const float env = e && *e ? std::strtof(e, nullptr) : 0.0f;

@@ -437,7 +437,9 @@ constexpr Bytes kBytes[] = {
 //    cloth and jumping fixes at 60 to these). The target is ours (1/60, 1/90,
 //    or the uncapped limit), so this is what makes 90 and uncapped real time;
 //  - two runs of parameter reads (0x183ff29, 0x1840799, beside the camera's
-//    field-of-view clamp) replaced by stores of the list's 60 fps values;
+//    field-of-view clamp) replaced by stores of the list's 60 fps values, and
+//    two edits in the camera's update (0x183dc97, 0x183dcfe) - left out with
+//    the Camera tuning Original (kKyoCameraSites);
 //  - a few constants and table bytes (0x47df586, 0x3abc2xx), the cloth's
 //    substep count forced to 1 (0xb6e67a: Kyo's "the part files were authored
 //    at 30 fps with 2 substeps: a rate of 60"), the motion blur's sample
@@ -539,6 +541,26 @@ static_assert(sizeof(kPlayTimeAddWas) - 1 == 2 * 13, "the add and its replacemen
 constexpr std::uint32_t kStepLoad = 0x2418e3d;
 constexpr char kStepLoadWas[] = "f30f108364020000f30f5f4318f30f5d0512d59002";
 static_assert(sizeof(kStepLoadWas) - 1 == 2 * 21, "the cave's three instructions are 21 bytes");
+
+// The Camera tuning option (host/options.cpp camera_tuning;
+// BBHOST_CAMERA_TUNING=fps++|original), read when the game starts. FPS++
+// keeps Kyo's retune of the follow camera from his 60 FPS++ list, as bbhost
+// always has: his parameter stores (0x183ff29, 0x1840799, kSixtySites), the
+// constructor's defaults (kConstants 0x183a4c3..0x183aa5b, the halved chase
+// rates and a 40 degree direct pitch angle) and two edits in the camera's
+// update (0x183dc97, the jump past the chase-rate pick; 0x183dcfe, the wall
+// escape when neither probe hits), with its weights converted from a 60 fps
+// frame (frame_rate_step::g_camera_tuned_fps). Original leaves all of those
+// as the game has them and converts the game's own weights from a 30 fps
+// frame - the camera of the game at 30 at every rate. At 30 nothing here is
+// written: the camera is the game's either way (Kyo's 30 FPS++ list, a
+// separate retune with stale values, was never applied).
+constexpr std::uint32_t kKyoCameraSites[] = {0x183dc97, 0x183dcfe, 0x183ff29, 0x1840799};
+constexpr std::uint32_t kKyoCameraFirst = 0x183a4c3, kKyoCameraLast = 0x183aa5b;  // the constructor's immediates
+bool kyo_camera_site(std::uint32_t at) {
+    return std::find(std::begin(kKyoCameraSites), std::end(kKyoCameraSites), at) != std::end(kKyoCameraSites);
+}
+bool kyo_camera_constant(std::uint32_t at) { return at >= kKyoCameraFirst && at <= kKyoCameraLast; }
 
 // The cloth above 60 (tools/fps_sites.py, from Kyo's "90 FPS++"). With one
 // substep a frame (0xb6e67a above) the hcl solver runs at the frame rate,
@@ -1256,6 +1278,18 @@ int wanted_fps() {
     return mode_of(host_settings().frame_cap);
 }
 
+// The Camera tuning option as the game started with it: true for Original.
+// BBHOST_CAMERA_TUNING=original (or orig, 1) / fps++ (or kyo, 0) overrides it.
+bool camera_original() {
+    if (const char* e = std::getenv("BBHOST_CAMERA_TUNING"); e && *e) {
+        const std::string v(e);
+        if (v == "original" || v == "orig" || v == "1") return true;
+        if (v == "fps++" || v == "kyo" || v == "0") return false;
+        host_log("frame rate: BBHOST_CAMERA_TUNING=%s is neither fps++ nor original; the option decides", e);
+    }
+    return host_settings().camera_original;
+}
+
 // Whether every site of a group holds the list's old bytes; the first that
 // does not is named.
 template <std::size_t N>
@@ -1332,9 +1366,12 @@ int apply_rate(ElfImage* image, int want) {
         if (bn < kCodeEnd) guest_protect_rx(&image->mem, lo, hi - lo);
         else guest_protect_rw(&image->mem, lo, hi - lo);
     };
+    // The Camera tuning: Original leaves Kyo's camera sites and constants out.
+    const bool original_camera = camera_original();
     const auto write_sites = [&](const auto& sites) {
         std::size_t n = 0;
         for (const Site& site : sites) {
+            if (original_camera && kyo_camera_site(site.at)) continue;
             const std::vector<std::uint8_t> now = hex_bytes(site.now);
             write(site.at, now.data(), now.size());
             ++n;
@@ -1345,8 +1382,12 @@ int apply_rate(ElfImage* image, int want) {
     // counts; the sound thread keeps up with the fastest frame.
     const int fps = mode == 0 ? kUncappedReferenceFps : mode;
     // A rated constant's rule gives the table's own value at 60.
-    std::size_t rated_fixed = 0;
+    std::size_t rated_fixed = 0, camera_kept = 0;
     for (const Constant& c : kConstants) {
+        if (original_camera && kyo_camera_constant(c.at)) {
+            ++camera_kept;
+            continue;
+        }
         std::uint32_t now = c.now;
         if (const Rated* r = rated(c.at); r && mode != 60) {
             now = float_bits(rated_value(r->kind, bits_float(c.was), fps));
@@ -1366,10 +1407,6 @@ int apply_rate(ElfImage* image, int want) {
     if (sixty_ok) {
         g_sites_applied = write_sites(kSixtySites);
         g_frame_time_applied = write_sites(kFrameTimeSites);
-        // The camera's weights now hold Kyo's 60 fps values (the parameter
-        // stores above, kConstants' defaults): the decomp camera converts
-        // them to each frame's length (decomp/camera/follow_camera.cpp).
-        frame_rate_step::g_camera_60_tuned.store(true, std::memory_order_relaxed);
         // The task step and the play time's count, ours: written by our
         // SprjFlipper::Update every frame, in 16 bytes of the image's tail
         // (with the guest's, BBHOST_FRAME_SOURCE=0 or 2 at 60, the cave and
@@ -1416,6 +1453,21 @@ int apply_rate(ElfImage* image, int want) {
                 host_log("frame rate: 0x%x does not hold the play time's add; the game's stays", kPlayTimeAdd);
             }
         }
+    }
+    // The camera's weights hold Kyo's 60 fps values (kConstants' defaults,
+    // and his stores with the sites) or, with Original, the game's 30 fps
+    // ones: the decomp camera converts them from a frame of that rate to each
+    // frame's length (decomp/camera/follow_camera.cpp), from the frame time
+    // each_frame keeps, which needs no site.
+    frame_rate_step::g_camera_tuned_fps.store(original_camera ? 30 : 60, std::memory_order_relaxed);
+    if (original_camera) {
+        host_log("frame rate: the follow camera's tuning is Original: the game's own values, converted from its 30 fps "
+                 "frames to each frame's length (Kyo's %zu camera sites and the constructor's %zu defaults left as the "
+                 "game has them)",
+                 sizeof(kKyoCameraSites) / sizeof(kKyoCameraSites[0]), camera_kept);
+    } else {
+        host_log("frame rate: the follow camera's tuning is FPS++: Kyo's 60 fps retune from his 60 FPS++ list, converted "
+                 "from 60 fps frames to each frame's length (Camera tuning: Original for the game's own)");
     }
     if (mode != 60) {
         g_cloth_applied = write_sites(kClothSites);
@@ -1501,7 +1553,9 @@ void frame_rate_install(ElfImage* image) {
     }
     if (g_source == Source::Compare) g_frame_after_thunk = hle_wrap_fn(reinterpret_cast<void*>(&frame_after));
     if (want == 30) {
-        host_log("frame rate: the game's own 30");
+        host_log("frame rate: the game's own 30; the follow camera is the game's own (the Camera tuning, %s, applies above "
+                 "30)",
+                 camera_original() ? "Original" : "FPS++");
         // Ours runs the game's own mode at 30 (or the guest's does with
         // BBHOST_FRAME_SOURCE=0, when only the online test tick needs the hook).
         {  // ours runs the game's own mode at 30 (the param walk and the online tick ride on the same hook)
