@@ -19,8 +19,8 @@
 //
 // Entries are compressed (zlib) and read lazily, at a lookup; the file is read
 // whole at device start, rewritten whole (to a temporary a chunk at a time,
-// then renamed) at most once a minute while new translations come in, and at
-// exit.
+// then renamed) once 4 MiB or 2% of new translations have come in - at most
+// once a minute - and at exit.
 
 #include "gcn/lift.h"
 #include "gcn/translate.h"
@@ -49,7 +49,8 @@ gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::Tr
 // (they are part of every key).
 void translation_cache_load(const std::string& path);
 // The whole file, when translations were added since the last write; `force`
-// writes now (the exit), otherwise at most once a minute.
+// writes now (the exit), otherwise once 4 MiB or 2% of it is new, at most once
+// a minute.
 void translation_cache_save(const std::string& path, bool force);
 // The same on a thread of its own (the 300-flip report's).
 void translation_cache_save_async(const std::string& path);

@@ -50,8 +50,12 @@ constexpr std::uint32_t kVersion = 2;  // 2: wave64_needs
 constexpr std::size_t kMaxEntries = 65536;
 constexpr std::uint64_t kMaxBytes = 256ull << 20;
 constexpr std::uint32_t kMaxRaw = 64u << 20;  // one entry uncompressed: the largest translations are ~1 MiB
-// A periodic write at most this often; the exit writes regardless.
+// A periodic write at most this often, and only once this much is new
+// (compressed): 4 MiB or 2% of what the file holds, the pipeline cache's rule
+// (gpu.cpp). The file is rewritten whole, 170 MiB in a world run, and a minute
+// of play adds a dozen entries. The exit writes whatever is new.
 constexpr auto kSaveInterval = std::chrono::seconds(60);
+constexpr std::uint64_t kSaveMinNew = 4ull << 20;
 
 struct Key {
     std::uint64_t a = 0, b = 0;
@@ -380,6 +384,7 @@ struct Cache {
     std::vector<std::unique_ptr<std::uint8_t[]>> made;     // under mu: entries made in this run, never freed
     std::unordered_map<Key, Slot, KeyHash> slots;          // under mu
     std::uint64_t bytes = 0;                               // under mu: compressed, every slot
+    std::uint64_t saved_bytes = 0;                         // under mu: `bytes` at the last write (or the load)
     bool dirty = false;                                    // under mu
     std::chrono::steady_clock::time_point saved{};         // under mu: the last write
     std::size_t loaded = 0;
@@ -480,6 +485,16 @@ void store(const Key& key, const Writer& w) {
 }
 
 std::string path_tmp(const std::string& path) { return path + ".tmp" + std::to_string(host_thread_id()); }
+
+// Under g_tc.mu: a write is due when entries came in (or one is to be left
+// out) and, unless forced, a minute has passed and enough of them are new.
+bool save_due_locked(bool force) {
+    if (!g_tc.dirty) return false;
+    if (force) return true;
+    if (std::chrono::steady_clock::now() - g_tc.saved < kSaveInterval) return false;
+    const std::uint64_t fresh = g_tc.bytes > g_tc.saved_bytes ? g_tc.bytes - g_tc.saved_bytes : 0;
+    return fresh >= std::max<std::uint64_t>(kSaveMinNew, g_tc.saved_bytes / 50);
+}
 
 std::atomic<std::uint64_t> g_window_hits{0}, g_window_hit_us{0}, g_window_misses{0}, g_window_miss_us{0};
 std::atomic<std::uint64_t> g_window_lift_hits{0}, g_window_lift_misses{0};
@@ -614,6 +629,7 @@ void translation_cache_load(const std::string& path) {
                  dropped ? ", some keys twice" : "");
     }
     g_tc.saved = std::chrono::steady_clock::now();
+    g_tc.saved_bytes = g_tc.bytes;
     g_tc.ready.store(true, std::memory_order_release);
 }
 
@@ -626,13 +642,14 @@ void translation_cache_save(const std::string& path, bool force) {
         Slot slot;
     };
     std::vector<Out> out;
+    std::uint64_t fresh = 0;
     {
         std::lock_guard<std::mutex> lk(g_tc.mu);
-        if (!g_tc.dirty) return;
-        const auto now = std::chrono::steady_clock::now();
-        if (!force && now - g_tc.saved < kSaveInterval) return;
+        if (!save_due_locked(force)) return;
         g_tc.dirty = false;
-        g_tc.saved = now;
+        g_tc.saved = std::chrono::steady_clock::now();
+        fresh = g_tc.bytes > g_tc.saved_bytes ? g_tc.bytes - g_tc.saved_bytes : 0;
+        g_tc.saved_bytes = g_tc.bytes;
         out.reserve(g_tc.slots.size());
         for (const auto& [key, s] : g_tc.slots) {
             if (!s.bad) out.push_back({key, s});
@@ -667,8 +684,9 @@ void translation_cache_save(const std::string& path, bool force) {
         host_log("render: saving the translation cache to %s failed", path.c_str());
         return;
     }
-    host_log("render: translation cache saved: %zu translations and lifts, %.1f MiB (written in %llu ms)%s", keep, bytes / 1048576.0,
-             static_cast<unsigned long long>(us_since(t0) / 1000), keep < out.size() ? ", the oldest left out" : "");
+    host_log("render: translation cache saved: %zu translations and lifts, %.1f MiB, %.1f MiB of it new (written in %llu ms)%s", keep,
+             bytes / 1048576.0, fresh / 1048576.0, static_cast<unsigned long long>(us_since(t0) / 1000),
+             keep < out.size() ? ", the oldest left out" : "");
 }
 
 void translation_cache_save_async(const std::string& path) {
@@ -676,7 +694,7 @@ void translation_cache_save_async(const std::string& path) {
     if (!g_tc.on || path.empty()) return;
     {
         std::lock_guard<std::mutex> lk(g_tc.mu);
-        if (!g_tc.dirty || std::chrono::steady_clock::now() - g_tc.saved < kSaveInterval) return;
+        if (!save_due_locked(false)) return;
     }
     if (saving.exchange(true)) return;
     std::thread([path] {
