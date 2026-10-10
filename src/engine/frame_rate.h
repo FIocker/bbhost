@@ -34,7 +34,8 @@
 // The choice is made when the game starts: the game's fixed 1/30 s steps are
 // constants in its code, and a rate needs them all changed together.
 
-// The frame time code on the game's side reads: engine/frame_rate_step.h.
+// The frame time and the camera's flag code on the game's side reads:
+// engine/frame_rate_step.h.
 
 struct ElfImage;
 

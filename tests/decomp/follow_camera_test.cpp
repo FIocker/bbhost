@@ -465,7 +465,7 @@ int main(int argc, char** argv) {
         eboot_kit::at(0x183dc97)[0] = sixty ? 0xd6 : 0x57;
         eboot_kit::at(0x183dc97)[1] = sixty ? 0x05 : 0x06;
         eboot_kit::at(0x183dcfe)[0] = sixty ? 0x00 : 0x01;
-        const u32 ease = sixty ? 0x3ccccccdu : 0x3dcccccdu, rate = sixty ? 0x3c89b0c3u : 0x3d088889u;  // engine/frame_rate.cpp
+        const u32 ease = sixty ? 0x3d523176u : 0x3dcccccdu, rate = sixty ? 0x3c89b0c3u : 0x3d088889u;  // engine/frame_rate.cpp at 60
         std::memcpy(eboot_kit::at(0x4d25e68), &ease, 4);
         std::memcpy(eboot_kit::at(0x4d25e94), &rate, 4);
         // The mouse on odd cameras, at a sensitivity and with axes of its own.

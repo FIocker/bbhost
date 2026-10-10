@@ -27,6 +27,18 @@
 // from memory as the game reads them; the game's other constants are
 // literals here, and the body check hashes them with the code.
 //
+// At the frame rates bbhost converts (engine/frame_rate.h) the weights the
+// camera eases by each frame are converted to the frame's length, so it turns,
+// chases and settles as far in a second at any rate: the ones the 60 FPS++
+// sites store at their 60 fps values (the chase rates +0x198, +0x1a4, +0x1ac/
+// +0x1b8 and their lock-on pair, +0x1c4, the direct pitch rate +0x23c, the
+// lock chase +0x240, the pitch return's kept share +0x1a8) from a 60 fps
+// frame, the LockCamParam blend +0x330 from a 30 fps one (frame_rate_step.h;
+// Kyo's 1.3 lists and yogesh1239's AI/Camera fix do the same in caves). The
+// distance and chase-rate eases are constants the frame-rate code writes every
+// frame. At the game's own 30 and in a compare run nothing is converted: the
+// step is the game's to the bit.
+//
 // Two things the PC port adds, neither in the game's function: the mouse
 // turns the free camera after the stick, where Dark Souls III turns it
 // (engine/mouse_camera.h), and while the keyboard and mouse were used last the
@@ -41,6 +53,7 @@
 // camera's hook in the game's code against our mouse step.
 #include "decomp/decomp.h"
 #include "decomp/guest.h"
+#include "engine/frame_rate_step.h"
 #include "engine/mouse_camera.h"
 #include "engine/mouse_camera_step.h"
 
@@ -499,6 +512,10 @@ Hold held_turns() {
 struct Step {
     float dt;
     Vec dt4;  // dt in every lane
+    // This frame's length in 60 fps frames when the frame rate is converted,
+    // for the per-frame weights (frame_rate_step.h); 0: the game's own
+    // arithmetic (30, or a compare run).
+    float frames60 = 0.0f;
     void* world;
     Saved saved;
     Vec stick;         // the right stick: x turns the pitch, y the yaw (P7)
@@ -577,9 +594,9 @@ float ease(float from, float to, float k) { return from + (to - from) * k; }
 // field of view is camFovY in degrees, floored at 38 (below, a fixed
 // 0.6632251 radians) and capped at 48 - unless the fov-uncap patch is in,
 // which ours sees at the cap's own instruction.
-void ease_toward_lock_cam_param(FollowCam& cam, const u8* row) {
+void ease_toward_lock_cam_param(FollowCam& cam, const u8* row, float frames60) {
     const auto field = [row](u64 at) { return load<float>(reinterpret_cast<u64>(row) + at); };
-    const float k = cam.param_ease;
+    const float k = frame_rate_step::weight(cam.param_ease, frames60 * 0.5f);  // a 30 fps weight
     cam.eased_distance = ease(cam.eased_distance, field(0x0), k);
     cam.pitch_min = ease(cam.pitch_min, field(0x4) * kOneDegree, k);
     cam.lock_shift_ratio = ease(cam.lock_shift_ratio, field(0x8), k);
@@ -757,7 +774,8 @@ Vec follow_character_frame(FollowCam& cam, const u8* chr, const Step& step) {
     const Vec frame_position = point(frame.r3);
     cam.chr_position = frame_position;
     if (!cam.reset_request)
-        cam.chr_position = step.saved.chr_position + (frame_position - step.saved.chr_position) * _mm_set1_ps(cam.chr_chase_rate);
+        cam.chr_position = step.saved.chr_position +
+                           (frame_position - step.saved.chr_position) * _mm_set1_ps(frame_rate_step::weight(cam.chr_chase_rate, step.frames60));
     return frame_position;
 }
 
@@ -794,7 +812,7 @@ void chase_wanted_point(FollowCam& cam, const Step& step) {
     cam.orbit_reference = cam.origin_b;
     cam.focus = cam.origin_b;
     cam.distance = cam.eased_distance;
-    const float rate = cam.target_chase_rate + (1.0f - cam.target_chase_rate) * cam.follow_weight;
+    const float rate = frame_rate_step::weight(cam.target_chase_rate + (1.0f - cam.target_chase_rate) * cam.follow_weight, step.frames60);
     const Vec move = (cam.chr_position - step.saved.chr_position) * _mm_set1_ps(rate);
     cam.wanted = move + cam.wanted;
     cam.wanted_tested = move + cam.wanted_tested;
@@ -822,7 +840,7 @@ float yaw_along(Vec v, float current) {
 // (+0x1ec, +0x1f0) as the target's height difference grows from +0x1fc to
 // +0x200. Nothing moves while the angles are within the play angle (+0x244)
 // of where they should be; a step that would end inside it stops at its edge.
-void turn_toward_lock_target(FollowCam& cam) {
+void turn_toward_lock_target(FollowCam& cam, float frames60) {
     const Vec to_target = cam.lock_target - cam.focus;
     const Vec to_focus = cam.focus - cam.wanted;
     const float pitch = cam.pitch, yaw = cam.yaw;
@@ -844,7 +862,7 @@ void turn_toward_lock_target(FollowCam& cam) {
     else
         want = min_ss(cam.lock_pitch_max + t * (cam.pitch_max - cam.lock_pitch_max), want);
 
-    const float rate = cam.lock_chase_rate;
+    const float rate = frame_rate_step::weight(cam.lock_chase_rate, frames60);
     const float pitch_error = wrap_angle(want - from_pitch);
     const float new_pitch = wrap_angle(from_pitch + rate * pitch_error);
     const float yaw_error = wrap_angle(target_yaw - from_yaw);
@@ -890,7 +908,7 @@ bool step_auto_turn(FollowCam& cam, const Step& step) {
         running = false;
         left = 0.0f;
     }
-    const float rate = cam.lock_chase_rate;
+    const float rate = frame_rate_step::weight(cam.lock_chase_rate, step.frames60);
     const float auto_pitch = cam.auto_pitch;
     const float pitch = wrap_angle(cam.pitch + rate * wrap_angle(auto_pitch - cam.pitch));
     cam.pitch = pitch;
@@ -941,7 +959,7 @@ bool choose_angles(FollowCam& cam, const Step& step) {
         return false;
     }
     if (cam.lock_on) {
-        turn_toward_lock_target(cam);
+        turn_toward_lock_target(cam, step.frames60);
         return false;
     }
     if (cam.turn_behind) {
@@ -1049,12 +1067,12 @@ void fast_turn(FollowCam& cam, const Step& step, float ramp) {
     if (stick[0] > 0.0f) {
         const float direct = stick[0] / series_sin(wrap_angle(cam.direct_pitch_angle)) * cam.pitch_max;
         const float target = 0.0f > direct ? 0.0f : min_ss(cam.pitch_max, direct);
-        const float eased = pitch + (target - pitch) * cam.direct_pitch_rate;
+        const float eased = pitch + (target - pitch) * frame_rate_step::weight(cam.direct_pitch_rate, step.frames60);
         cam.pitch = choose(cam.pitch_min > eased, cam.pitch_min, choose(eased > cam.pitch_max, cam.pitch_max, eased));
     } else {
         const float direct = stick[0] / series_sin(wrap_angle(-cam.direct_pitch_angle)) * cam.pitch_min;
         const float target = cam.pitch_min > direct ? cam.pitch_min : min_ss(0.0f, direct);
-        const float eased = pitch + (target - pitch) * cam.direct_pitch_rate;
+        const float eased = pitch + (target - pitch) * frame_rate_step::weight(cam.direct_pitch_rate, step.frames60);
         cam.pitch = choose(cam.pitch_min > eased, cam.pitch_min, min_ss(cam.pitch_max, eased));
     }
 }
@@ -1110,9 +1128,10 @@ void steer_by_stick(FollowCam& cam, const Step& step, bool auto_turning) {
 
 // Without lock-on or an auto turn, the pitch eases back toward its reference:
 // it keeps +0x1a8 of its difference from it each frame.
-void return_pitch(FollowCam& cam) {
+void return_pitch(FollowCam& cam, float frames60) {
     if (cam.lock_on || cam.auto_turn) return;
-    cam.pitch = wrap_angle(cam.pitch_reference + wrap_angle(cam.pitch - cam.pitch_reference) * cam.pitch_chase_rate);
+    cam.pitch = wrap_angle(cam.pitch_reference +
+                           wrap_angle(cam.pitch - cam.pitch_reference) * frame_rate_step::keep(cam.pitch_chase_rate, frames60));
 }
 
 // ---- P15: the wanted position -----------------------------------------------
@@ -1305,7 +1324,7 @@ void steer_around_walls(FollowCam& cam, const Step& step, void* world) {
 // part. The pitch return's weight (+0x130) pulls all three toward 1. Then the
 // point's distance from the orbit reference chases the target's by +0x1c4.
 // A reset puts the point on the target.
-Vec chase_point(FollowCam& cam) {
+Vec chase_point(FollowCam& cam, float frames60) {
     const Vec target = cam.wanted_tested;
     if (cam.reset_request) return target;
     const bool lock = cam.auto_turn || cam.lock_on;
@@ -1337,7 +1356,11 @@ Vec chase_point(FollowCam& cam) {
             rates = rates * _mm_setr_ps(t, 1.0f, t, 0.0f);
         }
     }
-    const Vec share = rates + (_mm_setr_ps(1.0f, 1.0f, 1.0f, 0.0f) - rates) * _mm_set1_ps(cam.return_weight);
+    Vec share = rates + (_mm_setr_ps(1.0f, 1.0f, 1.0f, 0.0f) - rates) * _mm_set1_ps(cam.return_weight);
+    if (frames60 > 0.0f) {
+        share = _mm_setr_ps(frame_rate_step::weight(share[0], frames60), frame_rate_step::weight(share[1], frames60),
+                            frame_rate_step::weight(share[2], frames60), share[3]);
+    }
     const Vec chased = point + (target - point) * share;
 
     const Vec out = chased - cam.orbit_reference;
@@ -1346,7 +1369,8 @@ Vec chase_point(FollowCam& cam) {
     if (out_length > 1e-5f) {
         const float target_distance = length3(target - cam.orbit_reference)[0];
         const float point_distance = length3(point - cam.orbit_reference)[0];
-        scale = (point_distance + (target_distance - point_distance) * cam.chase_distance_rate) / out_length;
+        scale = (point_distance + (target_distance - point_distance) * frame_rate_step::weight(cam.chase_distance_rate, frames60)) /
+                out_length;
     }
     return cam.orbit_reference + out * _mm_set1_ps(scale);
 }
@@ -1542,15 +1566,18 @@ void pull_toward_reference(FollowCam& cam) {
 }
 
 // The step, once the update has taken the mouse's counts.
-void follow_cam_step(u8* cam_bytes, u8* chr, void* world, float dt) {
+// `frames60`: this frame's length in 60 fps frames for the weights a converted
+// frame rate scales, 0 for the game's own arithmetic.
+void follow_cam_step(u8* cam_bytes, u8* chr, void* world, float dt, float frames60) {
     g_frames.fetch_add(1, std::memory_order_relaxed);
     FollowCam& cam = *reinterpret_cast<FollowCam*>(cam_bytes);
-    if (const u8* row = lock_cam_row(camera_param_id(cam))) ease_toward_lock_cam_param(cam, row);  // P1, P2
-    ease_distance_and_speeds(cam);                                                              // P3
-    if (!chr) return;                                                                           // P4
+    if (const u8* row = lock_cam_row(camera_param_id(cam))) ease_toward_lock_cam_param(cam, row, frames60);  // P1, P2
+    ease_distance_and_speeds(cam);                                                                         // P3
+    if (!chr) return;                                                                                      // P4
     Step step{};
     step.dt = dt;
     step.dt4 = _mm_set1_ps(dt);
+    step.frames60 = frames60;
     step.world = world;
     step.hold = held_turns();
     ride_moving_floor(cam, chr, step);                                       // P5
@@ -1562,11 +1589,11 @@ void follow_cam_step(u8* cam_bytes, u8* chr, void* world, float dt) {
     const bool auto_turning = choose_angles(cam, step);                      // P11
     run_return_timers(cam, step);                                            // P12
     steer_by_stick(cam, step, auto_turning);                                 // P13
-    return_pitch(cam);                                                       // P14
+    return_pitch(cam, step.frames60);                                        // P14
     place_wanted(cam, step);                                                 // P15
     cast_back_from_walls(cam, world);                                        // P16
     steer_around_walls(cam, step, world);                                    // P17
-    place_camera(cam, step, chase_point(cam));                               // P18
+    place_camera(cam, step, chase_point(cam, step.frames60));                // P18
     collide_camera(cam, world);                                              // P19
     clear_requests(cam);                                                     // P20
     guard_against_nan(cam, step.saved);                                      // P21
@@ -1580,7 +1607,9 @@ void follow_cam_step(u8* cam_bytes, u8* chr, void* world, float dt) {
 // the game's prologue does where ours is not in place.
 DECOMP_LEAF void follow_cam_update(u8* cam_bytes, u8* chr, void* world, float dt) {
     mouse_camera::begin_update();
-    follow_cam_step(cam_bytes, chr, world, dt);
+    const float frame = frame_rate_step::g_frame_seconds.load(std::memory_order_relaxed);
+    const bool converted = frame > 0.0f && frame_rate_step::g_camera_60_tuned.load(std::memory_order_relaxed);
+    follow_cam_step(cam_bytes, chr, world, dt, converted ? frame * 60.0f : 0.0f);
 }
 
 // ---- Placing it -------------------------------------------------------------
@@ -1698,7 +1727,7 @@ GUEST_ABI void update_compare(u8* cam, u8* chr, void* world, float dt) {
         after_game = load<u64>(gsm + 0x14);
         store<u64>(gsm + 0x14, overrides);
     }
-    follow_cam_step(ours, chr, world, dt);
+    follow_cam_step(ours, chr, world, dt, 0.0f);  // the game's arithmetic: compared at any frame rate
     if (gsm) {
         after_ours = load<u64>(gsm + 0x14);
         store<u64>(gsm + 0x14, after_game);

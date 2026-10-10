@@ -1310,6 +1310,10 @@ int apply_rate(ElfImage* image, int want) {
     if (sixty_ok) {
         g_sites_applied = write_sites(kSixtySites);
         g_frame_time_applied = write_sites(kFrameTimeSites);
+        // The camera's weights now hold Kyo's 60 fps values (the parameter
+        // stores above, kConstants' defaults): the decomp camera converts
+        // them to each frame's length (decomp/camera/follow_camera.cpp).
+        frame_rate_step::g_camera_60_tuned.store(true, std::memory_order_relaxed);
     }
     if (mode != 60) {
         g_cloth_applied = write_sites(kClothSites);
