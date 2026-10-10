@@ -1880,10 +1880,35 @@ bool init_locked() {
         g.fifo_latest_ready_ext = nullptr;
     }
     dlaa_add_device_extensions(g.phys, dext);
+    // The embedded FSR optical-flow shaders use linear compute derivatives.
+    // Enable the extension and feature together, only when the device has both.
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR fsr_derivatives{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
+    {
+        std::uint32_t count = 0;
+        vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &count, nullptr);
+        std::vector<VkExtensionProperties> extensions(count);
+        vkEnumerateDeviceExtensionProperties(g.phys, nullptr, &count, extensions.data());
+        const bool has_derivatives = std::any_of(extensions.begin(), extensions.end(), [](const auto& ext) {
+            return std::strcmp(ext.extensionName, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) == 0;
+        });
+        if (has_derivatives) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+            query.pNext = &fsr_derivatives;
+            vkGetPhysicalDeviceFeatures2(g.phys, &query);
+            if (fsr_derivatives.computeDerivativeGroupLinear)
+                dext.push_back(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+        }
+    }
     VkPhysicalDeviceFaultFeaturesEXT ffault{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     ffault.deviceFault = VK_TRUE;
     VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     if (g.has_device_fault) f13.pNext = &ffault;
+    if (fsr_derivatives.computeDerivativeGroupLinear) {
+        fsr_derivatives.computeDerivativeGroupQuads = VK_FALSE;
+        fsr_derivatives.pNext = f13.pNext;
+        f13.pNext = &fsr_derivatives;
+    }
     VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT fgpl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
     fgpl.graphicsPipelineLibrary = VK_TRUE;
     if (g.has_gpl) {

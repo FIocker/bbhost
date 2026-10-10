@@ -799,11 +799,15 @@ bool dlss_sr_upscale_hud_locked(RtImage* source, std::uint32_t in_w, std::uint32
     if (g_sr_hud_anchor == g_fg_current.frame_index) return true;
     const auto sr_format = fsr_selected() && source->format == VK_FORMAT_B8G8R8A8_UNORM ?
                            VK_FORMAT_R8G8B8A8_UNORM : source->format;
+    // The pinned FSR accumulation shader declares rgba16f storage output.
+    // Keep SDR input as SDR; only the owned reconstruction output needs FP16.
+    const auto output_format = fsr_selected() ? VK_FORMAT_R16G16B16A16_SFLOAT : sr_format;
     if (!g_sr_input.image || !g_sr_output.image || g_sr_image_iw != in_w || g_sr_image_ih != in_h ||
-        g_sr_image_ow != *out_w || g_sr_image_oh != *out_h || g_sr_input.format != sr_format) {
+        g_sr_image_ow != *out_w || g_sr_image_oh != *out_h || g_sr_input.format != sr_format ||
+        g_sr_output.format != output_format) {
         flush_locked(); destroy_image(g_sr_input); destroy_image(g_sr_output);
         if (!fg_resize_image_locked(g_sr_input, in_w, in_h, sr_format) ||
-            !fg_resize_image_locked(g_sr_output, *out_w, *out_h, sr_format)) {
+            !fg_resize_image_locked(g_sr_output, *out_w, *out_h, output_format)) {
             destroy_image(g_sr_input); destroy_image(g_sr_output);
             return false;
         }
@@ -830,7 +834,7 @@ bool dlss_sr_upscale_hud_locked(RtImage* source, std::uint32_t in_w, std::uint32
     VkImageCopy copy{};
     copy.srcSubresource = copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.extent = {*out_w, *out_h, 1};
-    if (sr_format == source->format) {
+    if (output_format == source->format) {
         vkCmdCopyImage(g_cmd(), g_sr_output.image, VK_IMAGE_LAYOUT_GENERAL, source->image,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
     } else {

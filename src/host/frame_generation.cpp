@@ -144,6 +144,8 @@ FrameGenerator::~FrameGenerator() {
 }
 
 bool FrameGenerator::init(VkInstance instance, VkPhysicalDevice phys, VkDevice device, std::uint32_t queue_family, VkQueue queue) {
+    fsr_support_checked_ = false;
+    fsr_supported_ = false;
     instance_ = instance;
     phys_ = phys;
     device_ = device;
@@ -371,6 +373,28 @@ bool FrameGenerator::ensure_feature(VkCommandBuffer cmd, std::uint32_t width, st
     } else {
 #if !defined(BBHOST_HAVE_FSR)
         return false;
+#else
+        if (!fsr_support_checked_) {
+            fsr_support_checked_ = true;
+            std::uint32_t count = 0;
+            vkEnumerateDeviceExtensionProperties(phys_, nullptr, &count, nullptr);
+            std::vector<VkExtensionProperties> extensions(count);
+            vkEnumerateDeviceExtensionProperties(phys_, nullptr, &count, extensions.data());
+            const bool has_derivatives = std::any_of(extensions.begin(), extensions.end(), [](const auto& ext) {
+                return std::strcmp(ext.extensionName, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME) == 0;
+            });
+            if (has_derivatives) {
+                VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
+                VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+                query.pNext = &derivatives;
+                vkGetPhysicalDeviceFeatures2(phys_, &query);
+                fsr_supported_ = derivatives.computeDerivativeGroupLinear;
+            }
+            if (!fsr_supported_)
+                host_log("framegen: FSR provider requires KHR linear compute derivatives; retaining ordinary presentation");
+        }
+        if (!fsr_supported_) return false;
 #endif
     }
 

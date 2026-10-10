@@ -10,6 +10,35 @@ bbhost includes independent Vulkan adapters for AMD FidelityFX Super Resolution:
 ### FSR 3.1.5 & FSR 3.1.6
 - Vulkan 1.3 capable GPU.
 - Support for 16-bit storage / float16.
+- Frame generation additionally requires `VK_KHR_compute_shader_derivatives`
+  with linear derivative groups for this provider's embedded optical-flow shaders.
+  Unsupported devices retain ordinary presentation.
+
+## Selecting providers
+
+Setup's Start-up and display section and the F10 menu offer separate
+reconstruction and frame-generation providers. Both take effect after restart.
+Reconstruction offers Off, Native AA, Quality, Balanced, Performance and Ultra
+Performance. FSR frame generation offers Off or 2x; it also works with
+reconstruction off. Object motion vectors feed either provider when enabled.
+
+The existing `[dlss]` configuration section remains compatible:
+
+```toml
+[dlss]
+upscaler_backend = "fsr3" # "dlss", "fsr3", or "fsr4"
+mode = "quality"
+frame_generation_backend = "fsr3" # "dlss" or "fsr3"
+frame_generation = true
+frame_generation_factor = 2
+object_motion = true
+```
+
+`BBHOST_UPSCALER` and `BBHOST_FG_BACKEND` override those providers for a run.
+This integration uses analytical FSR 3 frame generation, including when FSR 4
+reconstruction is selected; it does not provide FSR 4 ML frame generation.
+The optional source-v07 FSR 4 model is experimental and is not the newer FSR
+4.1.1 runtime.
 
 ### FSR 4 (source-v07)
 - Vulkan 1.3 with:

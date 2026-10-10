@@ -42,6 +42,7 @@ struct OwnedImage {
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
+    bool initialized = false;
 };
 
 void destroy_image(VkDevice device, OwnedImage& im) {
@@ -59,6 +60,7 @@ void destroy_image(VkDevice device, OwnedImage& im) {
     }
     im.format = VK_FORMAT_UNDEFINED;
     im.width = im.height = 0;
+    im.initialized = false;
 }
 
 bool create_image(VkPhysicalDevice phys, VkDevice device, OwnedImage& im,
@@ -311,7 +313,8 @@ struct FsrContext {
             return false;
         }
 
-        const VkImageUsageFlags uav_usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        const VkImageUsageFlags uav_usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                                            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         if (!create_image(phys, device, dilated_depth, shared.dilatedDepth.width, shared.dilatedDepth.height,
                          shared.dilatedDepth.format, uav_usage) ||
             !create_image(phys, device, dilated_motion, shared.dilatedMotionVectors.width, shared.dilatedMotionVectors.height,
@@ -550,6 +553,22 @@ bool fsr_upscale_locked(VkPhysicalDevice phys,
 
     if (g_ctx.active_backend == 1) {
         // Dispatch FSR 3.1.5
+        // These images belong to the host, so the bridge must see their real
+        // initial layout. It restores imported images to GENERAL after dispatch.
+        for (auto* image : {&g_ctx.dilated_depth, &g_ctx.dilated_motion, &g_ctx.reconstructed_prev_depth}) {
+            if (image->initialized) continue;
+            VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = image->image;
+            barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &barrier);
+            image->initialized = true;
+        }
         FfxVkFsr3_3_1_5Bridge* bridge = ffxVkFsr3_3_1_5UpscalerContextGetBridge(g_ctx.fsr3_ctx);
         if (!bridge) return false;
 

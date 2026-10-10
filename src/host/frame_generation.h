@@ -110,6 +110,8 @@ private:
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     bool feature_created_ = false;
     bool recreate_ = false;
+    bool fsr_support_checked_ = false;
+    bool fsr_supported_ = false;
     int active_backend_ = 0; // 0: DLSS, 1: FSR3
     FgHistory history_;
 

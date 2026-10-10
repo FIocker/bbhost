@@ -30,6 +30,29 @@ set(FFX_VK_PORTABLE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(fsr_vulkan)
 
+# The pinned bridge elides same-layout transitions. A reset can clear an image
+# immediately after its initial clear, so those transfer writes still need an
+# execution dependency. Keep this narrow SDK fix reproducible for fetched and
+# local providers, and reject unexpected source revisions rather than guessing.
+find_package(Git REQUIRED)
+set(fsr_clear_patch "${CMAKE_CURRENT_LIST_DIR}/fsr-clear-order.patch")
+execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${fsr_clear_patch}"
+  WORKING_DIRECTORY "${fsr_vulkan_SOURCE_DIR}" RESULT_VARIABLE fsr_patch_present
+  OUTPUT_QUIET ERROR_QUIET)
+if(NOT fsr_patch_present EQUAL 0)
+  execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check "${fsr_clear_patch}"
+    WORKING_DIRECTORY "${fsr_vulkan_SOURCE_DIR}" RESULT_VARIABLE fsr_patch_check
+    OUTPUT_QUIET ERROR_QUIET)
+  if(NOT fsr_patch_check EQUAL 0)
+    message(FATAL_ERROR "FSR provider does not match the pinned clear-order patch")
+  endif()
+  execute_process(COMMAND "${GIT_EXECUTABLE}" apply "${fsr_clear_patch}"
+    WORKING_DIRECTORY "${fsr_vulkan_SOURCE_DIR}" RESULT_VARIABLE fsr_patch_result)
+  if(NOT fsr_patch_result EQUAL 0)
+    message(FATAL_ERROR "Could not apply FSR provider clear-order patch")
+  endif()
+endif()
+
 add_library(bbhost_fsr_provider OBJECT ${CMAKE_CURRENT_SOURCE_DIR}/src/host/fsr_provider.cpp)
 target_include_directories(bbhost_fsr_provider PRIVATE
   "${fsr_vulkan_SOURCE_DIR}/upstream/ffx-2.3.0/Kits/FidelityFX/upscalers/fsr3/internal")
