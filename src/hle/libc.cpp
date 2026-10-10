@@ -6,6 +6,7 @@
 #include "hle/common.h"
 #include "hle/libc_ctype.h"
 #include "hle/libc_abi.h"
+#include "hle/libc_stdio.h"
 #include "hle/libc_random.h"
 #include "hle/fs.h"
 #include "core/tls_rewrite.h"
@@ -261,8 +262,12 @@ GUEST_ABI std::uint64_t hle_fread(void* p, std::uint64_t sz, std::uint64_t n, FI
 GUEST_ABI std::uint64_t hle_fwrite(const void* p, std::uint64_t sz, std::uint64_t n, FILE* f) {
     return std::fwrite(p, static_cast<std::size_t>(sz), static_cast<std::size_t>(n), f);
 }
-GUEST_ABI int hle_fseek(FILE* f, long off, int whence) { return std::fseek(f, off, whence); }
-GUEST_ABI long hle_ftell(FILE* f) { return std::ftell(f); }
+GUEST_ABI int hle_fseek(FILE* f, std::int64_t off, int whence) { return libc_result(bb::libc::seek(f, off, whence)); }
+GUEST_ABI std::int64_t hle_ftell(FILE* f) {
+    const auto offset = bb::libc::tell(f);
+    if (offset == -1) set_guest_errno_host(errno);
+    return offset;
+}
 GUEST_ABI void hle_rewind(FILE* f) { std::rewind(f); }
 GUEST_ABI int hle_feof(FILE* f) { return std::feof(f); }
 GUEST_ABI int hle_ferror(FILE* f) { return std::ferror(f); }
@@ -273,7 +278,7 @@ GUEST_ABI int hle_ungetc(int c, FILE* f) { return std::ungetc(c, f); }
 GUEST_ABI char* hle_fgets(char* s, int n, FILE* f) { return std::fgets(s, n, f); }
 GUEST_ABI int hle_fputc(int c, FILE* f) { return std::fputc(c, f); }
 GUEST_ABI int hle_fputs(const char* s, FILE* f) { return std::fputs(s, f); }
-GUEST_ABI int hle_fgetpos(FILE* f, std::fpos_t* p) { return std::fgetpos(f, p); }
+GUEST_ABI int hle_fgetpos(FILE* f, bb::libc::Fpos* p) { return libc_result(bb::libc::get_position(f, p)); }
 GUEST_ABI int hle_setvbuf(FILE* f, char* b, int m, std::uint64_t n) {
     const int host_mode = bb::libc::buffer_mode(m);
     if (host_mode < 0) return -1;

@@ -1,6 +1,7 @@
 // Optional differential oracle. No game bytes are embedded: BBHOST_LIBC_ELF
 // must name the user's decrypted sce_module/libc.elf.
 #include "hle/libc_abi.h"
+#include "hle/libc_stdio.h"
 
 #include <elf.h>
 #include <sys/mman.h>
@@ -23,6 +24,10 @@ namespace {
 int oracle_errno;
 std::uint64_t oracle_guard = 0x123456789abcdefULL;
 int* oracle_error() { return &oracle_errno; }
+std::int64_t oracle_seek(int fd, std::int64_t offset, int whence) {
+    CHECK(fd == 7 && offset == 0 && whence == SEEK_CUR);
+    return 0x100000123LL;
+}
 void unresolved_import() {
     std::fprintf(stderr, "native libc called an import outside this oracle's scope\n");
     std::abort();
@@ -98,6 +103,7 @@ struct NativeLibc {
                     const auto sym = get<Elf64_Sym>(dynlib + tags.at(0x61000039) + ELF64_R_SYM(r.r_info) * sizeof(Elf64_Sym));
                     const auto name = nid(sym);
                     if (name == "9BcDykPmo1I") { value = reinterpret_cast<std::uint64_t>(&oracle_error); error_bound = true; }
+                    else if (name == "xReSebwKApA") value = reinterpret_cast<std::uint64_t>(&oracle_seek);
                     else if (name == "f7uOxY9mM1U") { value = reinterpret_cast<std::uint64_t>(&oracle_guard); guard_bound = true; }
                     else if (sym.st_value) value = reinterpret_cast<std::uint64_t>(base + sym.st_value);
                     else value = reinterpret_cast<std::uint64_t>(&unresolved_import);
@@ -128,6 +134,17 @@ int main() {
     const auto signed_parse = lib.function<std::int64_t(*)(const char*, char**, int)>("7pNKcscKrf8");
     const auto unsigned_parse = lib.function<std::uint64_t(*)(const char*, char**, int)>("q+9E0X3aWpU");
     const auto wide_parse = lib.function<std::int64_t(*)(const char16_t*, char16_t**, int)>("34nH7v2xvNQ");
+    // Execute the native position converter with an empty narrow FILE.
+    // Its descriptor seek is supplied above; FILE layout and output writes
+    // are performed by the actual guest instructions.
+    alignas(8) unsigned char stream[136]{};
+    stream[0] = 1;
+    const int fd = 7;
+    std::memcpy(stream + 4, &fd, sizeof(fd));
+    Fpos position{};
+    const auto native_position = lib.function<std::int64_t(*)(void*, Fpos*)>("dYJJbxnyb74");
+    CHECK(native_position(stream, &position) == 0);
+    CHECK(position.offset == 0x100000123LL && position.state[0] == 0 && position.state[1] == 0);
     std::mt19937_64 rng(37);
     const char* extra[] = {"0x", "0xg", "0x1", "0778", "--12", "+-12", "-+12", "++12", " - 12",
         "9223372036854775808", "-9223372036854775809", "18446744073709551616", "-18446744073709551616"};
