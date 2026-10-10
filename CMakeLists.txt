@@ -45,6 +45,7 @@ add_executable(bbhost
   src/core/imports.cpp
   src/core/thunk.cpp
   src/core/portable.cpp
+  src/core/paced_file.cpp
   src/core/host_clock.cpp
   src/core/futex.cpp
   src/core/win_vm.cpp
@@ -411,6 +412,9 @@ if(UNIX)
   target_include_directories(write_watch_test PRIVATE src)
   target_link_libraries(write_watch_test PRIVATE pthread)
   add_test(NAME write_watch_test COMMAND write_watch_test)
+  add_executable(paced_file_test tests/paced_file_test.cpp src/core/paced_file.cpp)
+  target_include_directories(paced_file_test PRIVATE src)
+  add_test(NAME paced_file_test COMMAND paced_file_test)
   # The decomp's tests (tests/decomp, docs/decomp.md "How one is checked"):
   # the eboot kit loads the 1.09 eboot with bbhost's own loader, every import a
   # trap, and a test runs the game's functions beside ours. They skip (77)
@@ -500,7 +504,7 @@ if(UNIX)
   set_tests_properties(gcn_decode_test PROPERTIES SKIP_RETURN_CODE 77)
   # The translation cache (src/host/translation_cache.cpp, which it includes)
   # against the shipped shader bundles.
-  add_executable(translation_cache_test tests/translation_cache_test.cpp)
+  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp)
   target_include_directories(translation_cache_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(translation_cache_test PRIVATE gcn ZLIB::ZLIB)
   add_dependencies(translation_cache_test bbhost_translator_fingerprint)

@@ -1,5 +1,6 @@
 #include "core/config.h"
 #include "core/host_clock.h"
+#include "core/paced_file.h"
 #include "core/portable.h"
 #include "host/foreign_hooks.h"
 #include "host/gpu_internal.h"
@@ -5317,28 +5318,13 @@ std::size_t g_cache_size_hint = 0;  // the last serialized size; under g_cache_s
 bool g_cache_save_every = false;     // BBHOST_PIPELINE_CACHE_SAVE_S set
 
 // Writes the file through a temporary one, 8 MiB at a time, each chunk on the
-// device before the next is written. Written at once, the cache (313 MB) was
-// seconds of write-back that other threads' file reads and log writes queued
-// behind: a 2.9 s main-loop frame at boot and a 1 s stall in play, over NFS.
+// device before the next is written (HostPacedFile). Written at once, the
+// cache (313 MB) was seconds of write-back that other threads' file reads and
+// log writes queued behind: a 2.9 s main-loop frame at boot and a 1 s stall in
+// play, over NFS.
 bool write_file_paced(const std::string& path, const char* data, std::size_t size) {
-    const std::string tmp = path + ".tmp";
-    std::FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (!f) return false;
-    constexpr std::size_t kChunk = 8u << 20;
-    bool ok = true;
-    for (std::size_t at = 0; ok && at < size; at += kChunk) {
-        const std::size_t n = std::min(kChunk, size - at);
-        ok = std::fwrite(data + at, 1, n, f) == n && std::fflush(f) == 0;
-#if defined(_WIN32)
-        ok = ok && _commit(_fileno(f)) == 0;
-#else
-        ok = ok && ::fdatasync(fileno(f)) == 0;
-#endif
-    }
-    ok = std::fclose(f) == 0 && ok;
-    std::error_code ec;
-    if (ok) std::filesystem::rename(tmp, path, ec);
-    return ok && !ec;
+    HostPacedFile f(path, path + ".tmp");
+    return f.write(data, size) && f.commit();
 }
 
 // Serializes the cache and writes it if it grew. The cache is ~230 MB, and

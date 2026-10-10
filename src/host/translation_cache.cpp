@@ -1,5 +1,6 @@
 #include "host/translation_cache.h"
 
+#include "core/paced_file.h"
 #include "core/portable.h"
 #include "log.h"
 #include "translator_fingerprint.h"
@@ -650,25 +651,19 @@ void translation_cache_save(const std::string& path, bool force) {
     head.u32(static_cast<std::uint32_t>(keep));
     std::error_code ec;
     std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
-    const std::string tmp = path_tmp(path);
-    bool ok = false;
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        f.write(reinterpret_cast<const char*>(head.out.data()), static_cast<std::streamsize>(head.out.size()));
-        for (std::size_t k = 0; k < keep && f; ++k) {
-            Writer e;
-            e.u64(out[k].key.a);
-            e.u64(out[k].key.b);
-            e.u32(out[k].slot.raw);
-            e.u32(out[k].slot.size);
-            f.write(reinterpret_cast<const char*>(e.out.data()), static_cast<std::streamsize>(e.out.size()));
-            f.write(reinterpret_cast<const char*>(out[k].slot.data), static_cast<std::streamsize>(out[k].slot.size));
-        }
-        ok = static_cast<bool>(f);
+    // A chunk at a time: written at once, its write-back held every other file
+    // operation on a slow disk for as long - 1.5 s over NFS.
+    HostPacedFile f(path, path_tmp(path));
+    bool ok = f.write(head.out.data(), head.out.size());
+    for (std::size_t k = 0; k < keep && ok; ++k) {
+        Writer e;
+        e.u64(out[k].key.a);
+        e.u64(out[k].key.b);
+        e.u32(out[k].slot.raw);
+        e.u32(out[k].slot.size);
+        ok = f.write(e.out.data(), e.out.size()) && f.write(out[k].slot.data, out[k].slot.size);
     }
-    if (ok) std::filesystem::rename(tmp, path, ec);
-    if (!ok || ec) {
-        std::filesystem::remove(tmp, ec);
+    if (!ok || !f.commit()) {
         host_log("render: saving the translation cache to %s failed", path.c_str());
         return;
     }

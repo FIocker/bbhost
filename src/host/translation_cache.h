@@ -18,8 +18,9 @@
 // lifter starts the file again. Kyo's preload keeps its SPIR-V the same way.
 //
 // Entries are compressed (zlib) and read lazily, at a lookup; the file is read
-// whole at device start, rewritten whole (to a temporary, then renamed) at
-// most once a minute while new translations come in, and at exit.
+// whole at device start, rewritten whole (to a temporary a chunk at a time,
+// then renamed) at most once a minute while new translations come in, and at
+// exit.
 
 #include "gcn/lift.h"
 #include "gcn/translate.h"
