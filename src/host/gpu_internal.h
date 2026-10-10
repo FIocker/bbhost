@@ -133,6 +133,9 @@ struct DevBuffer {
     VkDeviceAddress address = 0;
     void* map = nullptr;
     std::uint64_t size = 0;
+    // A device-local buffer that found video memory full and went to host
+    // memory (create_dev_buffer): read across the bus until it is made again.
+    bool in_host = false;
 };
 
 struct ComputePipeline {
@@ -608,6 +611,19 @@ std::uint64_t vram_reserve_bytes();
 bool vram_within_reserve(std::uint64_t more = 0);
 // Textures kept out of the reserve so far (placed in host memory instead).
 std::uint64_t vram_reserve_refusals();
+// Whether what a shortage put in host memory comes back once video memory has
+// room (BBHOST_VRAM_RETURN, on with the reserve): the mirrors, textures,
+// render targets and snapshots, device buffers.
+bool vram_return_on();
+// Whether video memory has `bytes` free above the reserve and `margin`.
+bool vram_room_for(std::uint64_t bytes, std::uint64_t margin = 256ull << 20);
+// The render targets and snapshots in host memory, one a call at most, moved
+// back into video memory (render.cpp; while recording - it records the copy).
+void render_return_targets_locked();
+// Textures in host memory dropped, at most 64 MiB a call, to be made again in
+// video memory at their next bind (textures.cpp).
+void textures_return_from_host_locked();
+std::string vram_return_report();  // the 5-second report's counts
 // Frees `m` with `image` once the recording in progress has retired.
 void defer_destroy_image(VkImage image, const ImageMemory& m);
 std::string image_heap_report();
@@ -725,6 +741,9 @@ void shadow_budget_locked();
 // it retires, and draws read vertex and index data from host memory from
 // then on.
 void shadow_give_back_locked(Gpu::Slot& slot);
+// Mirrors given back come back once video memory has had room for them a
+// while (vram_return_on). Called at each submission that gave nothing back.
+void shadow_return_locked();
 std::string shadow_report();
 std::uint64_t fnv1a(const void* data, std::size_t n, std::uint64_t h = 1469598103934665603ull);
 void bind_dummy_images(VkDescriptorSet set, const gcn::TranslateResult& meta, std::vector<VkWriteDescriptorSet>& writes,
@@ -821,6 +840,10 @@ struct RtImage {
     // draw, a fill or a copy last wrote it: its age and order for the reuse
     // retire (image_reuse_sweep_locked).
     std::uint64_t created_flip = 0, written_flip = 0, written_ms = 0;
+    // How its image was made, to make it again elsewhere (a target that went
+    // to host memory for want of video memory comes back: render_return_targets_locked).
+    VkImageCreateFlags create_flags = 0;
+    VkImageUsageFlags usage = 0;
 };
 // The bytes a target covers in guest memory (render.cpp).
 std::size_t rt_size_bytes(const RtImage& r);

@@ -162,6 +162,9 @@ constexpr std::uint64_t kImageRoom = 6656ull << 20;
 std::uint64_t g_mirror_cap = 0;    // shadow_budget_locked
 std::uint64_t g_mirror_bytes = 0;  // video memory the mirrors hold: whole mirrors and sparse blocks
 bool g_given_back = false;
+std::uint64_t g_initial_cap = 0;     // the share at the start, which mirrors that come back get again
+std::uint64_t g_given_back_ms = 0;   // when video memory last ran short (shadow_give_back_locked)
+std::uint64_t g_gives = 0, g_returns = 0;
 VkCommandBuffer g_upload_cmd[kSlots] = {};
 int g_upload_slot = -1;  // the slot whose upload buffer is recording, or -1
 std::size_t g_last_map = 0;  // g.maps index of the last hit
@@ -748,6 +751,7 @@ void shadow_budget_locked() {
     const char* e = std::getenv("BBHOST_SHADOW_VRAM_MB");
     g_mirror_cap = e && *e ? static_cast<std::uint64_t>(std::strtoull(e, nullptr, 10)) << 20
                            : g.local_budget > kImageRoom ? g.local_budget - kImageRoom : 0;
+    g_initial_cap = g_mirror_cap;
     if (!buffer_shadow_on()) return;
     if (!g.has_sparse && g_mirror_cap < kChunkBytes) {
         host_log("buffer shadow: no mirrors - one is a whole %llu MiB chunk here (no sparse binding), and the mirrors' share of video "
@@ -773,11 +777,45 @@ void shadow_give_back_locked(Gpu::Slot& slot) {
     const std::uint64_t held = g_mirror_bytes;
     g_mirror_bytes = 0;
     g_mirror_cap = 0;
+    g_given_back_ms = now_ms();
     if (!g_given_back) {
         g_given_back = true;
-        host_log("buffer shadow: video memory ran short - %u mirror(s), %llu MiB, given back to the images; vertex and index data are "
-                 "read from host memory from now on", mirrors, static_cast<unsigned long long>(held >> 20));
+        if (g_gives++ < 8)
+            host_log("buffer shadow: video memory ran short - %u mirror(s), %llu MiB, given back to the images; vertex and index data are "
+                     "read from host memory %s", mirrors, static_cast<unsigned long long>(held >> 20),
+                     vram_return_on() ? "until video memory has room for them again" : "from now on");
     }
+}
+
+// Mirrors given back for a shortage come back once video memory has had room
+// for them for 15 s: the share they started with, or what is free above the
+// reserve and a margin if less. A card that ran short once read every vertex
+// and index across the bus for the rest of the session - one 64 MiB scratch
+// chunk at a load took a 5 GB card from 60 fps to 44.8 for good.
+void shadow_return_locked() {
+    if (!g_given_back || !vram_return_on() || !buffer_shadow_on()) return;
+    static std::uint64_t roomy_since = 0;
+    const std::uint64_t now = now_ms();
+    const std::int64_t room = vram_headroom() - static_cast<std::int64_t>(vram_reserve_bytes()) - (256ll << 20);
+    if (room < (512ll << 20) || now - g_given_back_ms < 15000) {
+        roomy_since = 0;
+        return;
+    }
+    if (!roomy_since) roomy_since = now;
+    if (now - roomy_since < 15000) return;
+    roomy_since = 0;
+    std::uint32_t reset = 0;
+    for (Mirror& m : g_mirrors) {
+        if (m.failed && !m.buffer) {
+            m = Mirror{};
+            ++reset;
+        }
+    }
+    g_mirror_cap = std::min<std::uint64_t>(g_initial_cap, static_cast<std::uint64_t>(room));
+    g_given_back = false;
+    if (g_returns++ < 8)
+        host_log("buffer shadow: video memory has room again - the mirrors come back (%u chunk(s), a share of %llu MiB)", reset,
+                 static_cast<unsigned long long>(g_mirror_cap >> 20));
 }
 
 std::string shadow_report() {
@@ -808,7 +846,14 @@ std::string shadow_report() {
                   static_cast<unsigned long long>(resident), static_cast<unsigned long long>((resident * kPageBytes) >> 20),
                   static_cast<unsigned long long>(g_mirror_bytes >> 20), static_cast<unsigned long long>(g_mirror_cap >> 20),
                   g_given_back ? " (given back: video memory ran short)" : "");
-    return std::string(buf) + h + rr;
+    std::string out = std::string(buf) + h + rr;
+    if (g_gives || g_returns) {
+        char gr[96];
+        std::snprintf(gr, sizeof(gr), "; given back %llu time(s), back %llu", static_cast<unsigned long long>(g_gives),
+                      static_cast<unsigned long long>(g_returns));
+        out += gr;
+    }
+    return out;
 }
 
 }  // namespace gpu

@@ -946,6 +946,7 @@ bool create_dev_buffer(DevBuffer& b, std::uint64_t size, bool host_visible, bool
             b.buffer = VK_NULL_HANDLE;
             return false;
         }
+        b.in_host = true;
         g.vram_short.store(true, std::memory_order_relaxed);
     }
     vkBindBufferMemory(g.device, b.buffer, b.memory, 0);
@@ -3959,8 +3960,10 @@ constexpr std::uint64_t kScratchKeepBytes = 256ull << 20;
 std::atomic<std::uint64_t> g_scratch_created{0}, g_scratch_placed{0};
 std::atomic<std::uint64_t> g_scratch_refusals{0};  // chunks not made for want of room above the reserve
 void scratch_let_go_locked(const DevBuffer& b) {
-    // Not kept while video memory is down to the reserve.
-    if (g.scratch_free_bytes + b.size <= kScratchKeepBytes && !vram_within_reserve()) {
+    // Not kept while video memory is down to the reserve, nor one in host
+    // memory (made while video memory was full): the next chunk is made in
+    // video memory if there is room by then (vram_return_on).
+    if (g.scratch_free_bytes + b.size <= kScratchKeepBytes && !vram_within_reserve() && !(b.in_host && vram_return_on())) {
         g.scratch_free.push_back(b);
         g.scratch_free_bytes += b.size;
     } else {
@@ -4208,6 +4211,27 @@ bool vram_within_reserve(std::uint64_t more) {
 
 std::uint64_t vram_reserve_refusals() { return g_reserve_refusals.load(std::memory_order_relaxed); }
 
+// BBHOST_VRAM_RETURN=0: what a shortage put in host memory stays there for
+// the session, as before. On with the reserve.
+bool vram_return_on() {
+    static const bool env_off = [] {
+        const char* e = std::getenv("BBHOST_VRAM_RETURN");
+        return e && e[0] == '0';
+    }();
+    return g_vram_reserve && !env_off;
+}
+
+bool vram_room_for(std::uint64_t bytes, std::uint64_t margin) {
+    return vram_headroom() >= static_cast<std::int64_t>(g_vram_reserve + margin + bytes);
+}
+
+std::string textures_return_report();  // textures.cpp
+std::string render_return_report();    // render.cpp
+std::string vram_return_report() {
+    if (!vram_return_on()) return {};
+    return textures_return_report() + render_return_report();
+}
+
 bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture) {
     out = ImageMemory{};
     const std::uint32_t local = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -4290,10 +4314,11 @@ std::string image_heap_report() {
             (g.mem_props.memoryTypes[b.type].heapIndex == g.local_heap ? free_vram : free_host) += kHeapBlock - b.used;
         }
         host_log("  video memory: headroom %lld MiB, reserve %llu MiB; image heap free %llu MiB in video memory, %llu MiB in host "
-                 "blocks; textures kept out of the reserve %llu, untile scratch chunks %llu",
+                 "blocks; textures kept out of the reserve %llu, untile scratch chunks %llu%s",
                  static_cast<long long>(vram_headroom() >> 20), static_cast<unsigned long long>(g_vram_reserve >> 20),
                  static_cast<unsigned long long>(free_vram >> 20), static_cast<unsigned long long>(free_host >> 20),
-                 static_cast<unsigned long long>(g_reserve_refusals.load()), static_cast<unsigned long long>(g_scratch_refusals.load()));
+                 static_cast<unsigned long long>(g_reserve_refusals.load()), static_cast<unsigned long long>(g_scratch_refusals.load()),
+                 vram_return_report().c_str());
     }
     return buf;
 }
@@ -4718,6 +4743,11 @@ void submit_locked() {
     transfer_flush_locked();
     render_end_pass_locked();
     copy_versions_flush_locked();
+    // A render target a shortage put in host memory goes back into video
+    // memory once there is room: its copy recorded here, after everything
+    // this recording wrote it with (vram_return_on; one at most, once a
+    // second).
+    render_return_targets_locked();
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -4809,6 +4839,7 @@ void submit_locked() {
     // mirrors are a cache and the images are not, so they go - freed once
     // this submission, the last that reads them, retires.
     if (g.vram_short.exchange(false, std::memory_order_relaxed)) shadow_give_back_locked(cur);
+    else shadow_return_locked();
     textures_submitted(g.slot);
     g.queued = 0;
     ++g.flushes;

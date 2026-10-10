@@ -1330,14 +1330,20 @@ void surface_written(Surface& sf) {
     sf.written_flip = hle_video_flip_count();
     sf.written_ms = now_ms();
 }
+// Surfaces whose image is in host memory for want of video memory
+// (textures_return_from_host_locked looks for them only while there are any).
+std::uint64_t g_host_surfaces = 0;
+bool surface_in_host(const Surface& sf) { return sf.image && !image_memory_in_vram(sf.memory); }
 void note_surface_added(Surface& sf) {
     surface_written(sf);
+    if (surface_in_host(sf)) ++g_host_surfaces;
     occupancy_add(sf, 1);
     if (sf.total_src <= kLargeSurfaceSrc) return;
     g_large_surfaces[sf.base] = &sf;
     g_max_large_src = std::max(g_max_large_src, sf.total_src);
 }
 void note_surface_erased(const Surface& sf) {
+    if (surface_in_host(sf) && g_host_surfaces) --g_host_surfaces;
     occupancy_add(sf, ~0u);
     g_large_surfaces.erase(sf.base);
 }
@@ -3296,6 +3302,53 @@ void textures_before_submit() {
     g_batch_preps.clear();
     retire_surfaces_locked();
     image_reuse_sweep_locked();
+    textures_return_from_host_locked();
+}
+
+// Textures a shortage (or the reserve) put in host memory come back once
+// video memory has room again: the surface goes as a retired one does, and its
+// next bind makes it again - in video memory now - from the guest memory that
+// holds its texels. Never one a shader or a copy wrote (its image holds what
+// guest memory does not). Once a second, 64 MiB a turn at most, with 512 MiB
+// to spare above the reserve so what comes back does not push other textures
+// out again.
+std::uint64_t g_returned_surfaces = 0, g_returned_bytes = 0;
+
+void textures_return_from_host_locked() {
+    if (!g_host_surfaces || !vram_return_on()) return;
+    static std::uint64_t last_ms = 0;
+    const std::uint64_t now = now_ms();
+    if (now - last_ms < 1000) return;
+    last_ms = now;
+    const std::int64_t room = vram_headroom() - static_cast<std::int64_t>(vram_reserve_bytes() + (512ull << 20));
+    if (room <= 0) return;
+    std::uint64_t budget = std::min<std::uint64_t>(static_cast<std::uint64_t>(room), 64ull << 20);
+    bool any = false;
+    for (auto it = g_surfaces.begin(); it != g_surfaces.end() && budget;) {
+        Surface& sf = it->second;
+        if (!surface_in_host(sf) || sf.failed || sf.gpu_written || sf.copied_mips || sf.memory.size > budget) {
+            ++it;
+            continue;
+        }
+        budget -= sf.memory.size;
+        ++g_returned_surfaces;
+        g_returned_bytes += sf.memory.size;
+        for (auto& v : sf.views) defer_destroy_view(v.second);
+        defer_destroy_image(sf.image, sf.memory);
+        if (g_last_view_surface == &sf) g_last_view_surface = nullptr;
+        note_surface_erased(sf);
+        it = g_surfaces.erase(it);
+        any = true;
+    }
+    if (any) bump_view_epoch();
+}
+
+std::string textures_return_report() {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), ", textures in host memory %llu, back from it %llu (%llu MiB)",
+                  static_cast<unsigned long long>(g_host_surfaces), static_cast<unsigned long long>(g_returned_surfaces),
+                  static_cast<unsigned long long>(g_returned_bytes >> 20));
+    return buf;
 }
 
 ReuseRetired textures_retire_reused_locked(std::uint64_t now, std::uint64_t idle_ms, std::chrono::steady_clock::time_point deadline) {

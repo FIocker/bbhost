@@ -1415,6 +1415,8 @@ RtImage* rt_image(std::uint64_t base, VkFormat format, std::uint32_t width, std:
     ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                 (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    r.create_flags = ici.flags;
+    r.usage = ici.usage;
     if (vkCreateImage(g.device, &ici, nullptr, &r.image) != VK_SUCCESS) {
         host_log("render: image creation failed (format %d %ux%u)", format, width, height);
         if (grow || carry) destroy_rt_image(grown_from);
@@ -6576,6 +6578,99 @@ void record_pass_barrier(VkCommandBuffer cmd) {
 
 namespace {
 
+// A render target or snapshot a shortage put in host memory comes back into
+// video memory once there is room for it: a new image made as the old one was,
+// the contents copied over, the old one retired as a replaced target is (its
+// views invalidated, freed once the work in flight has run). A target in host
+// memory is drawn and read across the bus every frame - two of them at 4K held
+// a 12 GB card's session at 3 fps. Called from the submission while it still
+// records, one target at most and once a second.
+std::uint64_t g_rt_returned = 0, g_rt_returned_bytes = 0;  // under g.mu
+
+bool rt_return_one_locked(RtImage& r) {
+    RtImage n = r;
+    n.image = VK_NULL_HANDLE;
+    n.view = VK_NULL_HANDLE;
+    n.layer_views.clear();
+    n.memory = ImageMemory{};
+    n.initialised = false;
+    VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    VkFormat view_formats[5];
+    VkImageFormatListCreateInfo format_list{VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    if (r.format_listed) {
+        format_list.viewFormatCount = rt_view_formats(r.format, view_formats);
+        format_list.pViewFormats = view_formats;
+        ici.pNext = &format_list;
+    }
+    ici.flags = r.create_flags;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = r.format;
+    ici.extent = {r.width, r.height, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = r.layers;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = r.usage;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    if (vkCreateImage(g.device, &ici, nullptr, &n.image) != VK_SUCCESS) return false;
+    if (!rt_image_memory(n.image, n.memory) || !image_memory_in_vram(n.memory)) {
+        vkDestroyImage(g.device, n.image, nullptr);
+        if (n.memory.memory) defer_destroy_image(VK_NULL_HANDLE, n.memory);
+        return false;
+    }
+    VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = n.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = n.format;
+    vci.subresourceRange = {aspect_of(n), 0, 1, 0, 1};
+    if (vkCreateImageView(g.device, &vci, nullptr, &n.view) != VK_SUCCESS) {
+        vkDestroyImage(g.device, n.image, nullptr);
+        defer_destroy_image(VK_NULL_HANDLE, n.memory);
+        return false;
+    }
+    if (r.initialised) copy_layers_locked(r, n);
+    destroy_rt_image(r);
+    r = std::move(n);
+    ++g_rt_gen;
+    bump_view_epoch();
+    return true;
+}
+
+}  // namespace
+
+void render_return_targets_locked() {
+    if (!vram_return_on()) return;
+    static std::uint64_t last_ms = 0;
+    const std::uint64_t now = steady_ms();
+    if (now - last_ms < 1000) return;
+    last_ms = now;
+    for (std::map<std::uint64_t, RtImage>* m : {&g_rts, &g_snapshots}) {
+        for (auto& [base, r] : *m) {
+            if (!r.image || image_memory_in_vram(r.memory)) continue;
+            if (!vram_room_for(r.memory.size)) return;
+            const std::uint64_t bytes = r.memory.size;
+            if (!rt_return_one_locked(r)) return;
+            ++g_rt_returned;
+            g_rt_returned_bytes += bytes;
+            if (g_rt_returned <= 8)
+                host_log("render: %s 0x%llx %ux%u format %d back in video memory from host memory (%llu MiB)",
+                         m == &g_rts ? (r.depth ? "depth target" : "render target") : "snapshot", static_cast<unsigned long long>(base),
+                         r.width, r.height, static_cast<int>(r.format), static_cast<unsigned long long>(bytes >> 20));
+            return;
+        }
+    }
+}
+
+std::string render_return_report() {
+    if (!g_rt_returned) return {};
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), ", targets back from host memory %llu (%llu MiB)", static_cast<unsigned long long>(g_rt_returned),
+                  static_cast<unsigned long long>(g_rt_returned_bytes >> 20));
+    return buf;
+}
+
+namespace {
+
 // Copies the layers `from` has into the same layers of `to`: a layered target
 // that grew keeps the slices already drawn.
 void copy_layers_locked(const RtImage& from, RtImage& to) {
@@ -7388,6 +7483,8 @@ RtImage* make_copy_snapshot_locked(std::uint64_t src_base, std::uint64_t dst_bas
     r.storage = from_depth && depth_copy_available_locked();
     if (r.storage) ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    r.create_flags = ici.flags;
+    r.usage = ici.usage;
     if (vkCreateImage(g.device, &ici, nullptr, &r.image) != VK_SUCCESS) return nullptr;
     if (!rt_image_memory(r.image, r.memory)) {
         vkDestroyImage(g.device, r.image, nullptr);
@@ -7471,6 +7568,12 @@ bool record_target_copy_locked(RtImage& src, RtImage& dst, std::uint32_t width, 
         // The barrier above orders each reuse after the last one's reads.
         static DevBuffer scratch;
         const std::size_t need = static_cast<std::size_t>(width) * height * 4;
+        // One a shortage put in host memory is made again in video memory
+        // once there is room (vram_return_on).
+        if (scratch.in_host && vram_return_on() && vram_room_for(scratch.size)) {
+            defer_destroy(scratch);
+            scratch = DevBuffer{};
+        }
         if (scratch.size < need) {
             if (scratch.buffer) defer_destroy(scratch);
             scratch = DevBuffer{};
