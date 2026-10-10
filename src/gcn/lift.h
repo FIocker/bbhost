@@ -21,11 +21,34 @@
 
 namespace gcn {
 
+// The GCN program's wave and quad operations and what the lift made of them.
+// Speed-only: shortcuts a wave takes that change no pixel's result - the lift
+// runs per pixel without them, and an HLSL emitter drops them too. Semantic:
+// operations whose results depend on the other pixels of a quad or on which
+// pixels survive - kept, as Shader Model 6 quad operations, derivatives,
+// helper-lane queries or discard.
+struct WaveOps {
+    // speed-only (dropped)
+    std::uint32_t execz_skips = 0;   // s_cbranch_execz over a region: the region runs, its writes masked per pixel
+    std::uint32_t kill_skips = 0;    // s_cbranch_scc0 over a kill region: the pixel's own guard bit masks it
+    std::uint32_t wave_tests = 0;    // s_cbranch_vccz/vccnz on a VCC shown the same in every lane: a per-pixel condition
+    std::uint32_t lane_exits = 0;    // a divergent loop's per-lane exit idiom (s_andn2_b64 + s_cbranch_scc0): a per-pixel break
+    std::uint32_t whole_quad = 0;    // s_wqm_b64: helper lanes run whole quads anyway
+    std::uint32_t spill_lanes = 0;   // v_writelane_b32 / v_readlane_b32 of a spilled scalar: a register
+    // semantic (kept)
+    std::uint32_t quad_swizzles = 0;  // ds_swizzle_b32 within a quad: QuadReadLaneAt / QuadReadAcross*
+    std::uint32_t implicit_lod = 0;   // samples whose LOD comes from the quad's derivatives
+    std::uint32_t lod_queries = 0;    // image_get_lod: CalculateLevelOfDetailUnclamped
+    std::uint32_t helper_queries = 0; // whether a quad holds a live pixel (HelperInvocation + quad reads)
+    std::uint32_t discards = 0;       // pixels discarded: EXEC clear at s_endpgm, or a clip distance below 0
+};
+
 struct LiftResult {
     std::vector<std::uint32_t> spirv;
     std::vector<std::string> rejections;  // why the program was not lifted; empty on success
     std::vector<std::string> proof;       // what the lift relied on
     std::string listing;                  // the program with the typed value each write produced
+    WaveOps wave;                         // on success
     bool ok() const { return rejections.empty() && !spirv.empty(); }
 };
 

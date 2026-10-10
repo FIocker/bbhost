@@ -1454,6 +1454,7 @@ private:
                 reg[cell_key(in.dst, ln)] = v;
                 note_result(v);
                 note_region_write(cell_key(in.dst, ln));
+                ++res.wave.spill_lanes;
             }
             // Without a known lane every cell of vN is gone in the reference
             // too (gcn/wave.h): no later v_readlane_b32 of vN reads one.
@@ -1483,6 +1484,7 @@ private:
         note_read(it->second);
         write_scalar(in.dst, it->second);
         ++cell_reads;
+        ++res.wave.spill_lanes;
     }
 
     // ---- 64-bit operands -------------------------------------------------------------
@@ -1594,6 +1596,7 @@ private:
                 reject("whole-quad mode outside a pixel shader: a quad's other lanes are other vertices");
                 return;
             }
+            ++res.wave.whole_quad;
             const Val a = read_lane(in.src0);
             if (!a.constant && !widen_ok) {
                 if (begin_whole_quad(in, a)) return;
@@ -2494,6 +2497,7 @@ private:
             if ((in.dmask >> k) & 1) write_v(in.vdata + out++, flt(extract(t_f32, lod, k)));
         }
         lod_queries.push_back(in.offset);
+        ++res.wave.lod_queries;
     }
 
     // The reference's image `ii` itself, for the instructions that take no
@@ -2712,6 +2716,7 @@ private:
             if ((in.dmask >> k) & 1) write_v(in.vdata + out++, flt(extract(t_f32, texel, k)));
         }
         (e.constant && e.set ? samples : varying_samples).push_back(in.offset);
+        if (opt.stage == Stage::Pixel && !lod && !dx) ++res.wave.implicit_lod;
         if (in_divergent_loop()) divergent_samples.push_back(in.offset);  // explicit LOD or gradients (checked above)
     }
 
@@ -3030,6 +3035,7 @@ private:
             write_v(in.dst, src);
             return;
         }
+        ++res.wave.quad_swizzles;  // a quad operation (folded ones above need none)
         const Id type = src.kind == Kind::Float ? t_f32 : t_u32;
         const Id v = src.kind == Kind::Float ? as_f(src) : as_u(src);
         Id r;
@@ -3350,6 +3356,7 @@ private:
         m.emit_void(spv::OpSelectionMerge, {a.merge, 0u});
         m.emit_void(spv::OpBranchConditional, {cond, a.then_label, a.else_label});
         cur_label = m.label(a.then_label);
+        if (c.op >= 6) ++res.wave.wave_tests;  // VCCZ tests all 64 bits; shown the same in every lane
         arms.push_back(std::move(a));
         ++if_constructs;
     }
@@ -3685,6 +3692,7 @@ private:
                 if (divergent) kill_proofs.push_back({r.guard, true});
             }
             ++kill_regions;
+            ++res.wave.kill_skips;
         }
         // Every path out of the region, through the rest of the program and
         // around loops, must write each of them before reading it.
@@ -4199,6 +4207,7 @@ private:
                 Id any = kept;
                 for (std::uint32_t d = 0; d < 3; ++d) any = m.emit(spv::OpLogicalOr, t_bool, {any, quad_swap(t_bool, kept, d)});
                 l.quad_live = any;
+                ++res.wave.helper_queries;
                 l.quad_region = (*it)->start;
                 break;
             }
@@ -4308,6 +4317,7 @@ private:
                 return;
             }
         } else if (in.op == 6 || in.op == 7) {
+            ++res.wave.wave_tests;  // VCCZ tests all 64 bits; shown the same in every lane
             Val bit;
             std::uint32_t split = 0;
             if (!vcc_branch_bit(bit, split)) {
@@ -4558,6 +4568,7 @@ private:
                 return;
             }
             ++divergent_loops;
+            ++res.wave.lane_exits;
         }
         ++loops_lifted;
         std::string kept;
@@ -4604,6 +4615,7 @@ private:
         m.emit_void(spv::OpKill, {});
         cur_label = m.label(l_on);
         clip_discard = true;
+        ++res.wave.discards;
     }
 
     // ---- module ----------------------------------------------------------------------
@@ -4875,6 +4887,8 @@ private:
             m.store(out_param(static_cast<int>(TranslateOptions::vs_clip_location(opt.vs_out_cntl))),
                     m.emit(spv::OpCompositeConstruct, t_v4f, {cf(1.0f), cf(1.0f), cf(1.0f), cf(1.0f)}));
         }
+        if (needs_kill) ++res.wave.discards;
+        res.wave.execz_skips = static_cast<std::uint32_t>(std::count_if(regions.begin(), regions.end(), [](const Region& r) { return !r.kill && !r.disabled; }));
         if (needs_kill) {  // translate.cpp's end of main
             const Id l_kill = m.fresh(), l_ret = m.fresh();
             m.emit_void(spv::OpSelectionMerge, {l_ret, 0u});
@@ -4980,6 +4994,13 @@ private:
                            "(only its v_writelane_b32s reach it, on every path); a VGPR a scalar is parked in is not read as this "
                            "pixel's word until written whole");
         }
+        const WaveOps& w = res.wave;
+        head.push_back("wave and quad operations: speed-only, dropped - " + std::to_string(w.execz_skips) + " s_cbranch_execz skips, " +
+                       std::to_string(w.kill_skips) + " kill-region skips, " + std::to_string(w.wave_tests) + " VCC tests made per pixel, " +
+                       std::to_string(w.lane_exits) + " per-lane loop exits, " + std::to_string(w.whole_quad) + " s_wqm_b64, " +
+                       std::to_string(w.spill_lanes) + " spill-lane moves; semantic, kept - " + std::to_string(w.quad_swizzles) +
+                       " quad swizzles, " + std::to_string(w.implicit_lod) + " implicit-LOD samples, " + std::to_string(w.lod_queries) +
+                       " LOD queries, " + std::to_string(w.helper_queries) + " live-quad queries, " + std::to_string(w.discards) + " discards");
         res.proof.insert(res.proof.begin(), head.begin(), head.end());
     }
 };
