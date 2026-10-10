@@ -31,9 +31,10 @@ void* oracle_tls(const std::uint64_t* descriptor) {
     static thread_local char error_buffer[22];
     return error_buffer;
 }
+std::int64_t oracle_seek_result = 0x100000123LL;
 std::int64_t oracle_seek(int fd, std::int64_t offset, int whence) {
     CHECK(fd == 7 && offset == 0 && whence == SEEK_CUR);
-    return 0x100000123LL;
+    return oracle_seek_result;
 }
 void unresolved_import() {
     std::fprintf(stderr, "native libc called an import outside this oracle's scope\n");
@@ -153,6 +154,11 @@ int main() {
     const auto native_position = lib.function<std::int64_t(*)(void*, Fpos*)>("dYJJbxnyb74");
     CHECK(native_position(stream, &position) == 0);
     CHECK(position.offset == 0x100000123LL && position.state[0] == 0 && position.state[1] == 0);
+    std::memset(&position, 0xa5, sizeof(position));
+    const Fpos unchanged = position;
+    oracle_seek_result = static_cast<std::int32_t>(0x80020009u);  // console EBADF
+    CHECK(native_position(stream, &position) == -1 && oracle_errno == 9);
+    CHECK(std::memcmp(&position, &unchanged, sizeof(position)) == 0);
     std::mt19937_64 rng(37);
     const char* extra[] = {"0x", "0xg", "0x1", "0778", "--12", "+-12", "-+12", "++12", " - 12",
         "9223372036854775808", "-9223372036854775809", "18446744073709551616", "-18446744073709551616"};

@@ -10,24 +10,36 @@ thread_local int t_guest_errno;
     std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr); \
     std::exit(1); } } while (0)
 
+__attribute__((sysv_abi, noinline)) int guest_seek(FILE* f, std::int64_t offset, int whence) {
+    return libc_result(bb::libc::seek(f, offset, whence));
+}
+__attribute__((sysv_abi, noinline)) std::int64_t guest_tell(FILE* f) {
+    const auto offset = bb::libc::tell(f);
+    if (offset == -1) set_guest_errno_host(errno);
+    return offset;
+}
+__attribute__((sysv_abi, noinline)) int guest_position(FILE* f, bb::libc::Fpos* p) {
+    return libc_result(bb::libc::get_position(f, p));
+}
+
 int main() {
     using namespace bb::libc;
     FILE* f = std::tmpfile();
     CHECK(f);
     // Move the cursor only: no multi-gigabyte data is allocated or written.
     constexpr std::int64_t large = 0x100000123LL;
-    CHECK(seek(f, large, SEEK_SET) == 0);
-    CHECK(tell(f) == large);
+    CHECK(guest_seek(f, large, SEEK_SET) == 0);
+    CHECK(guest_tell(f) == large);
     CHECK(seek(f, -17, SEEK_CUR) == 0);
     CHECK(tell(f) == large - 17);
     struct Guarded { Fpos pos; unsigned char guard[8]; } out;
     std::memset(&out, 0xa5, sizeof(out));
-    CHECK(get_position(f, &out.pos) == 0);
+    CHECK(guest_position(f, &out.pos) == 0);
     CHECK(out.pos.offset == large - 17 && out.pos.state[0] == 0 && out.pos.state[1] == 0);
     for (auto b : out.guard) CHECK(b == 0xa5);
     CHECK(seek(f, 0, SEEK_END) == 0 && tell(f) == 0);
     errno = 0;
-    CHECK(seek(f, -1, SEEK_SET) == -1 && errno == EINVAL);
+    CHECK(guest_seek(f, -1, SEEK_SET) == -1 && errno == EINVAL && t_guest_errno == 22);
     CHECK(std::fclose(f) == 0);
     t_guest_errno = 77;
     CHECK(!open_file("bbhost-libc-errno-missing-directory/file", "rb") && t_guest_errno == 2);
@@ -64,5 +76,18 @@ int main() {
         CHECK(std::strcmp(line, "Resource temporarily unavailable\n") == 0);
     }
     CHECK(std::fclose(messages) == 0);
+#if !defined(_WIN32)
+    int descriptors[2];
+    CHECK(::pipe(descriptors) == 0);
+    FILE* pipe = ::fdopen(descriptors[0], "rb");
+    CHECK(pipe);
+    CHECK(::close(descriptors[1]) == 0);
+    Fpos failed;
+    std::memset(&failed, 0xa5, sizeof(failed));
+    const Fpos unchanged = failed;
+    CHECK(guest_position(pipe, &failed) == -1 && t_guest_errno == 29);
+    CHECK(std::memcmp(&failed, &unchanged, sizeof(failed)) == 0);
+    CHECK(std::fclose(pipe) == 0);
+#endif
     std::puts("libc stdio tests passed");
 }
