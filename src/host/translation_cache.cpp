@@ -37,9 +37,10 @@ static_assert(sizeof(gcn::ResourcePath) == 40 && sizeof(gcn::ResourceStep) == 8,
 static_assert(sizeof(gcn::ImageBinding) == 64 && sizeof(gcn::SamplerBinding) == 56 && sizeof(gcn::BufferBinding) == 56,
               "a new binding field: add it to the entry");
 static_assert(sizeof(gcn::VertexElement) == 16, "a new VertexElement field: add it to hash_options");
-// (A lift's proof, listing and wave-operation counts are not kept: they are
-// diagnostics.)
-static_assert(sizeof(gcn::LiftResult) == 152, "a new LiftResult field: add it to the lift's entry (write_lift, read_lift)");
+// (A lift's proof, listing, wave-operation counts and engine names are not
+// kept: the names are put on after the cache (render.cpp name_stage), the rest
+// is diagnostics.)
+static_assert(sizeof(gcn::LiftResult) == 288, "a new LiftResult field: add it to the lift's entry (write_lift, read_lift)");
 #endif
 
 constexpr std::uint32_t kMagic = 0x43544242;  // "BBTC"

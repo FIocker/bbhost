@@ -5039,4 +5039,10 @@ LiftResult lift_vertex_shader(const Program& program, const TranslateOptions& op
     return lift_stage(Stage::Vertex, program, options, reference);
 }
 
+void name_lift(LiftResult& lift, const TranslateResult& reference, const ShaderReflection& reflection) {
+    if (!lift.ok()) return;
+    lift.names = name_bindings(reflection, reference);
+    lift.spirv = apply_names(lift.spirv, lift.names);
+}
+
 }  // namespace gcn

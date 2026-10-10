@@ -199,8 +199,22 @@ int run(const fs::path& capture, const fs::path& out, bool vs) {
     // the rebuilt options have to reproduce.
     const json::Value* stage_lifted = json::member(m, "translate").find(vs ? "vs_lifted" : "ps_lifted");
     const bool captured_lifted = stage_lifted && stage_lifted->type == json::Value::Type::Bool && stage_lifted->boolean;
-    const bool same_reference =
-        captured_lifted ? lifted.ok() && lifted.spirv == captured : reference.ok() && reference.spirv == captured;
+    // Debug names aside: the renderer puts the engine's names on a lift
+    // (gcn::name_lift, from the container's reflection, which a capture does
+    // not carry), and they change nothing the module computes.
+    const auto unnamed = [](const std::vector<std::uint32_t>& m) {
+        if (m.size() < 5) return m;
+        std::vector<std::uint32_t> out(m.begin(), m.begin() + 5);
+        for (std::size_t i = 5; i < m.size();) {
+            const std::uint32_t n = m[i] >> 16, op = m[i] & 0xffff;
+            if (!n || i + n > m.size()) return m;
+            if (op != 5 && op != 6) out.insert(out.end(), m.begin() + static_cast<std::ptrdiff_t>(i), m.begin() + static_cast<std::ptrdiff_t>(i + n));  // OpName, OpMemberName
+            i += n;
+        }
+        return out;
+    };
+    const bool same_reference = captured_lifted ? lifted.ok() && unnamed(lifted.spirv) == unnamed(captured)
+                                                : reference.ok() && unnamed(reference.spirv) == unnamed(captured);
     const std::string invalid = lifted.ok() ? validate(lifted.spirv) : std::string();
 
     fs::create_directories(out);

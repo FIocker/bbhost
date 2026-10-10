@@ -13,6 +13,7 @@
 #pragma once
 
 #include "gcn/isa.h"
+#include "gcn/names.h"
 #include "gcn/translate.h"
 
 #include <cstdint>
@@ -49,8 +50,17 @@ struct LiftResult {
     std::vector<std::string> proof;       // what the lift relied on
     std::string listing;                  // the program with the typed value each write produced
     WaveOps wave;                         // on success
+    // The engine's identities for the module's bindings and attributes, from
+    // the shader container's reflection (name_lift); empty without one.
+    ShaderNames names;
     bool ok() const { return rejections.empty() && !spirv.empty(); }
 };
+
+// Names a successful lift's bindings by the container's reflection: fills
+// `lift.names` and puts the engine's names on the module's variables (OpName
+// only - the module computes exactly what it did). `reference` is the
+// translation the lift declares the bindings of.
+void name_lift(LiftResult& lift, const TranslateResult& reference, const ShaderReflection& reflection);
 
 // Lifts a pixel shader. `reference` is the translator's result for the same
 // program and options, with cb_no_fallback set: the lifted module declares the

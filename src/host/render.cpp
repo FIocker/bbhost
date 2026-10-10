@@ -15,6 +15,7 @@
 #include "host/draw_capture.h"
 #include "gcn/container.h"
 #include "gcn/lift.h"
+#include "gcn/names.h"
 #include "gcn/wave.h"
 #include "gcn/isa.h"
 #include "hle/modules.h"
@@ -2786,6 +2787,31 @@ int precompile_stage_mask() {
     }();
     return mask;
 }
+// The reflection of each vertex and pixel shader GX created (gcn/names.h), by
+// program name: the engine's names for a lift's bindings (name_stage).
+// BBHOST_SHADER_NAMES=0: none kept, lifted modules keep the lifter's own names.
+const bool g_shader_names = [] {
+    const char* e = std::getenv("BBHOST_SHADER_NAMES");
+    return !(e && e[0] == '0');
+}();
+std::mutex g_reflections_mu;
+std::unordered_map<std::string, std::shared_ptr<const gcn::ShaderReflection>> g_reflections;
+std::atomic<std::uint64_t> g_named_stages{0}, g_named_bindings{0}, g_all_bindings{0};
+std::shared_ptr<const gcn::ShaderReflection> reflection_for(const std::string& name) {
+    std::lock_guard<std::mutex> lk(g_reflections_mu);
+    const auto it = g_reflections.find(name);
+    return it == g_reflections.end() ? nullptr : it->second;
+}
+// The engine's names on a lifted stage, where GX created the program.
+void name_stage(gcn::LiftResult& lifted, const gcn::TranslateResult& reference, const std::string& name) {
+    if (!g_shader_names || !lifted.ok()) return;
+    const std::shared_ptr<const gcn::ShaderReflection> r = reflection_for(name);
+    if (!r) return;
+    gcn::name_lift(lifted, reference, *r);
+    g_named_stages.fetch_add(1, std::memory_order_relaxed);
+    g_named_bindings.fetch_add(lifted.names.named, std::memory_order_relaxed);
+    g_all_bindings.fetch_add(lifted.names.bindings, std::memory_order_relaxed);
+}
 void record_shader_created(int creator, const std::uint8_t* container, std::size_t size, std::uint64_t flip) {
     if (creator < 0 || creator > 3) return;
     std::string name;
@@ -2830,6 +2856,13 @@ void record_shader_created(int creator, const std::uint8_t* container, std::size
     it->second.creations += 1;
     if (fresh) {
         it->second.first_flip = flip;
+        if (g_shader_names) {
+            auto r = std::make_shared<gcn::ShaderReflection>();
+            if (gcn::parse_reflection(std::vector<std::uint8_t>(container, container + size), *r)) {
+                std::lock_guard<std::mutex> lk(g_reflections_mu);
+                g_reflections.emplace(name, std::move(r));
+            }
+        }
         ShaderCreations::Entry& e = it->second;
         const std::size_t base = shdr + 16;
         if (base + 0x40 <= size) {
@@ -3811,6 +3844,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                     std::lock_guard<std::mutex> lk(logged_mu);
                     first = logged.insert(ps_name).second;
                 }
+                name_stage(lifted, pl.ps.meta(), ps_name);
                 if (lifted.ok()) {
                     if (first) {
                         host_log("render: PS %s lifted (%zu words; translated %zu)", ps_name.c_str(), lifted.spirv.size(),
@@ -3909,6 +3943,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // keeps the translation.
         if (vs_decomp) {
             gcn::LiftResult lifted = lift_cached(true, vs_prog, vo, pl.vs.meta());
+            name_stage(lifted, pl.vs.meta(), vs_name);
             static std::mutex logged_mu;  // no-fallback variants build on the pipeline workers
             static std::set<std::string> logged;
             bool first;
@@ -4954,6 +4989,7 @@ void precompile_ps(Precompiler& w, const PrecompileJob& job) {
         note_ps_early_tests(code.words, stage.meta().spirv);
         if (lift) {
             gcn::LiftResult lifted = lift_cached(false, prog, options, stage.meta());
+            name_stage(lifted, stage.meta(), job.name);
             if (lifted.ok()) {
                 stage.fresh().spirv = std::move(lifted.spirv);
                 stage.fresh().wave64_needs = 0;  // as build_gfx_pipeline's lift
@@ -5187,6 +5223,7 @@ void precompile_vs(Precompiler& w, const PrecompileJob& job) {
         // same stage the draw wants and is not thrown away for it.
         if (lift) {
             gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
+            name_stage(lifted, stage.meta(), job.name);
             if (lifted.ok()) {
                 stage.fresh().spirv = std::move(lifted.spirv);
                 stage.lifted = true;
@@ -7133,6 +7170,14 @@ void render_report() {
                  static_cast<unsigned long long>(g_plans_used), checked.c_str());
     }
     report_gx_state_compare();
+    if (g_shader_names) {
+        host_log("render: engine names on %llu lifted stages: %llu of their %llu bindings named (%zu programs' reflections kept)",
+                 static_cast<unsigned long long>(g_named_stages.load()), static_cast<unsigned long long>(g_named_bindings.load()),
+                 static_cast<unsigned long long>(g_all_bindings.load()), [] {
+                     std::lock_guard<std::mutex> lk(g_reflections_mu);
+                     return g_reflections.size();
+                 }());
+    }
     {
         std::string seen;
         for (const auto& [sel, path] : g_typed_select_seen) {
