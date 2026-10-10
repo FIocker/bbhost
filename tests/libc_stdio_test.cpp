@@ -47,5 +47,22 @@ int main() {
     CHECK(file_result(read_only, [&] { return std::fputc('x', read_only); }) == EOF);
     CHECK(std::ferror(read_only) && errno != 0 && t_guest_errno == to_freebsd(errno));
     CHECK(libc_result(std::fclose(read_only)) == 0);
+    FILE* messages = std::tmpfile();
+    CHECK(messages);
+    t_guest_errno = 35;
+    errno = EINVAL;
+    print_error(messages, "opening");
+    print_error(messages, "");
+    print_error(messages, nullptr);
+    CHECK(t_guest_errno == 35);
+    CHECK(seek(messages, 0, SEEK_SET) == 0);
+    char line[128];
+    CHECK(std::fgets(line, sizeof(line), messages));
+    CHECK(std::strcmp(line, "opening: Resource temporarily unavailable\n") == 0);
+    for (int i = 0; i < 2; ++i) {
+        CHECK(std::fgets(line, sizeof(line), messages));
+        CHECK(std::strcmp(line, "Resource temporarily unavailable\n") == 0);
+    }
+    CHECK(std::fclose(messages) == 0);
     std::puts("libc stdio tests passed");
 }

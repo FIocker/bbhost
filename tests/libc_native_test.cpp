@@ -25,6 +25,12 @@ namespace {
 int oracle_errno;
 std::uint64_t oracle_guard = 0x123456789abcdefULL;
 int* oracle_error() { return &oracle_errno; }
+void* oracle_tls(const std::uint64_t* descriptor) {
+    // Only the audited native strerror TLS descriptor is supported.
+    CHECK(descriptor[1] == 0x478);
+    static thread_local char error_buffer[22];
+    return error_buffer;
+}
 std::int64_t oracle_seek(int fd, std::int64_t offset, int whence) {
     CHECK(fd == 7 && offset == 0 && whence == SEEK_CUR);
     return 0x100000123LL;
@@ -104,6 +110,7 @@ struct NativeLibc {
                     const auto sym = get<Elf64_Sym>(dynlib + tags.at(0x61000039) + ELF64_R_SYM(r.r_info) * sizeof(Elf64_Sym));
                     const auto name = nid(sym);
                     if (name == "9BcDykPmo1I") { value = reinterpret_cast<std::uint64_t>(&oracle_error); error_bound = true; }
+                    else if (name == "vNe1w4diLCs") value = reinterpret_cast<std::uint64_t>(&oracle_tls);
                     else if (name == "xReSebwKApA") value = reinterpret_cast<std::uint64_t>(&oracle_seek);
                     else if (name == "f7uOxY9mM1U") { value = reinterpret_cast<std::uint64_t>(&oracle_guard); guard_bound = true; }
                     else if (sym.st_value) value = reinterpret_cast<std::uint64_t>(base + sym.st_value);
@@ -213,10 +220,9 @@ int main() {
         CHECK(native_end == host_end && native_end == text + 1);
     }
     const auto native_strerror = lib.function<const char*(*)(int)>("RIa6GnWp+iU");
-    CHECK(std::strcmp(native_strerror(11), "Resource deadlock avoided") == 0);
-    CHECK(std::strcmp(native_strerror(35), "Resource temporarily unavailable") == 0);
-    CHECK(std::strcmp(native_strerror(63), "File name too long") == 0);
-    CHECK(std::strcmp(native_strerror(66), "Directory not empty") == 0);
+    for (int e = 0; e < 95; ++e) CHECK(std::strcmp(native_strerror(e), error_string(e)) == 0);
+    for (int e : {-2147483647-1, -1, 95, 151, 152, 153, 1040, 1050, 1051, 1056, 1062, 1064, 1074, 2147483647})
+        CHECK(std::strcmp(native_strerror(e), error_string(e)) == 0);
     const auto lc = lib.function<const Lconv*(*)()>("0hlfW1O4Aa4")();
     const Lconv expected;
     CHECK(std::strcmp(lc->decimal_point, expected.decimal_point) == 0);

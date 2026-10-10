@@ -4,6 +4,7 @@
 #include <cstdio>
 
 #include "hle/common.h"
+#include "hle/libc_errno.h"
 
 namespace bb::libc {
 
@@ -25,6 +26,17 @@ template <typename Fn> inline auto file_result(FILE* file, Fn&& call) {
     // errno or erase the guest's previous errno on successful operations.
     if (error && std::ferror(file)) set_guest_errno_host(error);
     return result;
+}
+
+inline void print_error(FILE* file, const char* prefix) {
+    if (prefix && *prefix) {
+        file_result(file, [&] { return std::fputs(prefix, file); });
+        file_result(file, [&] { return std::fputs(": ", file); });
+    }
+    // Native perror reads guest errno AFTER writing its optional prefix.
+    const char* message = error_string(t_guest_errno);
+    file_result(file, [&] { return std::fputs(message, file); });
+    file_result(file, [&] { return std::fputc('\n', file); });
 }
 
 struct Fpos {

@@ -180,7 +180,7 @@ GUEST_ABI int hle_strncasecmp(const char* a, const char* b, std::uint64_t n) {
 #endif
 }
 GUEST_ABI int hle_strcoll(const char* a, const char* b) { return sgn(std::strcmp(a, b)); }
-GUEST_ABI const char* hle_strerror(int e) { return std::strerror(e); }
+GUEST_ABI const char* hle_strerror(int e) { return bb::libc::error_string(e); }
 template <typename Char, typename Integer>
 Integer guest_integer_result(bb::libc::IntegerParse<Char, Integer> r, Char** end) {
     if (end) *end = const_cast<Char*>(r.end);
@@ -207,7 +207,7 @@ GUEST_ABI int hle_vsprintf(char* b, const char* fmt, SysvVaList* ap) {
 GUEST_ABI int hle_vfprintf(FILE* f, const char* fmt, SysvVaList* ap) { return sysv_vfprintf(f ? f : stdout, fmt, ap); }
 GUEST_ABI int hle_puts(const char* s) { return std::puts(s); }
 GUEST_ABI int hle_putchar(int c) { return std::putchar(c); }
-GUEST_ABI void hle_perror(const char* s) { std::perror(s); }
+GUEST_ABI void hle_perror(const char* s) { bb::libc::print_error(stderr, s); }
 
 GUEST_ABI FILE* hle_fopen(const char* path, const char* mode) {
     std::string host = hle_fs_map_path(path);
