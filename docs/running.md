@@ -229,7 +229,10 @@ switch, at 60, 90, 120 or uncapped) moves the target while the game runs:
 `square:LO:HI:S` alternates LO and HI fps every S seconds, `random:LO:HI:S` picks
 a new rate in that range every S seconds, `jitter:LO:HI` every frame, and
 `sine:LO:HI:S` sweeps it - one process at two rates, or at one that never holds
-still, as a variable-refresh display or a busy scene makes it. The start of the log says which rate
+still, as a variable-refresh display or a busy scene makes it.
+`BBHOST_FIXED_TICK=<address>:<bytes>[,...]` (a test switch, same rates) runs
+a game function as a 30 Hz tick - once every other frame at 60, and so on, with
+the remainder carried - for logic that counts frames (`engine/frame_tick.h`). The start of the log says which rate
 runs and how many values and code sites were converted (`frame rate:` lines),
 and names any site whose bytes were not the expected ones (that rate is then
 refused: 90, 120 or uncapped falls back to 60).

@@ -94,6 +94,7 @@ add_executable(bbhost
   src/engine/fmod_probe.cpp
   src/engine/menu_memory.cpp
   src/engine/frame_rate.cpp
+  src/engine/frame_tick.cpp
   src/engine/frame_pool.cpp
   src/engine/sf_heap_probe.cpp
   src/engine/debug_menu.cpp

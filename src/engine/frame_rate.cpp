@@ -1,6 +1,7 @@
 #include "guest_abi.h"
 #include "engine/frame_rate.h"
 #include "engine/frame_rate_step.h"
+#include "engine/frame_tick.h"
 #include "engine/np_test.h"
 #include "engine/event_flags.h"
 #include "engine/player_data.h"
@@ -1236,6 +1237,7 @@ void each_frame(const SprjFlipper* f) {
     const auto scaled = [scale](float s) { return scale == 1.0f ? s : std::min(s * scale, kThirtieth); };
     const float step = scaled(std::min(std::max(f->measured_frame_seconds, f->target_frame_seconds), kThirtieth));
     if (step > 0.0f) {  // also NaN: the cave keeps the last step
+        frame_tick_frame(step);  // the fixed ticks' count for this frame (engine/frame_tick.h)
         if (g_step_va) put<float>(g_step_va, step);
         if (g_play_ms_va) {
             // The step in whole milliseconds, the rest carried to the next frame.
@@ -1703,6 +1705,7 @@ void frame_rate_install(ElfImage* image) {
     }
     g_game_fps = got;
     hle_video_set_game_pace(got);  // above 60 and uncapped: flips complete at once (hle/video.cpp)
+    frame_tick_install(image);
     const std::size_t kCountsN = sizeof(kCounts) / sizeof(kCounts[0]), kBytesN = sizeof(kBytes) / sizeof(kBytes[0]);
     const std::size_t constants = sizeof(kConstants) / sizeof(kConstants[0]);
     char target[96];
