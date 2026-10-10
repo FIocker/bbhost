@@ -165,6 +165,19 @@ bool g_given_back = false;
 std::uint64_t g_initial_cap = 0;     // the share at the start, which mirrors that come back get again
 std::uint64_t g_given_back_ms = 0;   // when video memory last ran short (shadow_give_back_locked)
 std::uint64_t g_gives = 0, g_returns = 0;
+// The live share (shadow_live): a mirror block or a whole mirror is made only
+// while video memory keeps the reserve and this cushion above it for the
+// next area's textures (BBHOST_SHADOW_CUSHION_MB, 256); a page refused for
+// want of room is read from host memory by that draw and tried again later.
+bool g_live = false;
+std::uint64_t g_cushion = 256ull << 20;
+std::uint64_t g_room_refusals = 0;     // copies refused for want of room, counted per draw
+std::uint64_t g_room_retry_ms = 0;     // no room until then: refused without asking (now_ms)
+std::uint64_t g_room_skips = 0;        // draws read from host memory while refused, before arming anything
+std::uint64_t g_first_refusal_ms = 0;  // the first refusal since the mirrors last started over (0: none)
+std::uint64_t g_last_flush_ms = 0;     // when they last started over
+std::uint64_t g_flushes = 0;           // the mirrors started over at a load
+std::uint64_t g_flush_refusals = 0, g_flush_held_back = 0, g_flush_gives = 0;  // the counts at the last flush
 VkCommandBuffer g_upload_cmd[kSlots] = {};
 int g_upload_slot = -1;  // the slot whose upload buffer is recording, or -1
 std::size_t g_last_map = 0;  // g.maps index of the last hit
@@ -207,6 +220,21 @@ bool phys_of(std::uint64_t va, std::uint64_t bytes, std::uint32_t& chunk, std::u
     return chunk < gcn::kDmemChunks && dmem_import(chunk, off, bytes) != nullptr;
 }
 
+// Whether the mirrors may take another `bytes` of video memory now: within
+// the share, and with the live share only while video memory keeps the
+// reserve and the cushion above it. A refusal holds for 250 ms, so the draws
+// in between pay no budget reading.
+bool mirror_room(std::uint64_t bytes) {
+    if (g_mirror_bytes + bytes > g_mirror_cap) return false;
+    if (!g_live) return true;
+    const std::uint64_t now = now_ms();
+    if (now < g_room_retry_ms) return false;
+    if (vram_room_for(bytes, g_cushion)) return true;
+    g_room_retry_ms = now + 250;
+    if (!g_first_refusal_ms) g_first_refusal_ms = now;
+    return false;
+}
+
 Mirror* mirror_for(std::uint32_t chunk) {
     Mirror& m = g_mirrors[chunk];
     if (m.buffer || m.failed) return m.failed ? nullptr : &m;
@@ -242,6 +270,12 @@ Mirror* mirror_for(std::uint32_t chunk) {
             m.buffer = VK_NULL_HANDLE;
         }
         bci.flags = 0;
+    }
+    if (g_live && g_mirror_bytes + kChunkBytes <= g_mirror_cap && !mirror_room(kChunkBytes)) {
+        // No room for a whole mirror now: this draw reads host memory, and
+        // a later one asks again.
+        ++g_room_refusals;
+        return nullptr;
     }
     if (g_mirror_bytes + kChunkBytes > g_mirror_cap) {
         m.failed = true;
@@ -385,6 +419,19 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
         bump(g_imports);
         return;
     }
+    // The live share refused a block less than 250 ms ago, this mirror's
+    // block is full and the range has pages with no device page yet: the
+    // range is read from host memory, as the refusal below would leave it,
+    // before any page's write watch is armed. Each draw used to arm its pages
+    // (an mprotect a run) and drop them at the refusal; on a 2.5 GB card that
+    // was 21 million refusals over six places and up to three times the
+    // frame time at the same GPU time.
+    if (g_live && m->sparse && (m->blocks.empty() || m->block_pages_used == kBlockPages) && !all_ok(m->resident, p0, p1) &&
+        now_ms() < g_room_retry_ms) {
+        ++g_room_skips;
+        bump(g_imports);
+        return;
+    }
     // The pages this call will copy, armed a run at a time: one protection of
     // the guest view and one of its GPU alias per run of consecutive pages,
     // instead of two per 64 KiB page - each is an mprotect, and the new
@@ -523,10 +570,26 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
                 bai.allocationSize = static_cast<VkDeviceSize>(kBlockPages) * kPageBytes;
                 bai.memoryTypeIndex = find_memory_type(m->mem_type_bits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
                 VkDeviceMemory mem = VK_NULL_HANDLE;
-                if (g_mirror_bytes + bai.allocationSize > g_mirror_cap || vkAllocateMemory(g.device, &bai, nullptr, &mem) != VK_SUCCESS) {
-                    go_dynamic(*m, p, page_va, g_mirror_bytes + bai.allocationSize > g_mirror_cap
-                                                   ? "has no room in the mirrors' share of video memory"
-                                                   : "has no device memory for its mirror page");
+                const bool room = mirror_room(bai.allocationSize);
+                if (!room && g_live) {
+                    // No room now is not for good: this draw reads host
+                    // memory, a later one tries again (after the mirrors
+                    // start over at a load, say). Not a copy toward 'keeps
+                    // being rewritten' either.
+                    pg.valid = false;
+                    m->ok[p >> 6] &= ~(1ull << (p & 63));
+                    if (pg.window_uploads) --pg.window_uploads;
+                    pg.watch = WriteWatch{};
+                    pg.alias_watch = WriteWatch{};
+                    pg.alias_va = 0;
+                    ++g_room_refusals;
+                    flush();
+                    bump(g_imports);
+                    return;
+                }
+                if (!room || vkAllocateMemory(g.device, &bai, nullptr, &mem) != VK_SUCCESS) {
+                    go_dynamic(*m, p, page_va, !room ? "has no room in the mirrors' share of video memory"
+                                                     : "has no device memory for its mirror page");
                     flush();
                     bump(g_imports);
                     return;
@@ -749,10 +812,26 @@ VkSemaphore shadow_bind_sparse_locked() {
 
 void shadow_budget_locked() {
     const char* e = std::getenv("BBHOST_SHADOW_VRAM_MB");
+    // The live share: with the video memory reserve on and no share given,
+    // the mirrors grow while video memory keeps the reserve and a cushion
+    // free, instead of taking only what lies above 6656 MiB of the budget at
+    // the start - which left any card with less than about 6.7 GB free no
+    // mirrors at all, every vertex and index read across the bus (18-27 ms
+    // of GPU a frame at 1080p where the mirrors give 6). BBHOST_SHADOW_LIVE=0
+    // keeps the fixed share.
+    const char* live = std::getenv("BBHOST_SHADOW_LIVE");
+    g_live = !(e && *e) && vram_reserve_bytes() && !(live && live[0] == '0');
+    if (const char* c = std::getenv("BBHOST_SHADOW_CUSHION_MB"); c && *c) g_cushion = std::strtoull(c, nullptr, 10) << 20;
     g_mirror_cap = e && *e ? static_cast<std::uint64_t>(std::strtoull(e, nullptr, 10)) << 20
-                           : g.local_budget > kImageRoom ? g.local_budget - kImageRoom : 0;
+                   : g_live ? ~0ull
+                   : g.local_budget > kImageRoom ? g.local_budget - kImageRoom : 0;
     g_initial_cap = g_mirror_cap;
     if (!buffer_shadow_on()) return;
+    if (g_live) {
+        host_log("buffer shadow: its mirrors may hold what video memory has free above the reserve and a %llu MiB cushion (%s)",
+                 static_cast<unsigned long long>(g_cushion >> 20), g.has_sparse ? "64 MiB blocks" : "whole 1 GiB mirrors: no sparse binding");
+        return;
+    }
     if (!g.has_sparse && g_mirror_cap < kChunkBytes) {
         host_log("buffer shadow: no mirrors - one is a whole %llu MiB chunk here (no sparse binding), and the mirrors' share of video "
                  "memory is %llu MiB (%s); vertex and index data are read from host memory",
@@ -811,11 +890,90 @@ void shadow_return_locked() {
             ++reset;
         }
     }
-    g_mirror_cap = std::min<std::uint64_t>(g_initial_cap, static_cast<std::uint64_t>(room));
+    g_mirror_cap = g_live ? g_initial_cap : std::min<std::uint64_t>(g_initial_cap, static_cast<std::uint64_t>(room));
     g_given_back = false;
     if (g_returns++ < 8)
-        host_log("buffer shadow: video memory has room again - the mirrors come back (%u chunk(s), a share of %llu MiB)", reset,
-                 static_cast<unsigned long long>(g_mirror_cap >> 20));
+        host_log("buffer shadow: video memory has room again - the mirrors come back (%u chunk(s)%s)", reset,
+                 g_live ? ", the live share" : (", a share of " + std::to_string(g_mirror_cap >> 20) + " MiB").c_str());
+}
+
+namespace {
+// Every mirror goes into `slot`, freed once that submission - the last that
+// reads them - has run; the pages are copied again as draws read them.
+void flush_mirrors_locked(Gpu::Slot& slot, const char* why) {
+    std::uint32_t n = 0;
+    const std::uint64_t held = g_mirror_bytes;
+    for (Mirror& m : g_mirrors) {
+        if (!m.buffer) {
+            if (!m.failed) m = Mirror{};
+            continue;
+        }
+        slot.garbage.push_back(DevBuffer{m.memory, m.buffer});
+        for (VkDeviceMemory b : m.blocks) slot.garbage.push_back(DevBuffer{b, VK_NULL_HANDLE});
+        m = Mirror{};
+        ++n;
+    }
+    g_mirror_bytes = 0;
+    g_room_retry_ms = 0;
+    g_first_refusal_ms = 0;
+    g_last_flush_ms = now_ms();
+    if (g_flushes++ < 12)
+        host_log("buffer shadow: %s - %u mirror(s), %llu MiB, start over", why, n, static_cast<unsigned long long>(held >> 20));
+}
+}  // namespace
+
+// The mirrors start over at a load that follows a shortage of room: when a
+// loading screen comes up and, since the last one, the live share refused
+// pages, the reserve kept textures out of video memory or the mirrors were
+// given back - or the share is all but shut right then - every mirror goes
+// and the coming area's pages are copied as its draws read them; and once in
+// play between two loads, when pages have been refused for 5 s. A share that
+// has stopped growing otherwise keeps the areas already left and reads the
+// new one's geometry across the bus. BBHOST_SHADOW_FLUSH_AT_LOAD=0: never;
+// on with the live share.
+
+void shadow_flush_at_load_locked(Gpu::Slot& slot) {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_SHADOW_FLUSH_AT_LOAD");
+        return !(e && e[0] == '0');
+    }();
+    static bool was_loading = false;
+    static bool mid_flushed = false;  // one start-over in play between two loads
+    const bool loading = loading_screen_now();
+    const bool starts = loading && !was_loading;
+    was_loading = loading;
+    if (!on || !g_live || !buffer_shadow_on() || g_given_back || !g_mirror_bytes) {
+        if (starts) mid_flushed = false;
+        return;
+    }
+    const std::uint64_t block = static_cast<std::uint64_t>(kBlockPages) * kPageBytes;
+    if (starts) {
+        mid_flushed = false;
+        const std::uint64_t held_back = vram_reserve_refusals();
+        // Or the share is all but shut as the load starts - less than a
+        // cushion's worth of blocks would fit above the reserve and the
+        // cushion: the coming area would find the mirrors full of the areas
+        // already left and read its own geometry across the bus until the
+        // load after it (a 4 GB card entered the Nightmare of Mensis that way,
+        // at 15.5 ms of GPU a frame against 6.3).
+        const bool shut = !vram_room_for(block, 2 * g_cushion);
+        if (!shut && g_room_refusals == g_flush_refusals && held_back == g_flush_held_back && g_gives == g_flush_gives) return;
+        g_flush_refusals = g_room_refusals;
+        g_flush_held_back = held_back;
+        g_flush_gives = g_gives;
+        flush_mirrors_locked(slot, "a load after a shortage of room");
+        return;
+    }
+    // In play: pages refused for 5 s on end (the area moved on without a
+    // load - most of the game's are seamless - and the mirrors hold the one
+    // left), 10 s or more after the last start-over: once until the next load.
+    const std::uint64_t now = now_ms();
+    if (!loading && !mid_flushed && g_first_refusal_ms && now - g_first_refusal_ms >= 5000 && g_room_retry_ms + 750 >= now &&
+        now - g_last_flush_ms >= 10000) {
+        mid_flushed = true;
+        g_flush_refusals = g_room_refusals;
+        flush_mirrors_locked(slot, "pages refused for want of room in play");
+    }
 }
 
 std::string shadow_report() {
@@ -841,12 +999,21 @@ std::string shadow_report() {
                   static_cast<unsigned long long>(g_span_hist[0]), static_cast<unsigned long long>(g_span_hist[1]),
                   static_cast<unsigned long long>(g_span_hist[2]), static_cast<unsigned long long>(g_span_hist[3]),
                   static_cast<unsigned long long>(g_span_hist[4]), static_cast<unsigned long long>(g_span_hist[5]));
-    char rr[160];
-    std::snprintf(rr, sizeof(rr), "; mirror pages resident %llu (%llu MiB); mirrors hold %llu MiB of video memory, share %llu MiB%s",
+    char rr[192];
+    char share[32];
+    if (g_mirror_cap == ~0ull) std::snprintf(share, sizeof(share), "live");
+    else std::snprintf(share, sizeof(share), "%llu MiB", static_cast<unsigned long long>(g_mirror_cap >> 20));
+    std::snprintf(rr, sizeof(rr), "; mirror pages resident %llu (%llu MiB); mirrors hold %llu MiB of video memory, share %s%s",
                   static_cast<unsigned long long>(resident), static_cast<unsigned long long>((resident * kPageBytes) >> 20),
-                  static_cast<unsigned long long>(g_mirror_bytes >> 20), static_cast<unsigned long long>(g_mirror_cap >> 20),
-                  g_given_back ? " (given back: video memory ran short)" : "");
+                  static_cast<unsigned long long>(g_mirror_bytes >> 20), share, g_given_back ? " (given back: video memory ran short)" : "");
     std::string out = std::string(buf) + h + rr;
+    if (g_room_refusals || g_flushes || g_room_skips) {
+        char lr[160];
+        std::snprintf(lr, sizeof(lr), "; copies refused for want of room %llu (%llu more draws not tried), started over at a load %llu",
+                      static_cast<unsigned long long>(g_room_refusals), static_cast<unsigned long long>(g_room_skips),
+                      static_cast<unsigned long long>(g_flushes));
+        out += lr;
+    }
     if (g_gives || g_returns) {
         char gr[96];
         std::snprintf(gr, sizeof(gr), "; given back %llu time(s), back %llu", static_cast<unsigned long long>(g_gives),

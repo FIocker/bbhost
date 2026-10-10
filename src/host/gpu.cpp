@@ -4344,6 +4344,7 @@ std::string image_heap_report() {
 // BBHOST_MEMORY_KEEPER=0 restores the old fixed reserve (six blocks and
 // 768 MiB at boot, never given back) for comparison.
 std::atomic<bool> g_loading_screen{false};
+bool loading_screen_now() { return g_loading_screen.load(std::memory_order_relaxed); }
 std::mutex g_keeper_mu;
 std::condition_variable g_keeper_cv;
 
@@ -4840,6 +4841,7 @@ void submit_locked() {
     // this submission, the last that reads them, retires.
     if (g.vram_short.exchange(false, std::memory_order_relaxed)) shadow_give_back_locked(cur);
     else shadow_return_locked();
+    shadow_flush_at_load_locked(cur);
     textures_submitted(g.slot);
     g.queued = 0;
     ++g.flushes;

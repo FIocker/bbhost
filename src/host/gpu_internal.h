@@ -744,6 +744,11 @@ void shadow_give_back_locked(Gpu::Slot& slot);
 // Mirrors given back come back once video memory has had room for them a
 // while (vram_return_on). Called at each submission that gave nothing back.
 void shadow_return_locked();
+// The mirrors start over (into `slot`) when a load comes after a shortage of
+// room (the live share). Called at each submission.
+void shadow_flush_at_load_locked(Gpu::Slot& slot);
+// Whether a loading screen is up (host_gpu_set_loading).
+bool loading_screen_now();
 std::string shadow_report();
 std::uint64_t fnv1a(const void* data, std::size_t n, std::uint64_t h = 1469598103934665603ull);
 void bind_dummy_images(VkDescriptorSet set, const gcn::TranslateResult& meta, std::vector<VkWriteDescriptorSet>& writes,
