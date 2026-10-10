@@ -39,6 +39,16 @@ int main() {
     CHECK(std::isinf(guest_log(0.0, 0)) && guest_log(0.0, 0) < 0);
     CHECK(std::isnan(guest_log(-1.0, 1)));
 
+    const std::uint64_t bit_patterns[] = {0, 0x8000000000000000ULL, 1, 0x8000000000000001ULL,
+        0x0010000000000000ULL, 0x3ff0000000000000ULL, 0x7ff0000000000000ULL,
+        0xfff0000000000000ULL, 0x7ff8000000000000ULL, 0x7ff0000000000001ULL};
+    const int classes[] = {0, 0, -2, -2, -1, -1, 1, 1, 2, 2};
+    for (unsigned i = 0; i < sizeof(classes) / sizeof(classes[0]); ++i) {
+        double x;
+        std::memcpy(&x, &bit_patterns[i], sizeof(x));
+        CHECK(dtest(&x) == classes[i]);
+    }
+
     // Match the eboot's 36-byte localtime_s destination followed by a cookie.
     struct GuardedTm { Tm value; unsigned char tail[20]; } g{};
     std::memset(g.tail, 0xa5, sizeof(g.tail));

@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <ctime>
 #include <limits>
 
@@ -58,6 +59,17 @@ inline char* set_c_locale(const char* name) {
     return !name || !*name || (name[0] == 'C' && name[1] == '\0') ? c : nullptr;
 }
 
+// _Dtest returns a short: normal=-1, denormal=-2, zero=0, infinity=1, NaN=2.
+// Inspect bits instead of performing floating-point operations on sNaNs.
+inline std::int16_t dtest(const double* p) {
+    std::uint64_t bits;
+    std::memcpy(&bits, p, sizeof(bits));
+    bits &= 0x7fffffffffffffffull;
+    const auto exponent = bits & 0x7ff0000000000000ull;
+    if (exponent == 0x7ff0000000000000ull) return bits == exponent ? 1 : 2;
+    if (!bits) return 0;
+    return exponent ? -1 : -2;
+}
 template <typename Float> inline Float logarithm(Float x, int selector) {
     return selector > 0 ? std::log10(x) : selector < 0 ? std::log2(x) : std::log(x);
 }

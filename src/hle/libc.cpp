@@ -588,21 +588,7 @@ GUEST_ABI std::int64_t hle_stoll(const char* s, char** end, int base) { return h
 GUEST_ABI std::uint64_t hle_stoul(const char* s, char** end, int base) { return hle_strtoumax(s, end, base); }
 GUEST_ABI std::uint64_t hle_stoull(const char* s, char** end, int base) { return hle_strtoumax(s, end, base); }
 
-GUEST_ABI int hle_dtest(double* p) {
-    if (!p) {
-        return 0;
-    }
-    if (std::isnan(*p)) {
-        return 2;
-    }
-    if (std::isinf(*p)) {
-        return 1;
-    }
-    if (*p == 0.0) {
-        return -1;
-    }
-    return 0;
-}
+GUEST_ABI std::int16_t hle_dtest(const double* p) { return bb::libc::dtest(p); }
 
 GUEST_ABI double hle_sin(double x) { return std::sin(x); }
 // Dinkumware _Sin/_FSin(x, qoff) compute sin(x + qoff*pi/2), i.e. the quarter
