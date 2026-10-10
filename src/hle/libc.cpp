@@ -212,9 +212,10 @@ GUEST_ABI void hle_perror(const char* s) { std::perror(s); }
 GUEST_ABI FILE* hle_fopen(const char* path, const char* mode) {
     std::string host = hle_fs_map_path(path);
     if (host.empty()) {
+        set_guest_errno_host(ENOENT);
         return nullptr;
     }
-    FILE* f = std::fopen(host.c_str(), mode ? mode : "r");
+    FILE* f = bb::libc::open_file(host.c_str(), mode ? mode : "r");
     static int logs;
     if (logs < 8) {
         host_log("fopen %s -> %s %s %s", path ? path : "", host.c_str(), mode ? mode : "",
@@ -251,17 +252,22 @@ GUEST_ABI FILE* hle_fopen(const char* path, const char* mode) {
 GUEST_ABI FILE* hle_freopen(const char* path, const char* mode, FILE* f) {
     std::string host = hle_fs_map_path(path);
     if (host.empty()) {
+        set_guest_errno_host(ENOENT);
         return nullptr;
     }
-    return std::freopen(host.c_str(), mode ? mode : "r", f);
+    return bb::libc::reopen_file(host.c_str(), mode ? mode : "r", f);
 }
-GUEST_ABI int hle_fclose(FILE* f) { return f ? std::fclose(f) : 0; }
-GUEST_ABI int hle_fflush(FILE* f) { return std::fflush(f); }
+GUEST_ABI int hle_fclose(FILE* f) { return f ? libc_result(std::fclose(f)) : 0; }
+GUEST_ABI int hle_fflush(FILE* f) { return libc_result(std::fflush(f)); }
 GUEST_ABI std::uint64_t hle_fread(void* p, std::uint64_t sz, std::uint64_t n, FILE* f) {
-    return write_watch_fread(p, static_cast<std::size_t>(sz), static_cast<std::size_t>(n), f);
+    return bb::libc::file_result(f, [&] {
+        return write_watch_fread(p, static_cast<std::size_t>(sz), static_cast<std::size_t>(n), f);
+    });
 }
 GUEST_ABI std::uint64_t hle_fwrite(const void* p, std::uint64_t sz, std::uint64_t n, FILE* f) {
-    return std::fwrite(p, static_cast<std::size_t>(sz), static_cast<std::size_t>(n), f);
+    return bb::libc::file_result(f, [&] {
+        return std::fwrite(p, static_cast<std::size_t>(sz), static_cast<std::size_t>(n), f);
+    });
 }
 GUEST_ABI int hle_fseek(FILE* f, std::int64_t off, int whence) { return libc_result(bb::libc::seek(f, off, whence)); }
 GUEST_ABI std::int64_t hle_ftell(FILE* f) {
@@ -273,12 +279,12 @@ GUEST_ABI void hle_rewind(FILE* f) { std::rewind(f); }
 GUEST_ABI int hle_feof(FILE* f) { return std::feof(f); }
 GUEST_ABI int hle_ferror(FILE* f) { return std::ferror(f); }
 GUEST_ABI void hle_clearerr(FILE* f) { std::clearerr(f); }
-GUEST_ABI int hle_fgetc(FILE* f) { return std::fgetc(f); }
-GUEST_ABI int hle_getc(FILE* f) { return std::getc(f); }
+GUEST_ABI int hle_fgetc(FILE* f) { return bb::libc::file_result(f, [&] { return std::fgetc(f); }); }
+GUEST_ABI int hle_getc(FILE* f) { return bb::libc::file_result(f, [&] { return std::getc(f); }); }
 GUEST_ABI int hle_ungetc(int c, FILE* f) { return std::ungetc(c, f); }
-GUEST_ABI char* hle_fgets(char* s, int n, FILE* f) { return std::fgets(s, n, f); }
-GUEST_ABI int hle_fputc(int c, FILE* f) { return std::fputc(c, f); }
-GUEST_ABI int hle_fputs(const char* s, FILE* f) { return std::fputs(s, f); }
+GUEST_ABI char* hle_fgets(char* s, int n, FILE* f) { return bb::libc::file_result(f, [&] { return std::fgets(s, n, f); }); }
+GUEST_ABI int hle_fputc(int c, FILE* f) { return bb::libc::file_result(f, [&] { return std::fputc(c, f); }); }
+GUEST_ABI int hle_fputs(const char* s, FILE* f) { return bb::libc::file_result(f, [&] { return std::fputs(s, f); }); }
 GUEST_ABI int hle_fgetpos(FILE* f, bb::libc::Fpos* p) { return libc_result(bb::libc::get_position(f, p)); }
 GUEST_ABI int hle_setvbuf(FILE* f, char* b, int m, std::uint64_t n) {
     const int host_mode = bb::libc::buffer_mode(m);

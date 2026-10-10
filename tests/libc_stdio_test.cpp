@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <cstring>
 
+thread_local int t_guest_errno;
+
 #define CHECK(expr) do { if (!(expr)) { \
     std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr); \
     std::exit(1); } } while (0)
@@ -27,5 +29,23 @@ int main() {
     errno = 0;
     CHECK(seek(f, -1, SEEK_SET) == -1 && errno == EINVAL);
     CHECK(std::fclose(f) == 0);
+    t_guest_errno = 77;
+    CHECK(!open_file("bbhost-libc-errno-missing-directory/file", "rb") && t_guest_errno == 2);
+    errno = ERANGE;  // logging or other host work must not replace guest errno
+    CHECK(t_guest_errno == 2);
+#if defined(_WIN32)
+    const char* null_path = "NUL";
+#else
+    const char* null_path = "/dev/null";
+#endif
+    t_guest_errno = 63;
+    FILE* read_only = open_file(null_path, "rb");
+    CHECK(read_only && t_guest_errno == 63);
+    errno = EINVAL;
+    CHECK(file_result(read_only, [&] { return std::fgetc(read_only); }) == EOF);
+    CHECK(!std::ferror(read_only) && t_guest_errno == 63);
+    CHECK(file_result(read_only, [&] { return std::fputc('x', read_only); }) == EOF);
+    CHECK(std::ferror(read_only) && errno != 0 && t_guest_errno == to_freebsd(errno));
+    CHECK(libc_result(std::fclose(read_only)) == 0);
     std::puts("libc stdio tests passed");
 }

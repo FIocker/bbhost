@@ -3,7 +3,29 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "hle/common.h"
+
 namespace bb::libc {
+
+inline FILE* open_file(const char* path, const char* mode) {
+    FILE* f = std::fopen(path, mode);
+    if (!f) set_guest_errno_host(errno);
+    return f;
+}
+inline FILE* reopen_file(const char* path, const char* mode, FILE* file) {
+    FILE* f = std::freopen(path, mode, file);
+    if (!f) set_guest_errno_host(errno);
+    return f;
+}
+template <typename Fn> inline auto file_result(FILE* file, Fn&& call) {
+    errno = 0;
+    auto result = call();
+    const int error = errno;
+    // EOF/short transfers are not necessarily errors; don't leak old host
+    // errno or erase the guest's previous errno on successful operations.
+    if (error && std::ferror(file)) set_guest_errno_host(error);
+    return result;
+}
 
 struct Fpos {
     std::int64_t offset;
