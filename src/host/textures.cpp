@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstring>
 #include <set>
+#include <tuple>
 #include <unordered_map>
 
 namespace gpu {
@@ -3175,15 +3176,26 @@ bool textures_copy_image_region_locked(const GpuImageCopy& c) {
     const std::uint32_t dw = std::max(1u, dst.width >> c.dst_mip), dh = std::max(1u, dst.height >> c.dst_mip);
     if (!c.w || !c.h || c.src_mip >= src.levels || c.dst_mip >= dst.levels || c.src_layer >= src.layers || c.dst_layer >= dst.layers ||
         c.src_x + c.w > sw || c.src_y + c.h > sh || c.dst_x + c.w > dw || c.dst_y + c.h > dh) {
-        if (g_image_copy_range.fetch_add(1, std::memory_order_relaxed) < 8) {
-            host_log("texture: copy token refused: src 0x%llx %ux%u levels %u layers %u%s mip %u layer %u at %u,%u; dst 0x%llx %ux%u levels %u layers %u%s "
-                     "mip %u layer %u at %u,%u; %ux%u",
-                     static_cast<unsigned long long>(tsharp_base(c.src_tsharp)), src.width, src.height, src.levels, src.layers, src.rt ? " (render target)" : "",
-                     c.src_mip, c.src_layer, c.src_x, c.src_y, static_cast<unsigned long long>(tsharp_base(c.dst_tsharp)), dst.width, dst.height, dst.levels,
-                     dst.layers, dst.rt ? " (render target)" : "", c.dst_mip, c.dst_layer, c.dst_x, c.dst_y, c.w, c.h);
+        g_image_copy_range.fetch_add(1, std::memory_order_relaxed);
+        const char* why = !c.w || !c.h                                       ? "an empty region"
+                          : c.src_mip >= src.levels || c.src_layer >= src.layers ? "source mip or layer out of range"
+                          : c.src_x + c.w > sw || c.src_y + c.h > sh         ? "source region out of range"
+                                                                             : "destination mip, layer or region out of range";
+        // Each source, destination and reason once (32 lines at most). The
+        // first eight refusals used to be the only ones logged, and those are
+        // the first frame's cube faces (copied before anything drew them, no
+        // loss), so every later refusal went by without a word.
+        static std::set<std::tuple<std::uint64_t, std::uint64_t, const char*>> seen;  // under g.mu
+        if (seen.size() < 32 && seen.emplace(tsharp_base(c.src_tsharp), tsharp_base(c.dst_tsharp), why).second) {
+            host_log("texture: copy token refused (%s): src 0x%llx %ux%u levels %u layers %u%s mip %u layer %u at %u,%u; dst 0x%llx %ux%u levels %u "
+                     "layers %u%s mip %u layer %u at %u,%u; %ux%u; flip %llu",
+                     why, static_cast<unsigned long long>(tsharp_base(c.src_tsharp)), src.width, src.height, src.levels, src.layers,
+                     src.rt ? " (render target)" : "", c.src_mip, c.src_layer, c.src_x, c.src_y,
+                     static_cast<unsigned long long>(tsharp_base(c.dst_tsharp)), dst.width, dst.height, dst.levels, dst.layers,
+                     dst.rt ? " (render target)" : "", c.dst_mip, c.dst_layer, c.dst_x, c.dst_y, c.w, c.h,
+                     static_cast<unsigned long long>(hle_video_flip_count()));
         }
-        refused(c.src_mip >= src.levels || c.src_layer >= src.layers ? "source mip or layer out of range"
-                                                                     : "destination mip, layer or region out of range");
+        refused(why);
         return false;
     }
     if (src.rt) g_image_copy_rt_src.fetch_add(1, std::memory_order_relaxed);
