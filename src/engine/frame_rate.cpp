@@ -527,6 +527,19 @@ constexpr std::uint32_t kPlayTimeAdd = 0x1d419d6;
 constexpr char kPlayTimeAddWas[] = "c5f259051267fe02c4e1fa2cc8";
 static_assert(sizeof(kPlayTimeAddWas) - 1 == 2 * 13, "the add and its replacement are 13 bytes");
 
+// The task step itself: the 60 FPS++ cave (0x2418e3d, as kSixtySites writes
+// it) computes it as movss xmm0,[rbx+0x264]; maxss xmm0,[rbx+0x18]; minss
+// xmm0,[1/30] - the flipper's measured frame time clamped to [target, 1/30]
+// - and stores it into the step-info and the slot. With our
+// SprjFlipper::Update the cave loads ours instead (movss xmm0,[step]; nop8;
+// nop5), written every frame in the image's tail just before the cave runs:
+// the same clamp, times a plugin's time scale (frame_rate_set_time_scale),
+// at most 1/30. Above 30 everything steps by that step, so slow motion
+// scales the step rather than stretching the frames.
+constexpr std::uint32_t kStepLoad = 0x2418e3d;
+constexpr char kStepLoadWas[] = "f30f108364020000f30f5f4318f30f5d0512d59002";
+static_assert(sizeof(kStepLoadWas) - 1 == 2 * 21, "the cave's three instructions are 21 bytes");
+
 // The cloth above 60 (tools/fps_sites.py, from Kyo's "90 FPS++"). With one
 // substep a frame (0xb6e67a above) the hcl solver runs at the frame rate,
 // against the 60 the part files were authored for (30 fps, 2 substeps), and
@@ -653,6 +666,10 @@ float g_cloth_dt = 1.0f / 60.0f;
 // The play time's count (kPlayTimeAdd) and the part of a millisecond carried.
 std::uint64_t g_play_ms_va = 0;
 double g_play_ms_carry = 0.0;
+// The task step the cave loads (kStepLoad); while it is ours a plugin's time
+// scale scales the step, not the frames' pace.
+std::uint64_t g_step_va = 0;
+std::atomic<bool> g_scale_by_step{false};
 
 template <typename T>
 void put(std::uint64_t a, T v) {
@@ -902,10 +919,14 @@ void sprj_flipper_update(SprjFlipper* f, FlipClock& clock, float target) {
     f->previous_frame_microseconds = f->current_frame_microseconds;
     std::int64_t now = clock.now();
     f->current_frame_microseconds = static_cast<std::uint64_t>(now);
-    // A plugin's time scale (frame_rate_set_time_scale): the game advances a
-    // fixed step a frame, so a longer frame is slower time and a shorter one
-    // faster, as far as the machine keeps up.
-    std::int64_t interval_us = seconds_to_us(f->target_frame_seconds / g_time_scale.load(std::memory_order_relaxed));
+    // A plugin's time scale (frame_rate_set_time_scale): at 30 the game
+    // advances a fixed step a frame, so a longer frame is slower time and a
+    // shorter one faster, as far as the machine keeps up. At a converted rate
+    // with the step ours (each_frame) the step scales and the pace stays.
+    const float pace_scale = converted && g_scale_by_step.load(std::memory_order_relaxed)
+                                 ? 1.0f
+                                 : g_time_scale.load(std::memory_order_relaxed);
+    std::int64_t interval_us = seconds_to_us(f->target_frame_seconds / pace_scale);
 
     // The last frames that ran behind, up to the foreground count of them:
     // how much time they took together.
@@ -1114,31 +1135,35 @@ float pace_target() {
     return 0.0f;
 }
 
-// After the update, at every converted rate: the values that follow the
-// frame's seconds, for the frame about to run. dt is what the FPS++ cave
-// (0x2418e3d) hands the game's task step this frame - the measured frame
-// time clamped to [target, 1/30] - with the uncapped limit as the floor while
-// a loading screen has no target. Above 60 the cloth's stiffness scale: the
-// square of its solver rate (one substep a frame) against the 60 its part
-// files were authored at, (60 dt)^2, at most 1 (below 60 the cloth keeps the
-// 60 tuning), over a smoothed frame time. Each store is one aligned float; a
+// After the update, at every converted rate, for the frame about to run: the
+// task step (kStepLoad) - the measured frame time clamped to [target, 1/30]
+// as the 60 FPS++ cave has it (a loading screen has no target: the measured
+// time), times a plugin's time scale, at most 1/30 - the play time's
+// milliseconds from it, and the values that follow the frame's seconds, from
+// dt: the same with the uncapped limit as the floor while a loading screen
+// has no target. Above 60 the cloth's stiffness scale: the square of its
+// solver rate (one substep a frame) against the 60 its part files were
+// authored at, (60 dt)^2, at most 1 (below 60 the cloth keeps the 60
+// tuning), over a smoothed frame time. Each store is one aligned value; a
 // reader on a worker sees the last frame's value or this one's.
 void each_frame(const SprjFlipper* f) {
-    const float floor_s = std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
-    const float dt = std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth);
-    if (!(dt > 0.0f)) return;  // also NaN
-    frame_rate_step::g_frame_seconds.store(dt, std::memory_order_relaxed);
-    if (g_play_ms_va) {
-        // The step the cave gives the game this frame (no uncapped floor) in
-        // whole milliseconds, the rest carried to the next frame.
-        const float step = std::min(std::max(f->measured_frame_seconds, f->target_frame_seconds), kThirtieth);
-        if (step > 0.0f) {
+    const float scale = g_scale_by_step.load(std::memory_order_relaxed) ? g_time_scale.load(std::memory_order_relaxed) : 1.0f;
+    const auto scaled = [scale](float s) { return scale == 1.0f ? s : std::min(s * scale, kThirtieth); };
+    const float step = scaled(std::min(std::max(f->measured_frame_seconds, f->target_frame_seconds), kThirtieth));
+    if (step > 0.0f) {  // also NaN: the cave keeps the last step
+        if (g_step_va) put<float>(g_step_va, step);
+        if (g_play_ms_va) {
+            // The step in whole milliseconds, the rest carried to the next frame.
             g_play_ms_carry += static_cast<double>(step) * 1000.0;
             const auto ms = static_cast<std::int32_t>(g_play_ms_carry);
             g_play_ms_carry -= ms;
             put<std::int32_t>(g_play_ms_va, ms);
         }
     }
+    const float floor_s = std::max(f->target_frame_seconds, 1.0f / static_cast<float>(kUncappedMaxFps));
+    const float dt = scaled(std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth));
+    if (!(dt > 0.0f)) return;  // also NaN
+    frame_rate_step::g_frame_seconds.store(dt, std::memory_order_relaxed);
     const double fps = 1.0 / static_cast<double>(dt);
     for (const EachFrame& e : g_each) put<float>(e.va, rated_value(e.kind, e.was, fps));
     g_cloth_dt += (dt - g_cloth_dt) * 0.1f;
@@ -1345,27 +1370,51 @@ int apply_rate(ElfImage* image, int want) {
         // stores above, kConstants' defaults): the decomp camera converts
         // them to each frame's length (decomp/camera/follow_camera.cpp).
         frame_rate_step::g_camera_60_tuned.store(true, std::memory_order_relaxed);
-        // The play time's count: written by our SprjFlipper::Update (with the
-        // guest's, BBHOST_FRAME_SOURCE=0 or 2 at 60, the game's add stays).
-        const std::vector<std::uint8_t> was = hex_bytes(kPlayTimeAddWas);
-        const std::uint64_t count = image->tail_va + image->tail_used + kPreferredGuestSlide;  // as a BN address
-        const std::int64_t disp = static_cast<std::int64_t>(count) - static_cast<std::int64_t>(kPlayTimeAdd + 6);
+        // The task step and the play time's count, ours: written by our
+        // SprjFlipper::Update every frame, in 16 bytes of the image's tail
+        // (with the guest's, BBHOST_FRAME_SOURCE=0 or 2 at 60, the cave and
+        // the game's add stay).
+        const std::uint64_t block = image->tail_va + image->tail_used + kPreferredGuestSlide;  // as a BN address
+        const std::uint64_t step_bn = block, play_bn = block + 8;
+        const std::int64_t step_disp = static_cast<std::int64_t>(step_bn) - static_cast<std::int64_t>(kStepLoad + 8);
+        const std::int64_t play_disp = static_cast<std::int64_t>(play_bn) - static_cast<std::int64_t>(kPlayTimeAdd + 6);
+        const auto holds = [&](std::uint32_t at, const char* hex) {
+            const std::vector<std::uint8_t> was = hex_bytes(hex);
+            return std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(at))), was.data(), was.size()) == 0;
+        };
+        const auto rel32 = [](std::int64_t d) { return d >= INT32_MIN && d <= INT32_MAX; };
         if (g_source != Source::Ours) {
-            host_log("frame rate: the guest's SprjFlipper::Update runs; the play time keeps the game's whole-millisecond add");
-        } else if (std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(kPlayTimeAdd))), was.data(),
-                               was.size()) != 0 ||
-                   image->tail_used + 8 > image->tail_size || disp < INT32_MIN || disp > INT32_MAX) {
-            host_log("frame rate: 0x%x does not hold the play time's add (or no room in the image's tail); the game's stays",
-                     kPlayTimeAdd);
+            host_log("frame rate: the guest's SprjFlipper::Update runs; the task step and the play time stay the game's");
+        } else if (image->tail_used + 16 > image->tail_size || !rel32(step_disp) || !rel32(play_disp)) {
+            host_log("frame rate: no room in the image's tail; the task step and the play time stay the game's");
         } else {
-            image->tail_used += 8;
-            g_play_ms_va = va(static_cast<std::uint32_t>(count));
-            put<std::int32_t>(g_play_ms_va, static_cast<std::int32_t>(1000 / fps));
-            const auto d = static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
-            const std::uint8_t now[13] = {0x8b, 0x0d, static_cast<std::uint8_t>(d), static_cast<std::uint8_t>(d >> 8),
-                                          static_cast<std::uint8_t>(d >> 16), static_cast<std::uint8_t>(d >> 24),
-                                          0x0f, 0x1f, 0x80, 0, 0, 0, 0};
-            write(kPlayTimeAdd, now, sizeof(now));
+            image->tail_used += 16;
+            const auto le = [](std::int64_t d, std::uint8_t* out) {
+                const auto u = static_cast<std::uint32_t>(static_cast<std::int32_t>(d));
+                for (int k = 0; k < 4; ++k) out[k] = static_cast<std::uint8_t>(u >> (8 * k));
+            };
+            if (holds(kStepLoad, kStepLoadWas)) {
+                g_step_va = va(static_cast<std::uint32_t>(step_bn));
+                put<float>(g_step_va, 1.0f / static_cast<float>(fps));
+                std::uint8_t now[21] = {0xf3, 0x0f, 0x10, 0x05, 0, 0, 0, 0,               // movss xmm0, [step]
+                                        0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,  // nop8
+                                        0x0f, 0x1f, 0x44, 0x00, 0x00};                   // nop5
+                le(step_disp, now + 4);
+                write(kStepLoad, now, sizeof(now));
+                g_scale_by_step.store(true, std::memory_order_relaxed);
+            } else {
+                host_log("frame rate: 0x%x does not hold the 60 FPS++ cave's step; the cave keeps computing it", kStepLoad);
+            }
+            if (holds(kPlayTimeAdd, kPlayTimeAddWas)) {
+                g_play_ms_va = va(static_cast<std::uint32_t>(play_bn));
+                put<std::int32_t>(g_play_ms_va, static_cast<std::int32_t>(1000 / fps));
+                std::uint8_t now[13] = {0x8b, 0x0d, 0, 0, 0, 0,                    // mov ecx, [count]
+                                        0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00};  // nop7
+                le(play_disp, now + 2);
+                write(kPlayTimeAdd, now, sizeof(now));
+            } else {
+                host_log("frame rate: 0x%x does not hold the play time's add; the game's stays", kPlayTimeAdd);
+            }
         }
     }
     if (mode != 60) {
@@ -1490,9 +1539,9 @@ void frame_rate_install(ElfImage* image) {
         std::snprintf(target, sizeof(target), "a 1/%d s target", got);
     }
     host_log("frame rate: %s (the frame-time manager's mode 2, %s; %zu constants and %zu other values converted, %zu 60 FPS++, "
-             "%zu frame-time and %zu cloth code sites%s)",
+             "%zu frame-time and %zu cloth code sites%s%s)",
              mode_name(got).c_str(), target, constants, kCountsN + kBytesN, g_sites_applied, g_frame_time_applied, g_cloth_applied,
-             g_play_ms_va ? ", the play time's add" : "");
+             g_step_va ? ", the task step ours" : "", g_play_ms_va ? ", the play time's add" : "");
     if (got != want)
         host_log("frame rate: %s was asked for; %s runs (the reason is above)", mode_name(want).c_str(), mode_name(got).c_str());
 }

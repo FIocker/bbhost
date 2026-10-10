@@ -46,9 +46,12 @@ void frame_rate_install(ElfImage* image);
 int frame_rate_game_fps();
 
 // Game time against real time (plugins' set_time_scale): 0.5 is half speed,
-// 2 double (as far as the machine keeps up), clamped to 0.1-4. The game steps
-// a fixed amount a frame, so this is the frame pacing's interval. (Uncapped,
-// the step follows the frame time, so only the fixed steps slow down.)
+// 2 double, clamped to 0.1-4. At 30 the game steps a fixed amount a frame, so
+// this is the frame pacing's interval (as far as the machine keeps up). At a
+// converted rate every step follows the frame's time, so it scales the task
+// step instead (at most 1/30 s a frame) and the frames keep their pace;
+// what still counts frames (frame_rate.cpp's kCounts and the rate's code
+// immediates) keeps real time.
 void frame_rate_set_time_scale(float scale);
 
 // The limiter since the last call, for the 300-flip report's timing line:
