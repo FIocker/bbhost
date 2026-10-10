@@ -17,6 +17,10 @@
 //              the comparison must flag exactly that texel. A perturbed copy of
 //              A's output checks the comparator the same way.
 //   variant    --ps: the same draw with another pixel shader, against A.
+// --specialize: every run's stages take the specialization constants bbhost's
+// optimized relink gives them (render.cpp relink_pipeline): the vertex
+// formats as constants for a vertex shader that reads them from its params,
+// and the indexed loads' words 3 and strides from the stage params.
 // A draw that took Vulkan vertex input replays with the captured bindings'
 // bytes as vertex buffers and the captured bindings and attributes.
 // Every run restores the guest pages and buffers from the blobs and checks
@@ -659,6 +663,7 @@ public:
             infos.push_back(si);
         };
         if (!json::flag(stages[0], "present")) fail("the capture has no vertex shader");
+        if (specialize) specialization();
         if (vs_override) {
             add(VK_SHADER_STAGE_VERTEX_BIT, *vs_override, "vertex (variant)");
         } else {
@@ -672,6 +677,12 @@ public:
             add(VK_SHADER_STAGE_FRAGMENT_BIT, *ps_override, "pixel (variant)");
         } else if (json::flag(stages[1], "present")) {
             add(VK_SHADER_STAGE_FRAGMENT_BIT, words_of(cap_.blob(json::str(stages[1], "spirv")), "pixel SPIR-V"), "pixel");
+        }
+        if (specialize) {
+            for (VkPipelineShaderStageCreateInfo& si : infos) {
+                if (si.stage == VK_SHADER_STAGE_VERTEX_BIT) si.pSpecializationInfo = &vs_spec_info_;
+                if (si.stage == VK_SHADER_STAGE_FRAGMENT_BIT) si.pSpecializationInfo = &ps_spec_info_;
+            }
         }
 
         VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
@@ -1441,6 +1452,50 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     std::vector<VkShaderModule> modules_;
+
+public:
+    bool specialize = false;  // --specialize
+
+private:
+    // The words relink_pipeline specializes with: the vertex stage's 16
+    // vertex-format descriptors (gcn::kVertexFormatSpecId), 16 words 3
+    // (kCbW3SpecId) and 16 strides (kCbStrideSpecId); the pixel stage's words
+    // 3 and strides. A 0 keeps the default, which reads the params.
+    std::uint32_t vs_spec_[48] = {}, ps_spec_[32] = {};
+    VkSpecializationMapEntry vs_entries_[48] = {}, ps_entries_[32] = {};
+    VkSpecializationInfo vs_spec_info_{}, ps_spec_info_{};
+    void specialization() {
+        const auto& stages = json::arr(cap_.m, "stages");
+        for (int st = 0; st < 2; ++st) {
+            if (!json::flag(stages[st], "present")) continue;
+            const auto& params = cap_.blob(json::str(json::member(stages[st], "params"), "blob"));
+            gcn::StageParams sp{};
+            std::memcpy(&sp, params.data(), std::min(params.size(), sizeof(sp)));
+            std::uint32_t* words = st ? ps_spec_ : vs_spec_ + 16;
+            for (int i = 0; i < 16; ++i) {  // render.cpp queue_library_relink: the indexed loads' (word 3 and stride set)
+                if (!(sp.cb_w3[i] | sp.cb_stride[i])) continue;
+                words[i] = sp.cb_w3[i];
+                words[16 + i] = sp.cb_stride[i];
+            }
+        }
+        const json::Value* fp = json::member(cap_.m, "translate").find("vertex_formats_from_params");
+        const json::Value* vi = cap_.m.find("vertex_input");
+        if (fp && fp->type == json::Value::Type::Bool && fp->boolean && vi && vi->type == json::Value::Type::Object) {
+            for (const json::Value& e : json::arr(*vi, "elements")) {
+                const std::uint32_t location = json::u32(e, "location");
+                if (location < 16) vs_spec_[location] = gcn::vertex_format_descriptor(static_cast<std::uint32_t>(json::u64(e, "w3")));
+            }
+        }
+        for (std::uint32_t k = 0; k < 16; ++k) {
+            vs_entries_[k] = {gcn::kVertexFormatSpecId + k, k * 4, 4};
+            vs_entries_[16 + k] = {gcn::kCbW3SpecId + k, (16 + k) * 4, 4};
+            vs_entries_[32 + k] = {gcn::kCbStrideSpecId + k, (32 + k) * 4, 4};
+            ps_entries_[k] = {gcn::kCbW3SpecId + k, k * 4, 4};
+            ps_entries_[16 + k] = {gcn::kCbStrideSpecId + k, (16 + k) * 4, 4};
+        }
+        vs_spec_info_ = {48, vs_entries_, sizeof(vs_spec_), vs_spec_};
+        ps_spec_info_ = {32, ps_entries_, sizeof(ps_spec_), ps_spec_};
+    }
     std::vector<VkPipeline> pipelines_;
 };
 
@@ -1514,10 +1569,11 @@ struct Options {
     bool validate = false;
     std::uint32_t bench = 0;  // draws per timed batch
     bool library = false;     // the variant is linked from pipeline libraries (BBHOST_PIPELINE_LIBRARY)
+    bool specialize = false;  // every run with the optimized relink's specialization constants
 };
 
 [[noreturn]] void usage() {
-    std::fprintf(stderr, "usage: drawreplay <capture-dir> [--out DIR] [--atol X] [--rtol Y] [--ps FILE.spv] [--vs FILE.spv] [--library] [--no-live] [--validate] [--bench N]\n");
+    std::fprintf(stderr, "usage: drawreplay <capture-dir> [--out DIR] [--atol X] [--rtol Y] [--ps FILE.spv] [--vs FILE.spv] [--library] [--specialize] [--no-live] [--validate] [--bench N]\n");
     std::exit(2);
 }
 
@@ -1535,6 +1591,7 @@ Options parse_args(int argc, char** argv) {
         else if (a == "--ps") o.ps = value();
         else if (a == "--vs") o.vs = value();
         else if (a == "--library") o.library = true;
+        else if (a == "--specialize") o.specialize = true;
         else if (a == "--no-live") o.live = false;
         else if (a == "--validate") o.validate = true;
         else if (a == "--bench") o.bench = static_cast<std::uint32_t>(std::strtoul(value().c_str(), nullptr, 10));
@@ -1564,6 +1621,7 @@ int replay_main(const Options& o) {
     std::printf("drawreplay: %s (%s, flip %llu) on %s\n", o.capture.string().c_str(), json::str(identity, "pipeline").c_str(),
                 static_cast<unsigned long long>(json::u64(identity, "flip")), dev.name.c_str());
     Replayer r(cap, dev);
+    r.specialize = o.specialize;
     const VkPipeline captured = r.pipeline(nullptr);
 
     json::Value report = json::Value::make_object();
@@ -1576,6 +1634,7 @@ int replay_main(const Options& o) {
     tol.set("atol", o.tol.atol);
     tol.set("rtol", o.tol.rtol);
     report.set("tolerance", tol);
+    report.set("specialized", o.specialize);
     json::Value comparisons = json::Value::make_object();
     json::Value runs = json::Value::make_object();
     const replay::Tolerance exact;
