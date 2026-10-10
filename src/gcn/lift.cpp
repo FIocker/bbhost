@@ -2616,6 +2616,72 @@ private:
         write_v(in.dst, flt(extract(t_f32, attr(in.attr), in.attr_chan)));
     }
 
+    // A vertex shader's pos1-3, as translate.cpp exp writes them:
+    // PA_CL_VS_OUT_CNTL packs the extra vectors after the position - the misc
+    // vector (bit 20), then the clip/cull distance vectors 0 (bit 22) and 1
+    // (bit 23). The misc vector carries the point size (USE_VTX_POINT_SIZE); a
+    // distance vector writes ClipDistance, distances 0-7 enabled by bits 0-7
+    // with the cull bits 8-15 folded in - or, with kVsOutCntlClipVarying,
+    // distances 0-3 to the clip location (a disabled one reads 1), which the
+    // pixel stage discards by.
+    Id out_clip = 0, out_point_size = 0;
+    int clip_count = 0;
+    bool extra_position_vector(const Inst& in, const std::vector<Id>& comps) {
+        const std::uint32_t cntl = opt.vs_out_cntl;
+        int slot = 13, misc_slot = -1, cc0_slot = -1, cc1_slot = -1;
+        if (cntl & (1u << 20)) misc_slot = slot++;
+        if (cntl & (1u << 22)) cc0_slot = slot++;
+        if (cntl & (1u << 23)) cc1_slot = slot++;
+        const int tgt = static_cast<int>(in.tgt);
+        if (tgt == misc_slot) {
+            if (cntl & ((1u << 17) | (1u << 18) | (1u << 19) | (1u << 21))) {
+                reject("a misc vector export with an edge flag, render target or viewport index or kill flag");
+                return false;
+            }
+            if (cntl & (1u << 16)) {  // USE_VTX_POINT_SIZE
+                if (!out_point_size) {
+                    out_point_size = m.global_variable(m.type_pointer(spv::ScOutput, t_f32), spv::ScOutput);
+                    m.decorate(out_point_size, spv::DecBuiltIn, {1 /* PointSize */});
+                    interface.push_back(out_point_size);
+                }
+                m.store(out_point_size, comps[0]);
+            }
+            return true;
+        }
+        if (tgt != cc0_slot && tgt != cc1_slot) {
+            reject("pos" + std::to_string(tgt - 12) + " export not enabled by PA_CL_VS_OUT_CNTL");
+            return false;
+        }
+        if (cntl & TranslateOptions::kVsOutCntlClipVarying) {
+            if (tgt != cc0_slot) return true;  // the host sends only distances 0-3 this way
+            std::vector<Id> d(4, cf(1.0f));
+            for (std::uint32_t k = 0; k < 4; ++k) {
+                if (((in.dmask >> k) & 1) && ((cntl >> k) & 1)) d[k] = comps[k];
+            }
+            m.store(out_param(static_cast<int>(TranslateOptions::vs_clip_location(cntl))), m.emit(spv::OpCompositeConstruct, t_v4f, d));
+            return true;
+        }
+        const int base = tgt == cc0_slot ? 0 : 4;
+        if (!out_clip) {
+            const std::uint32_t ena = (cntl & 0xff) | ((cntl >> 8) & 0xff);
+            clip_count = 0;
+            for (int k = 0; k < 8; ++k) {
+                if ((ena >> k) & 1) clip_count = k + 1;
+            }
+            if (clip_count == 0) clip_count = 1;
+            const Id t_arr = m.type_array(t_f32, cu(static_cast<std::uint32_t>(clip_count)));
+            out_clip = m.global_variable(m.type_pointer(spv::ScOutput, t_arr), spv::ScOutput);
+            m.decorate(out_clip, spv::DecBuiltIn, {3 /* ClipDistance */});
+            m.capability(spv::CapClipDistance);
+            interface.push_back(out_clip);
+        }
+        for (int k = 0; k < 4; ++k) {
+            if (!((in.dmask >> k) & 1) || base + k >= clip_count) continue;
+            m.store(m.access_chain(m.type_pointer(spv::ScOutput, t_f32), out_clip, {cu(static_cast<std::uint32_t>(base + k))}), comps[k]);
+        }
+        return true;
+    }
+
     void exp(const Inst& in) {
         // The translator exports whatever EXEC holds; a pixel whose bit is clear
         // here must be killed at s_endpgm (checked there).
@@ -2632,9 +2698,10 @@ private:
             export_execs.push_back(e);
         }
         if (in.tgt == 9) return;  // null export
-        // Pixel shaders export colour targets 0-7; vertex shaders the position (12) and params (32-63).
-        if (vertex ? !(in.tgt == 12 || (in.tgt >= 32 && in.tgt < 64)) : in.tgt >= 8) {
-            reject(vertex ? "only position and param exports are lifted in a vertex shader, not target " + std::to_string(in.tgt)
+        // Pixel shaders export colour targets 0-7; vertex shaders the position
+        // (12), the vectors PA_CL_VS_OUT_CNTL packs after it (13-15) and params (32-63).
+        if (vertex ? !(in.tgt >= 12 && in.tgt < 16) && !(in.tgt >= 32 && in.tgt < 64) : in.tgt >= 8) {
+            reject(vertex ? "only position, clip and param exports are lifted in a vertex shader, not target " + std::to_string(in.tgt)
                           : std::string("only colour exports are lifted"));
             return;
         }
@@ -2698,11 +2765,15 @@ private:
             return;
         }
         if (vertex) {  // the translator stores all four components of the position and of a param
-            const Id value = m.emit(spv::OpCompositeConstruct, t_v4f, comps);
-            if (in.tgt == 12) {
-                m.store(out_position(), value);
+            if (in.tgt > 12 && in.tgt < 16) {
+                if (!extra_position_vector(in, comps)) return;
             } else {
-                for (const Id var : param_outputs(static_cast<int>(in.tgt) - 32)) m.store(var, value);
+                const Id value = m.emit(spv::OpCompositeConstruct, t_v4f, comps);
+                if (in.tgt == 12) {
+                    m.store(out_position(), value);
+                } else {
+                    for (const Id var : param_outputs(static_cast<int>(in.tgt) - 32)) m.store(var, value);
+                }
             }
             exports.push_back(in.offset);
             return;
@@ -4637,6 +4708,12 @@ private:
             }
             if (!res.rejections.empty()) return;
         }
+        if (opt.stage == Stage::Vertex && (opt.vs_out_cntl & TranslateOptions::kVsOutCntlClipVarying) &&
+            !out_params.count(static_cast<int>(TranslateOptions::vs_clip_location(opt.vs_out_cntl)))) {
+            // translate.cpp's end of main: no distance vector exported, none discards.
+            m.store(out_param(static_cast<int>(TranslateOptions::vs_clip_location(opt.vs_out_cntl))),
+                    m.emit(spv::OpCompositeConstruct, t_v4f, {cf(1.0f), cf(1.0f), cf(1.0f), cf(1.0f)}));
+        }
         if (needs_kill) {  // translate.cpp's end of main
             const Id l_kill = m.fresh(), l_ret = m.fresh();
             m.emit_void(spv::OpSelectionMerge, {l_ret, 0u});
@@ -4653,7 +4730,7 @@ private:
             // declare exactly those.
             std::vector<std::uint32_t> params;
             for (const auto& kv : out_params) params.push_back(static_cast<std::uint32_t>(kv.first));
-            if (params != ref.vs_params || ref.vs_clip_count || ref.vs_point_size) {
+            if (params != ref.vs_params || (out_clip ? clip_count : 0) != ref.vs_clip_count || (out_point_size != 0) != ref.vs_point_size) {
                 cur = prog.insts.back().offset;
                 reject("the lifted outputs differ from the reference's (params, clip distances or point size)");
                 return;
@@ -4774,11 +4851,6 @@ LiftResult lift_pixel_shader(const Program& program, const TranslateOptions& opt
 }
 
 LiftResult lift_vertex_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference) {
-    if (options.vs_out_cntl & TranslateOptions::kVsOutCntlClipVarying) {
-        LiftResult r;
-        r.rejections.push_back("clip distances as a varying");
-        return r;
-    }
     return lift_stage(Stage::Vertex, program, options, reference);
 }
 

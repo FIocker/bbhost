@@ -2706,7 +2706,52 @@ void formats() {
     CHECK(compared == words3.size() * raws.size() * raws.size());
 }
 
-void run() { formats(); }
+void clip_distances() {
+    // pos1 holds clip distances 0 and 1 (PA_CL_VS_OUT_CNTL 0x400003, as 4,762
+    // of the game's vertex shaders): ClipDistance, or with the host's clip
+    // varying the distances at the clip location for the pixel stage (a
+    // disabled one reads 1), and 1s there when nothing exports them.
+    const std::vector<std::uint32_t> words = program([](std::vector<std::uint32_t>& w) { export_vec(w, 13, 4); });
+    const std::uint32_t fmt = 14u << 15 | 7u << 12 | 0xfac;  // 32_32_32_32 float
+    const std::map<std::uint32_t, std::array<std::uint32_t, 4>> inputs = {{0, {0x3f800000u, 0xc0000000u, 0x40400000u, 0x40800000u}},
+                                                                          {1, {1, 2, 3, 4}}};
+    std::array<std::uint32_t, 16> formats{};
+    formats[0] = formats[1] = gcn::vertex_format_descriptor(fmt);
+    gcn::TranslateOptions o = options(fmt, fmt, true);
+    o.vs_out_cntl = 0x400003;
+    const Lifted plain = lift_vs(words, o);
+    CHECK(lifted(plain.lift));
+    CHECK(plain.ref.vs_clip_count == 2);
+    if (plain.lift.ok()) {
+        const VertexRun r = run_vertex(plain.lift.spirv, inputs, formats);
+        if (!r.ok) std::fprintf(stderr, "vertex run failed: %s\n", r.error.c_str());
+        CHECK(r.ok && r.clip.size() == 2 && r.clip.at(0) == 0x3f800000u && r.clip.at(1) == 0xc0000000u);
+    }
+    o.vs_out_cntl = 0x400003 | gcn::TranslateOptions::kVsOutCntlClipVarying | 5u << gcn::TranslateOptions::kVsOutCntlClipLocationShift;
+    const Lifted varying = lift_vs(words, o);
+    CHECK(lifted(varying.lift));
+    CHECK(varying.ref.vs_params == std::vector<std::uint32_t>({0, 5}));
+    if (varying.lift.ok()) {
+        const VertexRun r = run_vertex(varying.lift.spirv, inputs, formats);
+        CHECK(r.ok && r.clip.empty() && r.params.count(5) &&
+              r.params.at(5) == (std::array<std::uint32_t, 4>{0x3f800000u, 0xc0000000u, 0x3f800000u, 0x3f800000u}));
+    }
+    const Lifted none = lift_vs(program(), o);  // nothing exported at pos1
+    CHECK(lifted(none.lift));
+    if (none.lift.ok()) {
+        const VertexRun r = run_vertex(none.lift.spirv, inputs, formats);
+        CHECK(r.ok && r.params.count(5) && r.params.at(5) == (std::array<std::uint32_t, 4>{0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u}));
+    }
+    // A pos1 that PA_CL_VS_OUT_CNTL does not enable is the translator's error.
+    o.vs_out_cntl = 0;
+    const Lifted stray = lift_vs(words, o);
+    CHECK(!stray.ref.ok() && rejected_with(stray.lift, "the reference translation failed"));
+}
+
+void run() {
+    formats();
+    clip_distances();
+}
 
 }  // namespace vertex
 
