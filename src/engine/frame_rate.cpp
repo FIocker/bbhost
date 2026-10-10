@@ -98,6 +98,15 @@ constexpr std::uint32_t kModeSixty = 2;
 // The physics world's expected minimum step (hkpWorldCinfo, 0x0f383ca) is a
 // tolerance hint at 1/fps; 0x4d29170's step is read by one load the 60 FPS++
 // sites point at the frame's time.
+// Not here: the effects' rate. The effect manager's constructor (sub_26fb190)
+// stores 30.0 at its +0 (the immediate at 0x26fb39f) and the GPU particle
+// update multiplies elapsed seconds by 0x4cad7fc (30.0): both turn effect
+// data, written in 30 fps frames, into seconds - an emitter's interval is its
+// frames / 30 counted down by elapsed time - so they are the data's rate, not
+// the game's. The FPS++ lists set both to 60, which halved every frame-given
+// interval and lifetime of the sfx emitters and ran GPU particles at twice
+// their speed; Dark Souls III on PC, at 60, keeps the same constructor's 30.
+// The FX particle system steps by the frame's time and reads neither.
 struct Constant {
     std::uint32_t at;
     std::uint32_t was, now;  // the eboot's value, and the one at 60
@@ -199,13 +208,11 @@ constexpr Constant kConstants[] = {
     {0x2434883, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x24348b8, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x25df519, 0x3c888889, 0x3c088889},  // 0.0166667 -> 0.00833333
-    {0x26fb39f, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x4befdcc, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4c9f358, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x4cad65c, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4cad660, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4cad664, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
-    {0x4cad7fc, 0x41f00000, 0x42700000},  // 30 -> 60
     {0x4ccc3f4, 0x3d088889, 0x3c888889},  // 0.0333333 -> 0.0166667
     {0x4cf6420, 0x3dcccccd, 0x3d4ccccd},  // 0.1 -> 0.05
     {0x4cf6424, 0x3dcccccd, 0x3d4ccccd},  // 0.1 -> 0.05
