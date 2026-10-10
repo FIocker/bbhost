@@ -52,5 +52,40 @@ int main() {
     CHECK(std::strcmp(set_c_locale("C"), "C") == 0);
     CHECK(!set_c_locale("POSIX") && !set_c_locale("en_US.UTF-8"));
 
+    struct Vector { const char* text; int base; std::int64_t value; std::size_t end; bool range; };
+    const Vector vectors[] = {
+        {"2147483648!", 10, 2147483648LL, 10, false},
+        {"-9223372036854775808", 10, INT64_MIN, 20, false},
+        {"9223372036854775808", 10, INT64_MAX, 19, true},
+        {"-9223372036854775809", 10, INT64_MIN, 20, true},
+        {"0xdeadBEEF!", 0, 0xdeadbeefLL, 10, false},
+        {"ff!", 16, 255, 2, false}, {"0778", 0, 63, 3, false},
+        {"1012", 2, 5, 3, false}, {"z!", 36, 35, 1, false},
+        {" \t-42!", 10, -42, 5, false}, {"  nope", 10, 0, 0, false},
+        {"0x", 16, 0, 0, false}, {"0xg", 0, 0, 0, false},
+        {"0x1", 8, 0, 1, false}, {"42", 1, 0, 0, false},
+        {"+-12", 10, INT64_MAX, 4, true}, {"--12", 10, INT64_MIN, 4, true}
+    };
+    for (const auto& v : vectors) {
+        const auto n = parse_signed(v.text, v.base);
+        CHECK(n.value == v.value && n.end - v.text == static_cast<std::ptrdiff_t>(v.end) && n.range_error == v.range);
+        std::u16string wide;
+        for (const char* p = v.text; *p; ++p) wide.push_back(static_cast<char16_t>(*p));
+        const auto w = parse_signed(wide.c_str(), v.base);
+        CHECK(w.value == v.value && w.end - wide.c_str() == static_cast<std::ptrdiff_t>(v.end) && w.range_error == v.range);
+    }
+    const auto max = parse_unsigned("18446744073709551615!", 10);
+    CHECK(max.value == UINT64_MAX && *max.end == '!' && !max.range_error);
+    const auto over = parse_unsigned("18446744073709551616!", 10);
+    CHECK(over.value == UINT64_MAX && *over.end == '!' && over.range_error);
+    const auto negative = parse_unsigned("-1", 10);
+    CHECK(negative.value == UINT64_MAX && !negative.range_error);
+    const std::u16string long_number = std::u16string(100, u'0') + u"2147483648!";
+    const auto long_parse = parse_signed(long_number.c_str(), 10);
+    CHECK(long_parse.value == 2147483648LL && *long_parse.end == u'!' && !long_parse.range_error);
+    // U+0131 must not truncate to ASCII '1'.
+    const char16_t nonascii[] = {u'2', 0x0131, u'3', 0};
+    const auto stop = parse_signed(nonascii, 10);
+    CHECK(stop.value == 2 && stop.end == nonascii + 1);
     std::puts("libc ABI tests passed");
 }

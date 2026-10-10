@@ -179,9 +179,17 @@ GUEST_ABI int hle_strncasecmp(const char* a, const char* b, std::uint64_t n) {
 }
 GUEST_ABI int hle_strcoll(const char* a, const char* b) { return sgn(std::strcmp(a, b)); }
 GUEST_ABI const char* hle_strerror(int e) { return std::strerror(e); }
-GUEST_ABI long hle_strtol(const char* s, char** end, int base) { return std::strtol(s, end, base); }
+template <typename Char, typename Integer>
+Integer guest_integer_result(bb::libc::IntegerParse<Char, Integer> r, Char** end) {
+    if (end) *end = const_cast<Char*>(r.end);
+    if (r.range_error) set_guest_errno_bsd(34);  // native ERANGE
+    return r.value;
+}
+GUEST_ABI std::int64_t hle_strtol(const char* s, char** end, int base) {
+    return guest_integer_result(bb::libc::parse_signed(s, base), end);
+}
 GUEST_ABI std::uint64_t hle_strtoumax(const char* s, char** end, int base) {
-    return static_cast<std::uint64_t>(std::strtoull(s, end, base));
+    return guest_integer_result(bb::libc::parse_unsigned(s, base), end);
 }
 
 // The printf family walks the guest's own va_list (hle/sysv_va.h): the
@@ -576,11 +584,9 @@ GUEST_ABI short* hle_getptolower() { return g_tolower + 1; }
 GUEST_ABI short* hle_getptoupper() { return g_toupper + 1; }
 
 GUEST_ABI double hle_stod(const char* s, char** end, long) { return std::strtod(s, end); }
-GUEST_ABI long long hle_stoll(const char* s, char** end, long) { return std::strtoll(s, end, 10); }
-GUEST_ABI unsigned long hle_stoul(const char* s, char** end, long) { return std::strtoul(s, end, 10); }
-GUEST_ABI unsigned long long hle_stoull(const char* s, char** end, long) {
-    return std::strtoull(s, end, 10);
-}
+GUEST_ABI std::int64_t hle_stoll(const char* s, char** end, int base) { return hle_strtol(s, end, base); }
+GUEST_ABI std::uint64_t hle_stoul(const char* s, char** end, int base) { return hle_strtoumax(s, end, base); }
+GUEST_ABI std::uint64_t hle_stoull(const char* s, char** end, int base) { return hle_strtoumax(s, end, base); }
 
 GUEST_ABI int hle_dtest(double* p) {
     if (!p) {
@@ -800,23 +806,10 @@ GUEST_ABI std::uint64_t hle_wcsspn(const Gwchar* s, const Gwchar* r) {
     }
     return n;
 }
-GUEST_ABI long hle_wcstol(const Gwchar* s, Gwchar** e, int b) {
-    std::string tmp;
-    if (s) {
-        for (const Gwchar* p = s; *p && tmp.size() < 64; ++p) {
-            tmp.push_back(static_cast<char>(*p));
-        }
-    }
-    char* end = nullptr;
-    long v = std::strtol(tmp.c_str(), &end, b);
-    if (e && s) {
-        *e = const_cast<Gwchar*>(s) + (end ? (end - tmp.c_str()) : tmp.size());
-    }
-    return v;
+GUEST_ABI std::int64_t hle_wcstol(const Gwchar* s, Gwchar** e, int b) {
+    return guest_integer_result(bb::libc::parse_signed(s, b), e);
 }
-GUEST_ABI long long hle_wcstoll(const Gwchar* s, Gwchar** e, int b) {
-    return hle_wcstol(s, e, b);
-}
+GUEST_ABI std::int64_t hle_wcstoll(const Gwchar* s, Gwchar** e, int b) { return hle_wcstol(s, e, b); }
 GUEST_ABI Gwchar* hle_wmemcpy(Gwchar* d, const Gwchar* s, std::uint64_t n) {
     if (d && s && n) {
         std::memcpy(d, s, static_cast<std::size_t>(n) * sizeof(Gwchar));

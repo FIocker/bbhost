@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <limits>
 
 namespace bb::libc {
 
@@ -54,6 +55,62 @@ static_assert(sizeof(Lconv) == 96 && offsetof(Lconv, decimal_point) == 0x48);
 inline char* set_c_locale(const char* name) {
     static char c[] = "C";
     return !name || !*name || (name[0] == 'C' && name[1] == '\0') ? c : nullptr;
+}
+
+// The narrow and UTF-16 integer helpers share the same C-locale parser. No
+// host long, locale, UTF-16 narrowing, arbitrary input cap, or host errno.
+template <typename Char, typename Integer> struct IntegerParse {
+    Integer value;
+    const Char* end;
+    bool range_error;
+};
+template <typename Char> inline const Char* skip_space(const Char* p) {
+    while (*p == ' ' || (*p >= '\t' && *p <= '\r')) ++p;
+    return p;
+}
+template <typename Char> inline IntegerParse<Char, std::uint64_t> parse_unsigned(const Char* s, int base) {
+    const Char* p = skip_space(s);
+    const bool negative = *p == '-';
+    if (*p == '+' || *p == '-') ++p;
+    if (base < 0 || base == 1 || base > 36) return {0, s, false};
+    const bool autodetect = base == 0;
+    if (!base) base = *p == '0' ? 8 : 10;
+    if ((autodetect || base == 16) && *p == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        base = 16;
+        p += 2;
+    }
+    const Char* first = p;
+    std::uint64_t value = 0;
+    bool overflow = false;
+    for (;;) {
+        const auto c = static_cast<std::uint32_t>(*p);
+        const unsigned digit = c >= '0' && c <= '9' ? c - '0' :
+                               c >= 'a' && c <= 'z' ? c - 'a' + 10 :
+                               c >= 'A' && c <= 'Z' ? c - 'A' + 10 : 36;
+        if (digit >= static_cast<unsigned>(base)) break;
+        constexpr auto max = std::numeric_limits<std::uint64_t>::max();
+        if (value > (max - digit) / static_cast<unsigned>(base)) overflow = true;
+        if (!overflow) value = value * static_cast<unsigned>(base) + digit;
+        ++p;
+    }
+    if (p == first) return {0, s, false};
+    if (overflow) return {std::numeric_limits<std::uint64_t>::max(), p, true};
+    return {negative ? 0 - value : value, p, false};
+}
+template <typename Char> inline IntegerParse<Char, std::int64_t> parse_signed(const Char* s, int base) {
+    const Char* p = skip_space(s);
+    const bool negative = *p == '-';
+    if (*p == '+' || *p == '-') ++p;
+    // Native signed helpers strip one sign then call the unsigned helper.
+    const auto u = parse_unsigned(p, base);
+    if (u.end == p) return {0, s, u.range_error};
+    constexpr auto max = std::numeric_limits<std::int64_t>::max();
+    constexpr auto min = std::numeric_limits<std::int64_t>::min();
+    const auto limit = static_cast<std::uint64_t>(max) + (negative ? 1 : 0);
+    if (u.value > limit) return {negative ? min : max, u.end, true};
+    const auto value = u.value == static_cast<std::uint64_t>(max) + 1 ? min :
+                       negative ? -static_cast<std::int64_t>(u.value) : static_cast<std::int64_t>(u.value);
+    return {value, u.end, u.range_error};
 }
 
 }  // namespace bb::libc
