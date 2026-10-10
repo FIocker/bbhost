@@ -127,6 +127,16 @@ struct NativeLibc {
         CHECK(at < size);
         return reinterpret_cast<Fn>(base + at);
     }
+    template <typename Fn> Fn called_function(const char* name, std::size_t offset) const {
+        const auto at = exports.at(name);
+        CHECK(at < size && offset <= size - at && 5 <= size - at - offset);
+        CHECK(base[at + offset] == 0xe8);
+        std::int32_t displacement;
+        std::memcpy(&displacement, base + at + offset + 1, sizeof(displacement));
+        const auto target = static_cast<std::int64_t>(at + offset + 5) + displacement;
+        CHECK(target >= 0 && static_cast<std::uint64_t>(target) < size);
+        return reinterpret_cast<Fn>(base + target);
+    }
     ~NativeLibc() { if (base) munmap(base, size); }
 };
 }  // namespace
@@ -159,6 +169,19 @@ int main() {
     oracle_seek_result = static_cast<std::int32_t>(0x80020009u);  // console EBADF
     CHECK(native_position(stream, &position) == -1 && oracle_errno == 9);
     CHECK(std::memcmp(&position, &unchanged, sizeof(position)) == 0);
+    // Follow the audited direct calls to read/write preparation helpers.
+    // They don't require the native FILE mutex lifecycle on rejected modes.
+    const auto write_prep = lib.called_function<int(*)(void*)>("aZK8lNei-Qw", 0x25);
+    const auto read_prep = lib.called_function<int(*)(void*)>("AEuF3F2f8TA", 0x61);
+    for (const auto [mode, prep] : {std::pair{1u, write_prep}, std::pair{2u, read_prep}}) {
+        alignas(8) unsigned char wrong_direction[136]{};
+        wrong_direction[0] = static_cast<unsigned char>(mode);
+        oracle_errno = 73;
+        CHECK(prep(wrong_direction) == -1 && oracle_errno == 73);
+        std::uint16_t flags;
+        std::memcpy(&flags, wrong_direction, sizeof(flags));
+        CHECK(flags & 0x200);
+    }
     std::mt19937_64 rng(37);
     const char* extra[] = {"0x", "0xg", "0x1", "0778", "--12", "+-12", "-+12", "++12", " - 12",
         "9223372036854775808", "-9223372036854775809", "18446744073709551616", "-18446744073709551616"};

@@ -54,11 +54,22 @@ int main() {
     FILE* read_only = open_file(null_path, "rb");
     CHECK(read_only && t_guest_errno == 63);
     errno = EINVAL;
-    CHECK(file_result(read_only, [&] { return std::fgetc(read_only); }) == EOF);
+    CHECK(file_result(read_only, [&] { return std::fgetc(read_only); }, read_access) == EOF);
     CHECK(!std::ferror(read_only) && t_guest_errno == 63);
-    CHECK(file_result(read_only, [&] { return std::fputc('x', read_only); }) == EOF);
-    CHECK(std::ferror(read_only) && errno != 0 && t_guest_errno == to_freebsd(errno));
-    CHECK(libc_result(std::fclose(read_only)) == 0);
+    CHECK(file_result(read_only, [&] { return std::fputc('x', read_only); }, write_access) == EOF);
+    CHECK(std::ferror(read_only) && errno != 0 && t_guest_errno == 63);
+    CHECK(close_file(read_only) == 0);
+    FILE* write_only = open_file(null_path, "wb");
+    CHECK(write_only);
+    CHECK(file_result(write_only, [&] { return std::fgetc(write_only); }, read_access) == EOF);
+    CHECK(std::ferror(write_only) && t_guest_errno == 63);
+    CHECK(reopen_file(null_path, "rb", write_only) == write_only);
+    CHECK(file_result(write_only, [&] { return std::fputc('x', write_only); }, write_access) == EOF);
+    CHECK(std::ferror(write_only) && t_guest_errno == 63);
+    CHECK(close_file(write_only) == 0);
+    FILE* read_write = open_file(null_path, "r+b");
+    CHECK(read_write && file_access(read_write) == (read_access | write_access));
+    CHECK(close_file(read_write) == 0);
     FILE* messages = std::tmpfile();
     CHECK(messages);
     t_guest_errno = 35;
@@ -77,6 +88,11 @@ int main() {
     }
     CHECK(std::fclose(messages) == 0);
 #if !defined(_WIN32)
+    FILE* full = open_file("/dev/full", "wb");
+    CHECK(full && std::setvbuf(full, nullptr, _IONBF, 0) == 0);
+    CHECK(file_result(full, [&] { return std::fputc('x', full); }, write_access) == EOF);
+    CHECK(t_guest_errno == 28 && std::ferror(full));
+    close_file(full);
     int descriptors[2];
     CHECK(::pipe(descriptors) == 0);
     FILE* pipe = ::fdopen(descriptors[0], "rb");
