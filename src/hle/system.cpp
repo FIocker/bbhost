@@ -1482,6 +1482,24 @@ struct PadTap {
 };
 std::mutex g_taps_mu;
 std::vector<PadTap> g_taps;  // under g_taps_mu
+// A pad plugged in by the port's own taps (hle_pad_tap), for a headless run.
+std::atomic<bool> g_tap_pad{false};
+
+// A run a test harness drives through requests (BBHOST_TEST_REQUESTS,
+// hle/video.cpp: tools/area_check.py) has its pad plugged in from the start,
+// as a console's is. A pad the game finds disconnected it reads only once a
+// second - its input manager looking for a controller - until one of those
+// reads finds the pad there, and the first tap then had to land its 200 ms
+// press inside one of them: on a Steam Deck's cold start the two clocks took
+// one to three minutes to line up, and the title ignored every press until
+// they did.
+bool test_pad_plugged() {
+    static const bool v = [] {
+        const char* e = std::getenv("BBHOST_TEST_REQUESTS");
+        return e && e[0];
+    }();
+    return v;
+}
 
 // The wheel's notches as presses of mouse inputs 6 (up) and 7 (down): bits
 // 0x20 and 0x40 of the buttons the bindings read. The notches are counted
@@ -1807,8 +1825,8 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
     // the player's, for a few polls - on a pad that is there. With no window
     // and no controller (a headless test run) the record is a disconnected
     // pad, whose buttons the game ignores, so the first tap plugs one in for
-    // the rest of the run, with a clock of its own.
-    static std::atomic<bool> tap_pad{false};
+    // the rest of the run, with a clock of its own (a run a harness drives
+    // has one from the start: test_pad_plugged).
     {
         std::lock_guard<std::mutex> lk(g_taps_mu);
         const auto now = std::chrono::steady_clock::now();
@@ -1819,12 +1837,12 @@ GUEST_ABI int hle_pad_read(int handle, std::uint8_t* st) {
             }
             if (now >= it->from) {
                 p.buttons |= it->button;
-                tap_pad.store(true, std::memory_order_relaxed);
+                g_tap_pad.store(true, std::memory_order_relaxed);
             }
             ++it;
         }
     }
-    if (!p.connected && tap_pad.load(std::memory_order_relaxed)) {
+    if (!p.connected && (g_tap_pad.load(std::memory_order_relaxed) || test_pad_plugged())) {
         p.connected = true;
         if (!p.timestamp) {
             p.timestamp = static_cast<std::uint64_t>(
@@ -2017,7 +2035,7 @@ GUEST_ABI int hle_pad_info(int, std::uint8_t* info) {
     info[9] = 13;   // right dead zone
     info[10] = 0;   // SCE_PAD_CONNECTION_TYPE_LOCAL
     info[11] = 1;   // connectedCount
-    info[12] = host_pad_state().connected ? 1 : 0;
+    info[12] = host_pad_state().connected || g_tap_pad.load(std::memory_order_relaxed) || test_pad_plugged() ? 1 : 0;
     return 0;
 }
 
