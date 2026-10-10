@@ -224,7 +224,12 @@ and at 30 both are the game's own.
 `BBHOST_GAME_FPS=30|60|90|120|0` overrides the setting for a run (0 is
 uncapped), `BBHOST_UNCAPPED_FPS=N` sets the uncapped limit (30-240) whatever
 V-Sync says, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the
-game steps by and values written from it. The start of the log says which rate
+game steps by and values written from it. `BBHOST_TEST_FPS_SWING` (a test
+switch, at 60, 90, 120 or uncapped) moves the target while the game runs:
+`square:LO:HI:S` alternates LO and HI fps every S seconds, `random:LO:HI:S` picks
+a new rate in that range every S seconds, `jitter:LO:HI` every frame, and
+`sine:LO:HI:S` sweeps it - one process at two rates, or at one that never holds
+still, as a variable-refresh display or a busy scene makes it. The start of the log says which rate
 runs and how many values and code sites were converted (`frame rate:` lines),
 and names any site whose bytes were not the expected ones (that rate is then
 refused: 90, 120 or uncapped falls back to 60).

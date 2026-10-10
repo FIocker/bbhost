@@ -1149,11 +1149,85 @@ float uncapped_target() {
     return 1.0f / limit;
 }
 
+// BBHOST_TEST_FPS_SWING (a test switch, converted rates only): the target
+// moves while the game runs, so one process can be held at two rates or at a
+// rate that keeps changing - what a variable refresh display, a busy scene
+// or a debugger does to the frame time. The same heap at both rates is what
+// a rate-invariance differential compares (tmp tools: rateinv).
+//   square:<lo>:<hi>:<s>   <lo> fps for <s> seconds, then <hi> for <s>, ...
+//   random:<lo>:<hi>:<s>   a new rate in [lo, hi] every <s> seconds
+//   jitter:<lo>:<hi>       a new rate in [lo, hi] every frame
+//   sine:<lo>:<hi>:<s>     from lo to hi and back over <s> seconds
+// The code immediates and counts keep the mode's values (uncapped: 120's).
+struct FpsSwing {
+    enum Kind { Off, Square, Random, Jitter, Sine } kind = Off;
+    float lo = 0, hi = 0, period = 1;
+};
+const FpsSwing g_swing = [] {
+    FpsSwing s;
+    const char* e = std::getenv("BBHOST_TEST_FPS_SWING");
+    if (!e || !*e) return s;
+    char kind[16] = {};
+    float lo = 0, hi = 0, period = 1;
+    const int n = std::sscanf(e, "%15[a-z]:%f:%f:%f", kind, &lo, &hi, &period);
+    if (n < 3 || !(lo >= 10.0f) || !(hi >= lo) || !(hi <= 1000.0f) || !(period > 0.0f)) {
+        host_log("frame rate: BBHOST_TEST_FPS_SWING=%s not understood (kind:lo:hi[:seconds]); ignored", e);
+        return s;
+    }
+    s.kind = !std::strcmp(kind, "square")   ? FpsSwing::Square
+             : !std::strcmp(kind, "random") ? FpsSwing::Random
+             : !std::strcmp(kind, "jitter") ? FpsSwing::Jitter
+             : !std::strcmp(kind, "sine")   ? FpsSwing::Sine
+                                            : FpsSwing::Off;
+    s.lo = lo;
+    s.hi = hi;
+    s.period = period;
+    if (s.kind == FpsSwing::Off) host_log("frame rate: BBHOST_TEST_FPS_SWING kind %s unknown; ignored", kind);
+    else host_log("frame rate: BBHOST_TEST_FPS_SWING %s %.1f..%.1f fps, %.2f s (a test switch)", kind, static_cast<double>(lo),
+                  static_cast<double>(hi), static_cast<double>(period));
+    return s;
+}();
+
+// The swing's target for this frame, or `base` when it is off.
+float swing_target(float base) {
+    if (g_swing.kind == FpsSwing::Off) return base;
+    static const auto t0 = std::chrono::steady_clock::now();
+    const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    static std::uint64_t rng = 0x9e3779b97f4a7c15ull;
+    const auto next_unit = [] {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return static_cast<double>(rng >> 11) * (1.0 / 9007199254740992.0);
+    };
+    double fps = g_swing.lo;
+    switch (g_swing.kind) {
+        case FpsSwing::Square: fps = (static_cast<std::int64_t>(t / g_swing.period) & 1) ? g_swing.hi : g_swing.lo; break;
+        case FpsSwing::Random: {
+            static std::int64_t slot = -1;
+            static double held = g_swing.lo;
+            const auto now_slot = static_cast<std::int64_t>(t / g_swing.period);
+            if (now_slot != slot) {
+                slot = now_slot;
+                held = g_swing.lo + (g_swing.hi - g_swing.lo) * next_unit();
+            }
+            fps = held;
+            break;
+        }
+        case FpsSwing::Jitter: fps = g_swing.lo + (g_swing.hi - g_swing.lo) * next_unit(); break;
+        case FpsSwing::Sine:
+            fps = g_swing.lo + (g_swing.hi - g_swing.lo) * 0.5 * (1.0 - std::cos(2.0 * 3.14159265358979 * t / g_swing.period));
+            break;
+        case FpsSwing::Off: break;
+    }
+    return static_cast<float>(1.0 / fps);
+}
+
 // The converted pace's target for this frame; 0 at 30.
 float pace_target() {
-    if (g_game_fps == 0) return uncapped_target();
-    if (g_game_fps == 60) return kSixtieth;  // the eboot's own mode 2
-    if (g_game_fps > 60) return 1.0f / static_cast<float>(g_game_fps);
+    if (g_game_fps == 0) return swing_target(uncapped_target());
+    if (g_game_fps == 60) return swing_target(kSixtieth);  // the eboot's own mode 2
+    if (g_game_fps > 60) return swing_target(1.0f / static_cast<float>(g_game_fps));
     return 0.0f;
 }
 
