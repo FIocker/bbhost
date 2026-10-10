@@ -510,6 +510,23 @@ constexpr Site kFrameTimeSites[] = {
     {0x02713d8d, "c5fa1025db606102", "c5fa1025736b0403"},
 };
 
+// The play time (GameDataMan+0x94, milliseconds: the save list's clock and
+// the play log's): NS_SPRJ::MoveMapStep::InGameUpdate adds the frame's step
+// to it in whole milliseconds, truncated - (int)(dt * 1000) - so a 16.7 ms
+// frame adds 16 and the clock runs 4% slow at 60 and 120 (1% at the game's
+// own 30 and at 90, 14% at 144 Hz uncapped). At a converted rate it adds a
+// count of ours instead: the same step (the 60 FPS++ cave's
+// min(max(measured, target), 1/30)) in milliseconds with the remainder
+// carried, written by our SprjFlipper::Update every frame into the image's
+// tail (core/elf.h). Before: vmulss xmm0,xmm1,[1000.0]; vcvttss2si
+// rcx,xmm0. After: mov ecx,[count]; nop7 - xmm1 (the step) is what the code
+// after reads, and xmm0 is written before it is read again.
+// (NS_SPRJ::GameDataMan::AccumulatePlayTime, 0x18eb6a0, is the same code out
+// of line; nothing calls it.)
+constexpr std::uint32_t kPlayTimeAdd = 0x1d419d6;
+constexpr char kPlayTimeAddWas[] = "c5f259051267fe02c4e1fa2cc8";
+static_assert(sizeof(kPlayTimeAddWas) - 1 == 2 * 13, "the add and its replacement are 13 bytes");
+
 // The cloth above 60 (tools/fps_sites.py, from Kyo's "90 FPS++"). With one
 // substep a frame (0xb6e67a above) the hcl solver runs at the frame rate,
 // against the 60 the part files were authored for (30 fps, 2 substeps), and
@@ -633,6 +650,9 @@ struct EachFrame {
 std::vector<EachFrame> g_each;
 std::uint64_t g_cloth_va = 0;
 float g_cloth_dt = 1.0f / 60.0f;
+// The play time's count (kPlayTimeAdd) and the part of a millisecond carried.
+std::uint64_t g_play_ms_va = 0;
+double g_play_ms_carry = 0.0;
 
 template <typename T>
 void put(std::uint64_t a, T v) {
@@ -1108,6 +1128,17 @@ void each_frame(const SprjFlipper* f) {
     const float dt = std::min(std::max(f->measured_frame_seconds, floor_s), kThirtieth);
     if (!(dt > 0.0f)) return;  // also NaN
     frame_rate_step::g_frame_seconds.store(dt, std::memory_order_relaxed);
+    if (g_play_ms_va) {
+        // The step the cave gives the game this frame (no uncapped floor) in
+        // whole milliseconds, the rest carried to the next frame.
+        const float step = std::min(std::max(f->measured_frame_seconds, f->target_frame_seconds), kThirtieth);
+        if (step > 0.0f) {
+            g_play_ms_carry += static_cast<double>(step) * 1000.0;
+            const auto ms = static_cast<std::int32_t>(g_play_ms_carry);
+            g_play_ms_carry -= ms;
+            put<std::int32_t>(g_play_ms_va, ms);
+        }
+    }
     const double fps = 1.0 / static_cast<double>(dt);
     for (const EachFrame& e : g_each) put<float>(e.va, rated_value(e.kind, e.was, fps));
     g_cloth_dt += (dt - g_cloth_dt) * 0.1f;
@@ -1314,6 +1345,28 @@ int apply_rate(ElfImage* image, int want) {
         // stores above, kConstants' defaults): the decomp camera converts
         // them to each frame's length (decomp/camera/follow_camera.cpp).
         frame_rate_step::g_camera_60_tuned.store(true, std::memory_order_relaxed);
+        // The play time's count: written by our SprjFlipper::Update (with the
+        // guest's, BBHOST_FRAME_SOURCE=0 or 2 at 60, the game's add stays).
+        const std::vector<std::uint8_t> was = hex_bytes(kPlayTimeAddWas);
+        const std::uint64_t count = image->tail_va + image->tail_used + kPreferredGuestSlide;  // as a BN address
+        const std::int64_t disp = static_cast<std::int64_t>(count) - static_cast<std::int64_t>(kPlayTimeAdd + 6);
+        if (g_source != Source::Ours) {
+            host_log("frame rate: the guest's SprjFlipper::Update runs; the play time keeps the game's whole-millisecond add");
+        } else if (std::memcmp(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(va(kPlayTimeAdd))), was.data(),
+                               was.size()) != 0 ||
+                   image->tail_used + 8 > image->tail_size || disp < INT32_MIN || disp > INT32_MAX) {
+            host_log("frame rate: 0x%x does not hold the play time's add (or no room in the image's tail); the game's stays",
+                     kPlayTimeAdd);
+        } else {
+            image->tail_used += 8;
+            g_play_ms_va = va(static_cast<std::uint32_t>(count));
+            put<std::int32_t>(g_play_ms_va, static_cast<std::int32_t>(1000 / fps));
+            const auto d = static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
+            const std::uint8_t now[13] = {0x8b, 0x0d, static_cast<std::uint8_t>(d), static_cast<std::uint8_t>(d >> 8),
+                                          static_cast<std::uint8_t>(d >> 16), static_cast<std::uint8_t>(d >> 24),
+                                          0x0f, 0x1f, 0x80, 0, 0, 0, 0};
+            write(kPlayTimeAdd, now, sizeof(now));
+        }
     }
     if (mode != 60) {
         g_cloth_applied = write_sites(kClothSites);
@@ -1437,8 +1490,9 @@ void frame_rate_install(ElfImage* image) {
         std::snprintf(target, sizeof(target), "a 1/%d s target", got);
     }
     host_log("frame rate: %s (the frame-time manager's mode 2, %s; %zu constants and %zu other values converted, %zu 60 FPS++, "
-             "%zu frame-time and %zu cloth code sites)",
-             mode_name(got).c_str(), target, constants, kCountsN + kBytesN, g_sites_applied, g_frame_time_applied, g_cloth_applied);
+             "%zu frame-time and %zu cloth code sites%s)",
+             mode_name(got).c_str(), target, constants, kCountsN + kBytesN, g_sites_applied, g_frame_time_applied, g_cloth_applied,
+             g_play_ms_va ? ", the play time's add" : "");
     if (got != want)
         host_log("frame rate: %s was asked for; %s runs (the reason is above)", mode_name(want).c_str(), mode_name(got).c_str());
 }

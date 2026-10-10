@@ -206,7 +206,9 @@ Above 30 the game's step is the frame's measured time (at most 1/30 s), and the
 places that stepped a fixed 1/30 s a frame - physics, enemy AI, ragdolls,
 grass, the camera's easing, momentum, fades - follow it, so the game runs at
 the same speed at every rate (`engine/frame_rate.cpp`, from Kyo's FPS++ lists
-and yogesh1239's high-FPS fixes). Above 60 and Uncapped the game paces itself
+and yogesh1239's high-FPS fixes). The play time adds each frame's milliseconds
+with the fractions kept (the game drops them: its clock ran 4% slow at 60 and
+120). Above 60 and Uncapped the game paces itself
 and its frames are shown as they come, so 90 on a 60 Hz display shows 60 of
 them a second; a rate the machine cannot hold runs slower than real time in
 the few places that count frames.

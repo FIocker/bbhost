@@ -23,7 +23,8 @@
 //    per-frame amounts, weights and rates in .rodata are written from that
 //    frame time every frame; code immediates and frame counts take the rate's
 //    value. Above 60 the cloth's six constraint caves (ninety_fps_sites.inc)
-//    scale its stiffness by (60 dt)^2.
+//    scale its stiffness by (60 dt)^2. The play time adds each frame's
+//    milliseconds with the remainder carried (the game truncates them).
 //  - uncapped: the same, with a target of the display's refresh rate with
 //    V-Sync on and 1/240 s with it off (BBHOST_UNCAPPED_FPS=N sets it); code
 //    immediates and counts at 120's values.
