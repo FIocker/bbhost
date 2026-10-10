@@ -4430,14 +4430,19 @@ private:
             }
         }
         std::vector<std::pair<Id, Id>> back;  // phi, value
+        // What a second attempt can assume instead is recorded for every
+        // register here before the first of them rejects, so one more attempt
+        // takes them all (a loop of 25 VGPRs ran out of attempts one at a time).
+        std::string retry_rejection;
         // What the header assumed of the helper lanes must hold for the value
         // that comes back; if not, a second attempt assumes less.
         const auto helper_lanes_kept = [&](int key, bool at_header, const Val& v) {
-            if (!v.helper_inexact || at_header) return true;
+            if (!v.helper_inexact || at_header) return;
             more_inexact.insert({l.header, key});
-            reject(key_name(key) + " comes back to the header of the loop at " + hex_offset(l.header) +
-                   " with helper lanes GCN may hold differently, which the header did not assume");
-            return false;
+            if (retry_rejection.empty()) {
+                retry_rejection = key_name(key) + " comes back to the header of the loop at " + hex_offset(l.header) +
+                                  " with helper lanes GCN may hold differently, which the header did not assume";
+            }
         };
         for (const Loop::Phi& p : l.phis) {
             if (p.kind == Kind::Lane) {
@@ -4447,7 +4452,7 @@ private:
                     return;
                 }
                 const Val v = known(it->second);
-                if (!helper_lanes_kept(p.key, p.helper_inexact, v)) return;
+                helper_lanes_kept(p.key, p.helper_inexact, v);
                 back.push_back({p.id, v.constant ? m.const_bool(v.set) : v.id});
                 continue;
             }
@@ -4460,7 +4465,7 @@ private:
                 reject(key_name(p.key) + " comes back to the header of the loop at " + hex_offset(l.header) + " with a value lanes may not hold alike");
                 return;
             }
-            if (!helper_lanes_kept(p.key, p.helper_inexact, v)) return;
+            helper_lanes_kept(p.key, p.helper_inexact, v);
             // Where it holds GCN's value: at least where the header assumed.
             const auto at_header = l.partial0.find(p.key);
             const Where header = at_header == l.partial0.end() ? Where{} : Where{true, at_header->second}, now = where_reg(p.key);
@@ -4476,11 +4481,16 @@ private:
         for (const auto& [k, entry] : l.unchanged) {
             const auto it = lanes.find(k);
             if (it == lanes.end() || !same_lane(known(it->second), known(entry))) {
-                if (k != kKeyExec && k != l.mask && it != lanes.end()) more_lane_phis.insert({l.header, k});
-                reject(key_name(k) + " comes back to the header of the loop at " + hex_offset(l.header) + " changed");
+                const std::string changed = key_name(k) + " comes back to the header of the loop at " + hex_offset(l.header) + " changed";
+                if (k != kKeyExec && k != l.mask && it != lanes.end()) {
+                    more_lane_phis.insert({l.header, k});  // a phi on the next attempt
+                    if (retry_rejection.empty()) retry_rejection = changed;
+                    continue;
+                }
+                reject(changed);
                 return;
             }
-            if (!helper_lanes_kept(k, entry.helper_inexact, it->second)) return;
+            helper_lanes_kept(k, entry.helper_inexact, it->second);
             // ... and so must what the header took of the lanes the lift does not run.
             const bool per_pixel_header = l.mask >= 0 || in_divergent_loop();
             if ((entry.helpers_clear && !it->second.helpers_clear) || (entry.wave_exact && !it->second.wave_exact) ||
@@ -4490,6 +4500,10 @@ private:
                        "every lane of the wave)");
                 return;
             }
+        }
+        if (!retry_rejection.empty()) {
+            reject(retry_rejection);
+            return;
         }
         m.emit_void(spv::OpBranch, {l.continue_label});
         m.label(l.continue_label);
