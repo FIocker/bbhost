@@ -47,7 +47,7 @@ constexpr std::uint8_t kFrameManagerPrologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 
                                                   0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x38};
 constexpr std::uint32_t kModeSixty = 2;
 
-// The game's pace: 30 (its own), a fixed rate (60, 90: the game's mode 2
+// The game's pace: 30 (its own), a fixed rate (60, 90, 120: the game's mode 2
 // with a 1/fps target), or uncapped (the same with the target the display's
 // refresh rate or 1/240 s). Kyo's FPS++ lists for 1.09 (60 and 90 FPS++ 1.0,
 // and his 1.3 lists with yogesh1239's high-FPS fixes) are the source of most
@@ -540,7 +540,7 @@ constexpr int kUncappedReferenceFps = 120;
 // The rates the Frame rate option offers besides 30 and uncapped
 // (host/options.cpp, engine/option_menu.cpp, host/launcher.cpp list the
 // same): each runs the game's mode 2 with a 1/fps target.
-constexpr int kFrameRates[] = {60, 90};
+constexpr int kFrameRates[] = {60, 90, 120};
 
 // A frame rate as one of the modes: 30, a converted rate, or 0 (uncapped).
 // Another number takes the nearest mode below it.
@@ -618,7 +618,7 @@ void count_was(const Counted& c, std::uint8_t* out) {
     std::memcpy(out, &c.was, c.n);
 }
 
-// The game's pace: 30, a converted rate (60, 90), or 0 for uncapped.
+// The game's pace: 30, a converted rate (60, 90, 120), or 0 for uncapped.
 int g_game_fps = 30;
 std::size_t g_sites_applied = 0, g_frame_time_applied = 0, g_cloth_applied = 0;
 std::atomic<std::uint64_t> g_frames{0};

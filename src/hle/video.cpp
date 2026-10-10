@@ -444,7 +444,7 @@ void vblank_tick(std::uint64_t vcount) {
 
 void start_vsync() {
     std::call_once(g_vsync_once, [] {
-        // Set, never cleared: the game at 90 or uncapped has set it already
+        // Set, never cleared: the game above 60 or uncapped has set it already
         // (hle_video_set_game_pace).
         if (const char* e = std::getenv("BBHOST_UNCAP"); e && e[0] == '1') g_flip_uncapped.store(true);
         host_log("video: %s", g_present_on_arrival
@@ -828,8 +828,8 @@ std::atomic<int> g_game_pace{-1};
 
 void hle_video_set_game_pace(int fps) {
     g_game_pace.store(fps);
-    if (fps == 90 || fps == 0) {
-        // The game paces itself - our SprjFlipper::Update waits out 1/90 s, or
+    if (fps > 60 || fps == 0) {
+        // The game paces itself - our SprjFlipper::Update waits out 1/fps s, or
         // the uncapped limit - and steps by the frame time it measured, so a
         // flip completes as soon as the frame is recorded, as under
         // BBHOST_UNCAP: held to the display's refresh, 90 on a 60 Hz display
@@ -837,7 +837,11 @@ void hle_video_set_game_pace(int fps) {
         // a refresh with V-Sync on (host/window.cpp drops the others).
         g_flip_uncapped.store(true);
         g_fps_cap.store(0);
-        host_log("video: flips complete as soon as they are recorded (the game paces itself at %s)", fps ? "90" : "uncapped");
+        if (fps) {
+            host_log("video: flips complete as soon as they are recorded (the game paces itself at %d)", fps);
+        } else {
+            host_log("video: flips complete as soon as they are recorded (the game paces itself, uncapped)");
+        }
     } else {
         g_fps_cap.store(fps);
     }

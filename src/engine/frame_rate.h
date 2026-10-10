@@ -2,7 +2,7 @@
 
 #include <string>
 
-// The game's own frame pace: 30, 60, 90 or uncapped.
+// The game's own frame pace: 30, 60, 90, 120 or uncapped.
 //
 // FD4's frame-time manager (0x2434770, called once a frame from the main
 // loop) picks an interval by mode - the int at +8, or +0xc while the one-shot
@@ -13,9 +13,9 @@
 // thread reads ~90% busy at 30 fps while half of that is waiting. Ours
 // replaces it (SprjFlipper::Update, BBHOST_FRAME_SOURCE).
 //
-// The Frame rate option (or BBHOST_GAME_FPS=30/60/90/0) when the game starts:
+// The Frame rate option (or BBHOST_GAME_FPS=30/60/90/120/0) when the game starts:
 //  - 30: the game's own.
-//  - 60, 90: mode 2 with a 1/fps target, the game's fixed steps converted
+//  - 60, 90, 120: mode 2 with a 1/fps target, the game's fixed steps converted
 //    (frame_rate.cpp's tables, from Kyo's FPS++ lists and yogesh1239's high-FPS
 //    fixes, each checked against the eboot): the task step and every step that
 //    used a fixed 1/30 read the measured frame time clamped to [target, 1/30]
@@ -40,7 +40,7 @@ struct ElfImage;
 
 void frame_rate_install(ElfImage* image);
 
-// The pace the game was started at: 30, 60, 90, or 0 for uncapped.
+// The pace the game was started at: 30, 60, 90, 120, or 0 for uncapped.
 int frame_rate_game_fps();
 
 // Game time against real time (plugins' set_time_scale): 0.5 is half speed,

@@ -546,11 +546,10 @@ constexpr int kEffectsRows = kEffectsCount + 2;
 
 // The frame rate (engine/frame_rate.h), as a pick-list. The row stores the
 // chosen entry's int32, so the values are the rates themselves and 0 is
-// uncapped. Four entries: the widget's list has six slots, and with four (as
-// before 90 and 144 were added to the old Frame cap) the panel draws with a
-// gap under the last one.
+// uncapped. Five entries of the widget's six slots (the old Frame cap's
+// 30/60/90/120/144/Off had all six; 116034 was its 144).
 const Choice kFrameCaps[] = {
-    {30, 116030}, {60, 116031}, {90, 116032}, {0, 116035},
+    {30, 116030}, {60, 116031}, {90, 116032}, {120, 116033}, {0, 116035},
 };
 std::int32_t g_frame_cap = 30;
 
