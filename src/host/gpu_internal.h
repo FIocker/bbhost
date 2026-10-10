@@ -26,6 +26,14 @@ std::string bb_memory_sites_report();
 // fail with VK_ERROR_OUT_OF_DEVICE_MEMORY once they would hold more than
 // `bytes` together - a smaller card's video memory acted out on a bigger one.
 void bb_memory_test_limit(std::uint32_t types, std::uint64_t bytes);
+// The memory types of the device-local heap: what our allocations hold in
+// them is counted (bb_memory_local_bytes), and the report's sites outside it
+// are marked "@host".
+void bb_memory_set_local_types(std::uint32_t types);
+std::uint64_t bb_memory_local_bytes();
+// Whether BBHOST_TEST_VRAM_MB acts out a smaller card: its limit, and what
+// our allocations hold against it.
+bool bb_memory_test_limited(std::uint64_t* limit, std::uint64_t* used);
 #define vkAllocateMemory(d, i, a, m) bb_alloc_memory((d), (i), (a), (m), __FILE__, __LINE__)
 #define vkFreeMemory(d, m, a) bb_free_memory((d), (m), (a))
 
@@ -56,7 +64,11 @@ struct ImageMemory {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize offset = 0, size = 0;
     std::int32_t block = -1;
+    std::uint32_t type = UINT32_MAX;  // the memory type it is in (image_memory_in_vram); UINT32_MAX: not known
 };
+// Whether an image's memory is in video memory (the device-local heap; true
+// when that is not known), and not in host memory for want of it.
+bool image_memory_in_vram(const ImageMemory& m);
 
 constexpr std::uint64_t kChunkBytes = 1ull << gcn::kDmemChunkShift;
 // How far a whole-span import runs on into the next chunk (gpu.cpp map setup).
@@ -576,7 +588,26 @@ void defer_destroy_image(VkImage image, VkDeviceMemory memory);
 // of 256 MiB blocks instead of one vkAllocateMemory - a kernel call - per
 // texture, which was ~10% of the command processor in frames where new
 // areas streamed in. Larger images get memory of their own.
-bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out);
+// texture: a sampled image or a copy made for one, which the video memory
+// reserve keeps out of the last of video memory (vram_reserve_bytes);
+// otherwise a render target or snapshot, which may take the reserve.
+bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture = false);
+// The video memory this process may still take, in bytes (negative: over
+// budget): BBHOST_TEST_VRAM_MB's limit less what our allocations hold against
+// it, else the driver's budget for the heap less its usage
+// (VK_EXT_memory_budget, read at most every 100 ms), else the budget at the
+// start less what our allocations hold there. Any thread.
+std::int64_t vram_headroom();
+// The video memory kept for render targets, snapshots and device buffers
+// (BBHOST_VRAM_RESERVE_MB; 0: the budget is not followed, as before):
+// textures take no new video memory out of it, the memory keeper makes no
+// spare in it, and the untile scratch takes no new chunk there.
+std::uint64_t vram_reserve_bytes();
+// Whether video memory is down to the reserve (headroom under reserve +
+// `more` bytes); false when the reserve is off.
+bool vram_within_reserve(std::uint64_t more = 0);
+// Textures kept out of the reserve so far (placed in host memory instead).
+std::uint64_t vram_reserve_refusals();
 // Frees `m` with `image` once the recording in progress has retired.
 void defer_destroy_image(VkImage image, const ImageMemory& m);
 std::string image_heap_report();

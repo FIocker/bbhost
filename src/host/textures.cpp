@@ -2048,7 +2048,7 @@ VkImageView rt_copied_view(RtImage& rt, const std::uint32_t* w, std::uint32_t wi
         if (vkCreateImage(g.device, &ici, nullptr, &nr.img.image) != VK_SUCCESS) return VK_NULL_HANDLE;
         VkMemoryRequirements req{};
         vkGetImageMemoryRequirements(g.device, nr.img.image, &req);
-        if (!image_memory_alloc(req, nr.img.memory)) {
+        if (!image_memory_alloc(req, nr.img.memory, true)) {
             vkDestroyImage(g.device, nr.img.image, nullptr);
             return VK_NULL_HANDLE;
         }
@@ -2168,7 +2168,7 @@ VkImageView level_alias_view(std::uint64_t base, const std::uint32_t* w, VkForma
         if (vkCreateImage(g.device, &ici, nullptr, &na.img.image) != VK_SUCCESS) return VK_NULL_HANDLE;
         VkMemoryRequirements req{};
         vkGetImageMemoryRequirements(g.device, na.img.image, &req);
-        if (!image_memory_alloc(req, na.img.memory)) {
+        if (!image_memory_alloc(req, na.img.memory, true)) {
             vkDestroyImage(g.device, na.img.image, nullptr);
             return VK_NULL_HANDLE;
         }
@@ -2514,7 +2514,7 @@ VkImageView texture_view_uncached(const std::uint32_t* w, bool storage, bool& di
         }
         VkMemoryRequirements req{};
         vkGetImageMemoryRequirements(g.device, sf.image, &req);
-        if (!image_memory_alloc(req, sf.memory)) {
+        if (!image_memory_alloc(req, sf.memory, true)) {
             vkDestroyImage(g.device, sf.image, nullptr);
             sf.image = VK_NULL_HANDLE;
             sf.failed = true;

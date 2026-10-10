@@ -1402,6 +1402,7 @@ void start_hang_watchdog() {
 }
 
 void start_memory_reserve();  // below, beside the image heap
+void vram_reserve_init();     // the same
 
 bool g_use_buffer_marker = false;  // VK_AMD_buffer_marker checkpoints (gpu_checkpoint)
 
@@ -1714,11 +1715,12 @@ bool init_locked() {
         // budget is about 7171) - set before anything is allocated in them.
         const std::uint32_t t = find_memory_type(~0u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         g.local_heap = t == UINT32_MAX ? 0 : g.mem_props.memoryTypes[t].heapIndex;
+        std::uint32_t types = 0;
+        for (std::uint32_t i = 0; i < g.mem_props.memoryTypeCount; ++i) {
+            if (g.mem_props.memoryTypes[i].heapIndex == g.local_heap) types |= 1u << i;
+        }
+        if (t != UINT32_MAX) bb_memory_set_local_types(types);
         if (const char* e = std::getenv("BBHOST_TEST_VRAM_MB"); e && std::strtoull(e, nullptr, 10)) {
-            std::uint32_t types = 0;
-            for (std::uint32_t i = 0; i < g.mem_props.memoryTypeCount; ++i) {
-                if (g.mem_props.memoryTypes[i].heapIndex == g.local_heap) types |= 1u << i;
-            }
             bb_memory_test_limit(types, std::strtoull(e, nullptr, 10) << 20);
         }
     }
@@ -2180,6 +2182,7 @@ bool init_locked() {
                  static_cast<unsigned long long>(heap >> 20), static_cast<unsigned long long>(budget >> 20),
                  g.has_memory_budget ? " (the driver's budget)" : " (no budget from the driver: the heap's size)",
                  test_bytes ? " - BBHOST_TEST_VRAM_MB, acted out" : "");
+        vram_reserve_init();
         shadow_budget_locked();
     }
     if (g.device && g_use_buffer_marker) {
@@ -3954,8 +3957,10 @@ namespace {
 constexpr std::uint64_t kScratchChunkBytes = 64ull << 20;
 constexpr std::uint64_t kScratchKeepBytes = 256ull << 20;
 std::atomic<std::uint64_t> g_scratch_created{0}, g_scratch_placed{0};
+std::atomic<std::uint64_t> g_scratch_refusals{0};  // chunks not made for want of room above the reserve
 void scratch_let_go_locked(const DevBuffer& b) {
-    if (g.scratch_free_bytes + b.size <= kScratchKeepBytes) {
+    // Not kept while video memory is down to the reserve.
+    if (g.scratch_free_bytes + b.size <= kScratchKeepBytes && !vram_within_reserve()) {
         g.scratch_free.push_back(b);
         g.scratch_free_bytes += b.size;
     } else {
@@ -3978,6 +3983,13 @@ bool acquire_scratch_locked(DevBuffer& b, std::uint64_t size, VkDeviceSize& offs
             g.scratch_free_bytes -= it->size;
             g.scratch_free.erase(it);
         } else {
+            // No new chunk out of the reserve: the upload takes the staging
+            // route (host memory) instead. A chunk made there was what
+            // overflowed a 6 GB card at a load and took every mirror with it.
+            if (vram_within_reserve(want)) {
+                g_scratch_refusals.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
             if (!create_dev_buffer(chunk, want, false)) return false;
             g_scratch_created.fetch_add(1, std::memory_order_relaxed);
         }
@@ -4103,7 +4115,7 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
                     if (at > lo) b.free[lo] = at - lo;
                     if (at + req.size < hi) b.free[at + req.size] = hi - (at + req.size);
                     b.used += req.size;
-                    out = {b.memory, at, req.size, static_cast<std::int32_t>(k)};
+                    out = {b.memory, at, req.size, static_cast<std::int32_t>(k), type};
                     ++g_heap_allocs;
                     return true;
                 }
@@ -4129,17 +4141,99 @@ bool heap_place_locked(const VkMemoryRequirements& req, std::uint32_t type, bool
     mai.memoryTypeIndex = type;
     if (vkAllocateMemory(g.device, &mai, nullptr, &out.memory) != VK_SUCCESS) return false;
     out.size = req.size;
+    out.type = type;
     ++g_heap_own;
     return true;
 }
+
+// The video memory budget, followed as it changes (vram_headroom): the
+// driver's figures read at most every 100 ms, and what our own allocations
+// took or gave back since - which the driver's next reading includes - from
+// our own count, so a load's burst of blocks is seen at once.
+std::mutex g_budget_mu;
+std::int64_t g_budget_read_ms = -(1ll << 40);
+std::int64_t g_budget_room = 0;            // heapBudget - heapUsage when read
+std::uint64_t g_budget_local_at_read = 0;  // bb_memory_local_bytes() then
+std::uint64_t g_vram_reserve = 0;          // vram_reserve_init
+std::atomic<std::uint64_t> g_reserve_refusals{0};
 }  // namespace
 
-bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out) {
+bool image_memory_in_vram(const ImageMemory& m) {
+    return m.type >= g.mem_props.memoryTypeCount || g.mem_props.memoryTypes[m.type].heapIndex == g.local_heap;
+}
+
+std::int64_t vram_headroom() {
+    std::uint64_t limit = 0, used = 0;
+    if (bb_memory_test_limited(&limit, &used)) return static_cast<std::int64_t>(limit) - static_cast<std::int64_t>(used);
+    const std::uint64_t local = bb_memory_local_bytes();
+    if (!g.has_memory_budget || !g.phys) return static_cast<std::int64_t>(g.local_budget) - static_cast<std::int64_t>(local);
+    std::lock_guard<std::mutex> lk(g_budget_mu);
+    const std::int64_t now = steady_ms();
+    if (now - g_budget_read_ms >= 100) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT mb{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 mp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        mp.pNext = &mb;
+        vkGetPhysicalDeviceMemoryProperties2(g.phys, &mp);
+        g_budget_room = static_cast<std::int64_t>(mb.heapBudget[g.local_heap]) - static_cast<std::int64_t>(mb.heapUsage[g.local_heap]);
+        g_budget_local_at_read = bb_memory_local_bytes();
+        g_budget_read_ms = now;
+        return g_budget_room;
+    }
+    return g_budget_room - (static_cast<std::int64_t>(local) - static_cast<std::int64_t>(g_budget_local_at_read));
+}
+
+// The reserve: 512 MiB on a discrete GPU, none on an integrated one (its
+// video memory is the same RAM, and a Steam Deck's 1 GiB carve-out would be
+// half reserve) or with tight memory, whose own settings apply.
+// BBHOST_VRAM_RESERVE_MB sets it; 0 places everything until an allocation
+// fails, as before.
+void vram_reserve_init() {
+    const char* e = std::getenv("BBHOST_VRAM_RESERVE_MB");
+    const bool given = e && *e;
+    const std::uint64_t mib = given ? std::strtoull(e, nullptr, 10) : (g.integrated || g.tight ? 0 : 512);
+    g_vram_reserve = mib << 20;
+    if (g_vram_reserve)
+        host_log("gpu: video memory followed against the driver's budget, the last %llu MiB kept for render targets and device buffers%s",
+                 static_cast<unsigned long long>(mib), given ? " (BBHOST_VRAM_RESERVE_MB)" : "");
+    else
+        host_log("gpu: video memory placed until an allocation fails (%s)",
+                 given ? "BBHOST_VRAM_RESERVE_MB=0" : g.integrated ? "an integrated GPU" : "tight memory");
+}
+
+std::uint64_t vram_reserve_bytes() { return g_vram_reserve; }
+
+bool vram_within_reserve(std::uint64_t more) {
+    return g_vram_reserve && vram_headroom() < static_cast<std::int64_t>(g_vram_reserve + more);
+}
+
+std::uint64_t vram_reserve_refusals() { return g_reserve_refusals.load(std::memory_order_relaxed); }
+
+bool image_memory_alloc(const VkMemoryRequirements& req, ImageMemory& out, bool texture) {
     out = ImageMemory{};
     const std::uint32_t local = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     const std::int64_t now = steady_ms();
-    const bool may_grow = now - g_vram_refused_ms.load(std::memory_order_relaxed) >= 1000;
+    bool may_grow = now - g_vram_refused_ms.load(std::memory_order_relaxed) >= 1000;
+    // The reserve: a texture takes no new video memory out of it - room
+    // already in the heap's blocks, else host memory, which it is only read
+    // from - so the render targets made after it still find video memory. A
+    // target in host memory is written and read across the bus every frame:
+    // two at 4K held a 12 GB card's session at 3 fps.
+    bool held_back = false;
+    if (texture && may_grow && local != UINT32_MAX && vram_within_reserve(req.size <= kHeapLargest ? kHeapBlock : req.size)) {
+        may_grow = false;
+        held_back = true;
+    }
     if (local != UINT32_MAX && heap_place_locked(req, local, may_grow, out)) return true;
+    if (held_back) {
+        const std::uint32_t host = host_memory_type(req.memoryTypeBits);
+        if (host != UINT32_MAX && heap_place_locked(req, host, true, out)) {
+            if (g_reserve_refusals.fetch_add(1, std::memory_order_relaxed) == 0)
+                host_log("gpu: video memory is down to the reserve (%lld MiB left): textures go to host memory until there is room",
+                         static_cast<long long>(vram_headroom() >> 20));
+            ++g_heap_host;
+            return true;
+        }
+    }
     // Video memory has no room for it: host memory, which the GPU reads across
     // the bus - slower, but drawn. A target that found no memory was never
     // made, and every pass reading it read nothing: on an 8 GB card whose
@@ -4189,6 +4283,18 @@ std::string image_heap_report() {
                   static_cast<unsigned long long>(g.staging_free_bytes >> 20), static_cast<unsigned long long>(view_epoch()));
     if (const std::string sites = view_epoch_sites_report(); !sites.empty()) host_log("  %s", sites.c_str());
     host_log("  %s", image_reuse_report_locked().c_str());
+    {
+        VkDeviceSize free_vram = 0, free_host = 0;
+        for (const HeapBlock& b : g_heap) {
+            if (b.memory == VK_NULL_HANDLE) continue;
+            (g.mem_props.memoryTypes[b.type].heapIndex == g.local_heap ? free_vram : free_host) += kHeapBlock - b.used;
+        }
+        host_log("  video memory: headroom %lld MiB, reserve %llu MiB; image heap free %llu MiB in video memory, %llu MiB in host "
+                 "blocks; textures kept out of the reserve %llu, untile scratch chunks %llu",
+                 static_cast<long long>(vram_headroom() >> 20), static_cast<unsigned long long>(g_vram_reserve >> 20),
+                 static_cast<unsigned long long>(free_vram >> 20), static_cast<unsigned long long>(free_host >> 20),
+                 static_cast<unsigned long long>(g_reserve_refusals.load()), static_cast<unsigned long long>(g_scratch_refusals.load()));
+    }
     return buf;
 }
 
@@ -4257,6 +4363,9 @@ void start_memory_reserve() {
                     if (type == UINT32_MAX || heap_free_locked(type, nullptr) >= spare_blocks * kHeapBlock) break;
                 }
                 if (steady_ms() - g_vram_refused_ms.load(std::memory_order_relaxed) < 10000) break;  // video memory is full
+                // No spare out of the reserve, during a load either: the
+                // coming area's targets want that room more.
+                if (vram_within_reserve(kHeapBlock)) break;
                 VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
                 mai.allocationSize = kHeapBlock;
                 mai.memoryTypeIndex = type;
@@ -4340,18 +4449,21 @@ void start_memory_reserve() {
             // turn, two seconds apart.
             std::vector<VkDeviceMemory> gone;
             std::vector<DevBuffer> chunks;
-            const bool may_give = now - last_given >= std::chrono::seconds(2);
+            // Down to the reserve, an empty block goes back at once, spare or
+            // not: the targets want the room more.
+            const bool short_now = vram_within_reserve();
+            const bool may_give = short_now || now - last_given >= std::chrono::seconds(2);
             {
                 std::lock_guard<GpuMutex> lk(g.mu);
                 if (type != UINT32_MAX && may_give) {
                     const VkDeviceSize free = heap_free_locked(type, nullptr);
                     for (HeapBlock& b : g_heap) {
                         if (b.memory == VK_NULL_HANDLE || b.used != 0) continue;
-                        if (now - b.empty_since < std::chrono::seconds(10)) continue;
+                        if (!short_now && now - b.empty_since < std::chrono::seconds(10)) continue;
                         // A block of host memory, made while video memory was
                         // full, goes back once empty; one of video memory only
                         // above the spare.
-                        if (b.type == type && free < (spare_play + 1) * kHeapBlock) continue;
+                        if (b.type == type && !short_now && free < (spare_play + 1) * kHeapBlock) continue;
                         gone.push_back(b.memory);
                         b.memory = VK_NULL_HANDLE;
                         b.free.clear();
