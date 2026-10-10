@@ -84,6 +84,9 @@ For each place the report says:
   30 ms, flip stalls over 40 ms, main-loop frames over 33 ms, and the pixel
   shaders met for the first time there, lifted or not and why;
 - the frames and their brightness;
+- memory as the place was left, from the 5-second report: the device-local
+  heaps' use, the image heap and everything bbhost allocated, and what the
+  place added since the place before;
 - the lift results of the place's captures.
 
 `report.json` has everything and `summary.txt` the same to read.
@@ -124,7 +127,8 @@ repeat - lantern flicker, fog and cloth move up to a third of the pixels
 between two identical runs. Frames are compared by the share of pixels that
 changed, a blurred difference that leaves noise out, and an 8 x 8 table of
 brightness changes; a picture of the difference goes in `diffs/`.
-`ab.txt` lists what is worse beyond the noise floor, then what is better. A
+`ab.txt` lists what is worse beyond the noise floor, then what is better,
+memory at each place included. A
 build older than the check still gives fps, its seconds' worst frames, the GPU
 busy meter and the hitches, but no frame intervals (its percentiles are marked
 approximate), draws by shader kind, frames or captures; the comparison leaves

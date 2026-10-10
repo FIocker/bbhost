@@ -535,6 +535,36 @@ class LogTest(unittest.TestCase):
         self.assertEqual(w["flips"], 180)
         self.assertNotIn("draws", w)
 
+    def test_memory_at_each_place(self):
+        """Device memory and the image heap as each place was left, from the
+        5-second reports, and what each place added."""
+        cy, cw = ac.AREA_BY_ID["central-yharnam"], ac.AREA_BY_ID["cathedral-ward"]
+
+        def report(device, heap_mib, blocks, total):
+            return ["[bbhost]   image heap: %d blocks, %d MiB in use; 64 textures placed in it, 0 with memory of their own, "
+                    "0 in host memory for want of video memory; blocks made on the command processor 1, released 0; upload "
+                    "staging free 256 MiB; view epoch 8" % (blocks, heap_mib),
+                    "[bbhost]   gpu: memory by heap: heap 0 (device) %d/10929 MiB; heap 1 5512/193149 MiB; heap 2 (device) 34/211 MiB;"
+                    % device,
+                    "[bbhost]   gpu: memory by site (MiB, blocks live; allocations made, driver ms): total %d; gpu.cpp:281 5081/6 "
+                    "(7, 1303.1);" % total]
+        win = [[16.7] * 60 for _ in range(3)]
+        lines = area_lines(cy, 100.0, "18010000", win, window_events=report(3000, 400, 2, 6000) + report(3100, 420, 2, 6100))
+        lines += area_lines(cw, 200.0, "18000000", win, window_events=report(3600, 700, 3, 6800))
+        rep = ac.pass_report(lines, [cy, cw], "perf")
+        m1, m2 = rep["areas"]["central-yharnam"]["memory"], rep["areas"]["cathedral-ward"]["memory"]
+        self.assertEqual((m1["device_mib"], m1["image_heap_mib"], m1["image_heap_blocks"], m1["allocated_mib"]), (3134, 420, 2, 6100))
+        self.assertEqual(m1["host_mib"], 5512)
+        self.assertNotIn("device_growth_mib", m1)
+        self.assertEqual((m2["device_growth_mib"], m2["image_heap_growth_mib"], m2["allocated_growth_mib"]), (500, 280, 700))
+        self.assertEqual(m2["device_since_first_mib"], 500)
+        report_ = {"dir": "/r", "run": {}, "passes": {"perf": {"stop_reason": "tour done", "elapsed_s": 1, "world": None,
+                                                               "tour_done": True, "fatal": []}},
+                   "areas": ac.merge(rep, None, None, [cy, cw])}
+        self.assertIn("memory at the end: device 3634 MiB (+500 since the last place), image heap 700 MiB in 3 blocks (+280 since "
+                      "the last place), allocated 6800 MiB",
+                      ac.summary_text(report_))
+
     def test_failure_reasons(self):
         log = ac.Log(second([16.7] * 60, failures={"pixel shader": 2, "descriptor set": 1}))
         d = log.seconds[0][1]["detail"]
@@ -682,6 +712,18 @@ class CompareTest(unittest.TestCase):
         self.assertEqual(e["perf"]["fps"]["verdict"], "within noise")
         self.assertEqual(e["status"]["b"], ["died in the window", "ok", "ok"])
         self.assertTrue(any("not measured in every run" in f for f in ab["flagged"]))
+
+    def test_memory_in_the_ab(self):
+        a = [self.report(60.0, 17.0, 400, 0.7), self.report(60.0, 17.0, 400, 0.7)]
+        b = [self.report(60.0, 17.0, 400, 0.7), self.report(60.0, 17.0, 400, 0.7)]
+        for r, dev in zip(a + b, (3000, 3010, 3900, 3920)):
+            r["areas"]["central-yharnam"]["memory"] = {"device_mib": dev, "image_heap_mib": 500}
+        ab = ac.compare_reports(a, b)
+        d = ab["areas"]["central-yharnam"]["memory"]["device memory MiB"]
+        self.assertEqual(d["verdict"], "worse")
+        self.assertEqual(ab["areas"]["central-yharnam"]["memory"]["image heap MiB"]["verdict"], "within noise")
+        self.assertTrue(any("device memory MiB worse" in f for f in ab["flagged"]))
+        self.assertIn("device memory MiB", ac.ab_text(ab))
 
     def test_summary_text(self):
         lines, _ = LogTest().run_lines()

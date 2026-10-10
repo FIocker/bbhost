@@ -43,8 +43,9 @@ main loop's work, the draws by how their pixel shader ran (lifted, translated,
 the page-table fallback's translation, none) and the draw failures by reason;
 for the arrival (the travel and the settle): the loads, pipeline compiles over
 30 ms, flip stalls over 40 ms, main-loop frames over 33 ms, and the pixel
-shaders met for the first time there, lifted or not and why; the frames; and
-the lift results. report.json holds all of it, summary.txt the same to read.
+shaders met for the first time there, lifted or not and why; the frames;
+memory as the place was left; and the lift results. report.json holds all of
+it, summary.txt the same to read.
 
 A place counts only where the player was (presence): every mark in the
 place's map, a view's within VIEW_REACH of its standpoint, and from the
@@ -359,6 +360,11 @@ CAPTURE_WROTE = re.compile(r"\] capture: wrote (\S+)/manifest\.json \((\S+), fli
 CAPTURE_REJECTED = re.compile(r"\] capture: (\S+) draw \d+ \(flip \d+\) not captured: (.*?)\s*$")
 LOADING = re.compile(r"\] loading: ([\d.]+) s \(flips")
 LOAD_BEGINS = re.compile(r"\] loading: begins, flip (\d+)")
+# The 5-second report's memory lines (host/gpu.cpp, host/render.cpp).
+MEMORY = re.compile(r"\] +gpu: memory by heap: (.*?)\s*$")
+HEAP_ENTRY = re.compile(r"heap (\d+)( \(device\))? (\d+)/(\d+) MiB")
+IMAGE_HEAP = re.compile(r"\] +image heap: (\d+) blocks, (\d+) MiB in use")
+MEMORY_TOTAL = re.compile(r"\] +gpu: memory by site \(MiB[^)]*\): total (\d+)")
 SLOW_PIPELINE = re.compile(r"\] render: slow pipeline (?!library )\S+.*vkCreateGraphicsPipelines (\d+) ms")
 SLOW_LIBRARY = re.compile(r"\] render: slow pipeline library .*?: (\d+) ms")
 STALL = re.compile(r"\] stall: flip #\d+ came (\d+) ms after")
@@ -486,7 +492,8 @@ class Log:
         for kind, rx in (("dump", DUMP_DONE), ("capture", CAPTURE_WROTE), ("capture_rejected", CAPTURE_REJECTED),
                          ("loading", LOADING), ("load_begins", LOAD_BEGINS), ("slow_pipeline", SLOW_PIPELINE),
                          ("slow_library", SLOW_LIBRARY), ("stall", STALL), ("long_frame", LONG_FRAME), ("ps_lifted", PS_LIFTED),
-                         ("ps_not_lifted", PS_NOT_LIFTED), ("pipeline_failed", PIPELINE_FAILED), ("world", WORLD)):
+                         ("ps_not_lifted", PS_NOT_LIFTED), ("pipeline_failed", PIPELINE_FAILED), ("world", WORLD),
+                         ("memory", MEMORY), ("image_heap", IMAGE_HEAP), ("memory_total", MEMORY_TOTAL)):
             m = rx.search(line)
             if not m:
                 continue
@@ -511,6 +518,15 @@ class Log:
                 self.world = {"flip": int(m.group(1)), "seconds": float(m.group(2))}
             elif kind == "load_begins":
                 self._ev(i, kind, flip=int(m.group(1)))
+            elif kind == "memory":
+                heaps = [(int(h.group(1)), bool(h.group(2)), int(h.group(3)), int(h.group(4))) for h in HEAP_ENTRY.finditer(m.group(1))]
+                self._ev(i, kind, device_mib=sum(u for _, dev, u, _ in heaps if dev),
+                         device_budget_mib=sum(b for _, dev, _, b in heaps if dev),
+                         host_mib=sum(u for _, dev, u, _ in heaps if not dev))
+            elif kind == "image_heap":
+                self._ev(i, kind, blocks=int(m.group(1)), mib=int(m.group(2)))
+            elif kind == "memory_total":
+                self._ev(i, kind, mib=int(m.group(1)))
             return
         m = VERSION.search(line)
         if m and not self.version:
@@ -729,6 +745,21 @@ def presence(log, area, start, end, marks, kind):
     return status, out
 
 
+def memory_at(log, start, end):
+    """What the last 5-second report in (start, end) said of memory: the
+    device-local heaps' use (and budget), the host heaps', the image heap's
+    blocks and use, and everything bbhost allocated; None without one."""
+    out = {}
+    for _, k, d in log.between(start, end, {"memory", "image_heap", "memory_total"}):
+        if k == "memory":
+            out.update(device_mib=d["device_mib"], device_budget_mib=d["device_budget_mib"], host_mib=d["host_mib"])
+        elif k == "image_heap":
+            out.update(image_heap_mib=d["mib"], image_heap_blocks=d["blocks"])
+        else:
+            out["allocated_mib"] = d["mib"]
+    return out or None
+
+
 def area_report(log, area, seg, kind):
     """One place's numbers from one pass's log."""
     start, end = seg
@@ -789,6 +820,8 @@ def area_report(log, area, seg, kind):
             rep["status"] = "no window"
     elif kind == "perf" and rep["status"] == "ok":
         rep["status"] = "no window"
+    # Memory as the place was left: the last report before its end.
+    rep["memory"] = memory_at(log, start, marks.get("end", end))
     if kind == "capture":
         cap = log.between(start, end, {"capture", "capture_rejected"})
         rep["captures"] = {"written": [{"dir": d["dir"], "pipeline": d["pipeline"], "flip": d["flip"]} for _, k, d in cap if k == "capture"],
@@ -807,6 +840,21 @@ def pass_report(lines, areas, kind):
             out["areas"][a.id] = area_report(log, a, segs[a.id], kind)
         else:
             out["areas"][a.id] = {"id": a.id, "name": a.name, "block": a.block, "status": "not reached"}
+    # Memory growth, place by place in the order they were visited: what was
+    # left held since the place before and since the first.
+    prev = first = None
+    for a in areas:
+        m = out["areas"][a.id].get("memory") or {}
+        if m.get("device_mib") is None:
+            continue
+        for key in ("device_mib", "image_heap_mib", "allocated_mib"):
+            if m.get(key) is None:
+                continue
+            if prev and prev.get(key) is not None:
+                m[key.replace("_mib", "_growth_mib")] = m[key] - prev[key]
+            if first and first.get(key) is not None:
+                m[key.replace("_mib", "_since_first_mib")] = m[key] - first[key]
+        prev, first = m, first or m
     return out
 
 
@@ -1007,6 +1055,12 @@ PERF_METRICS = (
     ("main loop work ms", ("main_loop_work_ms", "mean"), False, 0.2),
     ("CPU %", ("cpu_pct",), False, 5.0),
 )
+# Memory as each place was left (the 5-second report's): growth here is
+# what a leak looks like.
+MEMORY_METRICS = (
+    ("device memory MiB", ("device_mib",), False, 128),
+    ("image heap MiB", ("image_heap_mib",), False, 64),
+)
 ARRIVAL_METRICS = (
     ("slow pipelines", ("slow_pipelines", "count"), False, 2),
     ("slow pipeline ms", ("slow_pipelines", "ms"), False, 100),
@@ -1080,7 +1134,8 @@ def compare_reports(a_runs, b_runs, frame_pairs=None):
     for aid in ids:
         A_all = [r["areas"].get(aid, {}) for r in a_runs]
         B_all = [r["areas"].get(aid, {}) for r in b_runs]
-        ent = {"status": {"a": [x.get("status") for x in A_all], "b": [x.get("status") for x in B_all]}, "perf": {}, "arrival": {}}
+        ent = {"status": {"a": [x.get("status") for x in A_all], "b": [x.get("status") for x in B_all]}, "perf": {}, "arrival": {},
+               "memory": {}}
         # Only a visit that measured the place counts: a death, a load or the
         # player somewhere else made other numbers.
         A = [x if x.get("status") == "ok" else {} for x in A_all]
@@ -1093,6 +1148,10 @@ def compare_reports(a_runs, b_runs, frame_pairs=None):
             d = metric_delta([dig(x.get("arrival"), path) for x in A], [dig(x.get("arrival"), path) for x in B], hb, mn)
             if d:
                 ent["arrival"][label] = d
+        for label, path, hb, mn in MEMORY_METRICS:
+            d = metric_delta([dig(x.get("memory"), path) for x in A], [dig(x.get("memory"), path) for x in B], hb, mn)
+            if d:
+                ent["memory"][label] = d
         share = metric_delta([dig(x.get("window"), ("draws", "lifted_share")) for x in A],
                              [dig(x.get("window"), ("draws", "lifted_share")) for x in B], True, 0.001)
         if share:
@@ -1117,8 +1176,8 @@ def compare_reports(a_runs, b_runs, frame_pairs=None):
         out["areas"][aid] = ent
     flagged, improved = [], []
     for aid, ent in out["areas"].items():
-        for group in ("perf", "arrival"):
-            for label, d in ent[group].items():
+        for group in ("perf", "arrival", "memory"):
+            for label, d in ent.get(group, {}).items():
                 if d.get("verdict") in ("worse", "better"):
                     (flagged if d["verdict"] == "worse" else improved).append(
                         "%s: %s %s (%+.3g, noise %.3g)" % (aid, label, d["verdict"], d["delta"], d.get("noise", 0)))
@@ -1262,6 +1321,14 @@ def summary_text(report):
                     nps.get("lifted", 0), nps.get("translated", 0), (" (" + reasons + ")") if reasons else ""))
             if ar.get("pipelines_failed"):
                 out.append("  pipelines that failed to build: " + ", ".join(ar["pipelines_failed"][:8]))
+        m = a.get("memory")
+        if m and m.get("device_mib") is not None:
+            def grew(key):
+                v = m.get(key)
+                return "" if v is None else " (%+d since the last place)" % v
+            out.append("  memory at the end: device %d MiB%s, image heap %s MiB in %s blocks%s, allocated %s MiB" % (
+                m["device_mib"], grew("device_growth_mib"), fmt(m.get("image_heap_mib"), "%d"), fmt(m.get("image_heap_blocks"), "%d"),
+                grew("image_heap_growth_mib"), fmt(m.get("allocated_mib"), "%d")))
         fr = a.get("frames")
         if fr:
             out.append("  frames: " + ", ".join("%s %s" % (n, "luma %.1f" % f["stats"]["mean_luma"] if f.get("stats") else
@@ -1286,8 +1353,8 @@ def ab_text(ab):
            "B: %s (%s)" % (", ".join(str(d) for d in ab["b_runs"]), ", ".join(ab["b_version"]) or "?"), ""]
     for aid, e in ab["areas"].items():
         out.append("%s: A %s, B %s" % (aid, "/".join(str(s) for s in e["status"]["a"]), "/".join(str(s) for s in e["status"]["b"])))
-        for group in ("perf", "arrival"):
-            for label, d in e[group].items():
+        for group in ("perf", "arrival", "memory"):
+            for label, d in e.get(group, {}).items():
                 out.append("  %-22s A %-9s B %-9s %+8.3f%s  %s" % (
                     label, fmt(d["a_mean"], "%.3f"), fmt(d["b_mean"], "%.3f"), d["delta"],
                     (" (noise %.3f)" % d["noise"]) if "noise" in d else "", d.get("verdict", "")))
