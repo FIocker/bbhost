@@ -459,6 +459,7 @@ struct Gpu {
     std::atomic<std::uint64_t> draws_ps[4] = {};
     std::atomic<std::uint64_t> draws_vs[4] = {};  // ... and by how their vertex shader ran (DrawVs)
     std::atomic<std::uint64_t> draws_vs_why[16] = {};  // kDrawVsOther by why (DrawVsWhy)
+    std::atomic<std::uint64_t> draws_tess[6] = {};     // the host tessellator's draws by lifted stages (DrawTess)
     // Why each failed draw failed (DrawFail), reported at exit beside the total.
     std::atomic<std::uint64_t> draw_fail_why[16] = {};
     // host_gpu_draw calls, and those that returned without drawing (no target, or no colour and no depth write).
@@ -1488,6 +1489,10 @@ public:
     void bind_sets(VkPipelineLayout layout, const VkDescriptorSet sets[2], const std::uint32_t* dynamic = nullptr, bool bindless = false);
     // Constant buffers into set 2 (cb_push_on()): `n` bindings and their ranges.
     void push_buffers(VkPipelineLayout layout, const std::uint32_t* bindings, const VkDescriptorBufferInfo* infos, std::uint32_t n);
+    // One more set at `index`, after bind_sets' (a pipeline's own, past the
+    // shared layout's sets), with up to two dynamic offsets.
+    void bind_stage_set(VkPipelineLayout layout, std::uint32_t index, VkDescriptorSet set, std::uint32_t dynamic_count = 0,
+                        const std::uint32_t* dynamic = nullptr);
     void viewport(const VkViewport& vp);
     void scissor(const VkRect2D& sc);
     void depth_bounds(float lo, float hi);

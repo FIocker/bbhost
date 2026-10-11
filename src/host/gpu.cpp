@@ -5304,6 +5304,7 @@ GpuStats host_gpu_stats() {
     for (int i = 0; i < kDrawPsCount; ++i) st.draws_ps[i] = g.draws_ps[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kDrawVsCount; ++i) st.draws_vs[i] = g.draws_vs[i].load(std::memory_order_relaxed);
     for (int i = 0; i < kVsWhyCount; ++i) st.draws_vs_why[i] = g.draws_vs_why[i].load(std::memory_order_relaxed);
+    for (int i = 0; i < kDrawTessCount; ++i) st.draws_tess[i] = g.draws_tess[i].load(std::memory_order_relaxed);
     for (int i = 0; i < 16; ++i) st.draw_fail_why[i] = g.draw_fail_why[i].load(std::memory_order_relaxed);
     return st;
 }

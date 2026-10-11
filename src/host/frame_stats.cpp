@@ -109,6 +109,15 @@ void log_detail(const GpuStats& was, const GpuStats& now, const std::vector<doub
     host_log("frame detail: vertex shader lifted %llu, translated %llu, fetch shader or tessellation %llu, fallback %llu",
              static_cast<unsigned long long>(vs[kDrawVsLifted]), static_cast<unsigned long long>(vs[kDrawVsTranslated]),
              static_cast<unsigned long long>(vs[kDrawVsOther]), static_cast<unsigned long long>(vs[kDrawVsFallback]));
+    std::uint64_t ts[kDrawTessCount];
+    for (int i = 0; i < kDrawTessCount; ++i) ts[i] = now.draws_tess[i] - was.draws_tess[i];
+    if (ts[kDrawTess]) {
+        host_log("frame detail: tessellated draws %llu: domain shader lifted %llu, LS lifted %llu, hull lifted %llu, all three %llu "
+                 "(native hull pipelines %llu)",
+                 static_cast<unsigned long long>(ts[kDrawTess]), static_cast<unsigned long long>(ts[kDrawTessDomainLifted]),
+                 static_cast<unsigned long long>(ts[kDrawTessLsLifted]), static_cast<unsigned long long>(ts[kDrawTessHullLifted]),
+                 static_cast<unsigned long long>(ts[kDrawTessAllLifted]), static_cast<unsigned long long>(ts[kDrawTessNative]));
+    }
     constexpr std::size_t kPerLine = 100;  // 100 x " 16.67": well inside host_log's 1 KiB
     for (std::size_t at = 0; at < intervals_ms.size(); at += kPerLine) {
         std::string line;

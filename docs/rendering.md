@@ -66,7 +66,13 @@ before they are needed. There are two compilers:
 All 13,394 vertex, pixel and compute shaders in the game's bundles translate
 to valid SPIR-V (`gcn2spv --check`). Domain, hull and local shaders run on the
 host GPU's own tessellation stages; no geometry or export shader has been seen
-in use.
+in use. The lifter takes those too: the particles' local, hull and domain
+shaders, whose one control point travels as stage attributes, and the game's
+own hull draws (the Forbidden Woods' meshes, every hull in the bundles), whose
+local, hull and domain shaders become one native pipeline - the LDS they pass
+patches through turned into stage inputs and outputs, the game's patch list
+drawn as it is, with no compute pass in front. `BBHOST_LIFT_TESS=0` keeps every
+tessellation stage translated.
 
 **Textures and memory.** The game's memory is shared with the GPU, as on the
 PS4: its GPU-visible parts (about 5 GB) are imported into Vulkan, because
@@ -90,7 +96,7 @@ path at all:
 | Operation | Today |
 |---|---|
 | Draws | native: built from the engine's objects at a token |
-| Tessellated draws | native: host tessellation stages |
+| Tessellated draws | native: host tessellation stages; the game's hull draws one lifted pipeline each |
 | Post-processing (YEBIS) | native resource building; the game's shaders |
 | Menus (Scaleform) | native draw building from the HAL |
 | Fills and copies without a shader | recognised and performed directly |

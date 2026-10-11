@@ -44,6 +44,12 @@
 #include <unordered_map>
 #include <unordered_set>
 
+namespace {
+// A hull shader's constant factors, read out of its program (defined with the
+// tessellated draws below).
+bool hs_constant_factors(const gcn::Program& p, float out[6]);
+}  // namespace
+
 namespace gpu {
 bool dump_rt_locked(RtImage& r, const char* path);
 bool rt_float_max_locked(RtImage& r, float* out3);
@@ -219,7 +225,19 @@ struct GfxPipeline {
     // itself, and `tess_vs` above goes unused.
     ShaderStage tess_ls;
     bool tess_hw = false, tess_attrs = false;
+    bool tess_hull_lifted = false;  // the control stage is the hull's lift (BBHOST_LIFT_TESS); the LS's is tess_ls.lifted
     std::uint32_t tess_control_points = 1, tess_attr_vec4s = 8;
+    // The game's own hull as a native pipeline (DrawState::tess_native): the
+    // LS's lift the vertex stage on vertex input, the hull's the control stage,
+    // the domain shader's the evaluation stage, their LDS traffic stage I/O.
+    // The LS and the hull read their params and buffers from a set of their
+    // own (kTessNativeSet, tess_set_layout); the hull's translation (its
+    // bindings, no SPIR-V) is tess_hs. A particle pipeline whose lifted LS
+    // reads constant buffers binds those in that set too (its params stay
+    // the evaluation stage's).
+    bool tess_native = false;
+    gcn::TranslateResult tess_hs;
+    VkDescriptorSetLayout tess_set_layout = VK_NULL_HANDLE;
     // The VS and PS sets' layouts and the pipeline layout (stage_set_layout);
     // null with BBHOST_SET_LAYOUTS=0, which keeps the shared layout.
     VkDescriptorSetLayout set_layouts[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -765,6 +783,10 @@ std::atomic<std::uint64_t> g_tess_draws{0}, g_tess_patches{0}, g_tess_refused{0}
 std::atomic<std::uint32_t> g_tess_max_patches{0}, g_tess_max_level{0};
 // The draws the game's own hull shader ran for (tess_draw_one), and their patches.
 std::atomic<std::uint64_t> g_tess_hull_draws{0}, g_tess_hull_patches{0};
+// Of them, the attempts at a native hull pipeline (TessDraw::native) refused,
+// which went on through the LS pass, and those that went through it while a
+// worker built their native pipeline (queue_native_pipeline).
+std::atomic<std::uint64_t> g_tess_native_refusals{0}, g_tess_native_waits{0};
 // TranslateOptions::tess_lds_bound for every stage that reads or writes the
 // buffer standing in for LDS: each access checked against its patch's window
 // or the region the LS pass gave the draw, 0 read and the write dropped past
@@ -1920,6 +1942,22 @@ bool decomp_selects(const std::string& ps_name) {
     return selection.first || selection.second.count(ps_name) != 0;
 }
 
+// BBHOST_LIFT_TESS: the stages of a draw on the host's tessellator that run as
+// typed lifts (gcn/lift.h TessLift), as a mask - 1 the domain shader (the
+// evaluation stage), 2 the LS (the vertex stage, on Vulkan vertex input), 4
+// the hull shader (the control stage) of the particles' patches, whose
+// control point is carried as attributes; 8 the game's own hull draws (the
+// Forbidden Woods' meshes) as native pipelines, all three stages lifted and
+// the game's patch list drawn as it is, instead of the LS pass, the LDS ring
+// and its windows. The default 15 is all of it; 0 keeps every tessellation
+// stage translated (an A/B switch). Each stage still needs BBHOST_DECOMP to
+// select its program.
+constexpr unsigned kLiftTessDomain = 1, kLiftTessLs = 2, kLiftTessHull = 4, kLiftTessNative = 8;
+const unsigned g_lift_tess = [] {
+    const char* e = std::getenv("BBHOST_LIFT_TESS");
+    return e && *e ? static_cast<unsigned>(std::strtoul(e, nullptr, 0)) & 15u : 15u;
+}();
+
 // How a draw bound to `p` runs its pixel shader (GpuStats::draws_ps): only the
 // no-fallback variant ever carries a lift.
 int draw_ps_kind(const GfxPipeline& p) {
@@ -1944,6 +1982,9 @@ std::map<std::string, std::array<std::uint64_t, kVsWhyCount>> g_vs_other;
 // vertex shader on vertex input, and only a no-fallback stage - which a
 // fallback pipeline laid out from its no-fallback stages has too (layout_only).
 int draw_vs_kind(const GfxPipeline& p, bool vertex_input, bool fetchless) {
+    // A draw on the host's tessellator counts as lifted once all its stages
+    // before rasterization are: the domain shader, the LS and the hull.
+    if (p.tess_hw) return p.vs.lifted && p.tess_ls.lifted && p.tess_hull_lifted ? kDrawVsLifted : kDrawVsOther;
     if (p.vs.lifted) return kDrawVsLifted;
     if ((!vertex_input && !fetchless) || p.tess_hw) return kDrawVsOther;
     return p.lean || p.layout_only ? kDrawVsTranslated : kDrawVsFallback;
@@ -1984,6 +2025,14 @@ struct DrawState {
     std::uint32_t hs_rsrc1 = 0, hs_rsrc2 = 0, tess_window = 0;
     bool tess_quads = true, tess_cw = true;
     int tess_spacing = 0;
+    // And as a native pipeline (TessDraw::native): the LS, the hull and the
+    // domain shader lifted, the window's LDS their stage I/O, the game's own
+    // patch list drawn as it is. The lifts fold the window's tessellation
+    // constants, which the domain shader and the hull read through the
+    // constant buffer tess_cb[0] and [1] say (tess_constants_where).
+    bool tess_native = false;
+    std::uint32_t tess_constants[12] = {};
+    std::uint32_t tess_cb[2] = {};
     VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     bool rect = false;
     // attachments
@@ -2023,6 +2072,7 @@ std::uint64_t pipeline_key(const DrawState& s, std::uint64_t vs_hash, std::uint6
         std::uint32_t tess_hw, tess_attrs;
         std::uint64_t hs_va;
         std::uint32_t hs_rsrc1, hs_rsrc2, tess_window, tess_shape;
+        std::uint32_t tess_constants[12], tess_cb[2];
         // The state objects' ids, or the registers they stand for.
         std::uint32_t state[12];
         std::uint32_t color_mask[8];
@@ -2040,13 +2090,22 @@ std::uint64_t pipeline_key(const DrawState& s, std::uint64_t vs_hash, std::uint6
     k.tess_control_points = s.tess_control_points;
     std::memcpy(k.tess_outer, s.tess_outer, sizeof(k.tess_outer));
     std::memcpy(k.tess_inner, s.tess_inner, sizeof(k.tess_inner));
-    k.tess_attrs = s.tess_attrs;
+    k.tess_attrs = (s.tess_attrs ? 1u : 0u) | (s.tess_native ? 2u : 0u);
     if (s.tess_hull) {
         k.hs_va = s.hs_va;
         k.hs_rsrc1 = s.hs_rsrc1;
         k.hs_rsrc2 = s.hs_rsrc2;
         k.tess_window = s.tess_window;
         k.tess_shape = (s.tess_quads ? 1u : 0u) | (s.tess_cw ? 2u : 0u) | static_cast<std::uint32_t>(s.tess_spacing) << 2;
+    }
+    if (s.tess_native) {  // the LS is the pipeline's vertex stage, and the lifts fold the constants
+        std::memcpy(k.tess_constants, s.tess_constants, sizeof(k.tess_constants));
+        k.tess_cb[0] = s.tess_cb[0];
+        k.tess_cb[1] = s.tess_cb[1];
+        k.ls_va = s.ls_va;
+        k.ls_fetch_va = s.ls_fetch_va;
+        k.ls_rsrc1 = s.ls_rsrc1;
+        k.ls_rsrc2 = s.ls_rsrc2;
     }
     if (s.tess_attrs) {
         k.tess_attr_vec4s = s.tess_attr_vec4s;
@@ -3460,17 +3519,32 @@ VkShaderModule tess_passthrough_module(const std::string& dump_name) {
 // buffers are read through the page table, and its user data and the LDS
 // buffer come from the evaluation stage's params block. Never destroyed, as
 // above.
-VkShaderModule tess_hull_module(const DrawState& s, const std::string& dump_name) {
-    CachedProgram* hs = program_at(s.hs_va);
-    if (!hs) return VK_NULL_HANDLE;
-    static std::mutex mu;
-    static std::unordered_map<std::uint64_t, VkShaderModule> modules;  // under mu; VK_NULL_HANDLE: failed
+struct TessHullModule {
+    VkShaderModule module = VK_NULL_HANDLE;  // VK_NULL_HANDLE: failed
+    std::vector<std::uint32_t> spirv;        // for draw captures
+};
+std::mutex g_tess_hull_mu;
+std::unordered_map<std::uint64_t, TessHullModule> g_tess_hull_modules;  // under g_tess_hull_mu
+std::uint64_t tess_hull_key(const DrawState& s, const CachedProgram& hs) {
     const std::uint32_t k[6] = {s.hs_rsrc1, s.hs_rsrc2, s.tess_window, s.tess_control_points,
                                 (s.tess_quads ? 1u : 0u) | (s.tess_cw ? 2u : 0u) | static_cast<std::uint32_t>(s.tess_spacing) << 2,
                                 g.exec_known ? 1u : 0u};
-    const std::uint64_t key = fnv1a(k, sizeof(k), hs->hash ^ 0x4a11ull);
-    std::lock_guard<std::mutex> lk(mu);
-    if (const auto it = modules.find(key); it != modules.end()) return it->second;
+    return fnv1a(k, sizeof(k), hs.hash ^ 0x4a11ull);
+}
+// The control stage tess_hull_module made for a draw's state, or null.
+std::vector<std::uint32_t> tess_hull_spirv(const DrawState& s) {
+    CachedProgram* hs = program_at(s.hs_va);
+    if (!hs) return {};
+    std::lock_guard<std::mutex> lk(g_tess_hull_mu);
+    const auto it = g_tess_hull_modules.find(tess_hull_key(s, *hs));
+    return it == g_tess_hull_modules.end() ? std::vector<std::uint32_t>() : it->second.spirv;
+}
+VkShaderModule tess_hull_module(const DrawState& s, const std::string& dump_name) {
+    CachedProgram* hs = program_at(s.hs_va);
+    if (!hs) return VK_NULL_HANDLE;
+    const std::uint64_t key = tess_hull_key(s, *hs);
+    std::lock_guard<std::mutex> lk(g_tess_hull_mu);
+    if (const auto it = g_tess_hull_modules.find(key); it != g_tess_hull_modules.end()) return it->second.module;
     gcn::TranslateOptions o;
     o.stage = gcn::Stage::TessControl;
     o.tess_role = gcn::TranslateOptions::TessRole::HullTcs;
@@ -3497,7 +3571,7 @@ VkShaderModule tess_hull_module(const DrawState& s, const std::string& dump_name
         dump_spirv(dump_name + "-tess-hs", r.spirv);
         if (!make_module(r.spirv, m)) m = VK_NULL_HANDLE;
     }
-    modules.emplace(key, m);
+    g_tess_hull_modules.emplace(key, TessHullModule{m, m ? r.spirv : std::vector<std::uint32_t>()});
     return m;
 }
 
@@ -3736,6 +3810,242 @@ gcn::TranslateOptions vs_translate_options(const VsStageInputs& in, const gcn::P
 bool note_vs_precompile_hit(std::uint64_t vs_key);
 void note_vs_precompile_miss(const std::string& name, const VsStageInputs& in);
 
+// ---- native hull pipelines (DrawState::tess_native) ---------------------------
+// The game's own hull draws (the Forbidden Woods' meshes) as an ordinary
+// pipeline: the LS lifted as the vertex stage on Vulkan vertex input, the hull
+// as the control stage, the domain shader as the evaluation stage, the
+// window's LDS their stage inputs and outputs (gcn/lift.h TessLift::window),
+// drawing the game's patch list - its index buffer, base vertex and instances
+// - as it is. No LS pass, no LDS ring, no windows, no chunks.
+//
+// The domain shader keeps the vertex slot's sets (0, with the pixel shader's 1
+// and the shared 2 and 3); the LS and the hull read their params blocks and
+// constant buffers from a set of their own, 4: params at 0 (LS) and 1 (hull),
+// the LS's buffers from 16, the hull's from 32 - the layout tools/drawreplay
+// --native replays.
+constexpr std::uint32_t kTessNativeSet = 4, kTessNativeLsParams = 0, kTessNativeHsParams = 1, kTessNativeLsBuffers = 16,
+                        kTessNativeHsBuffers = 32;
+// The LS and hull of the native hull pipeline a worker is building
+// (queue_native_pipeline), null elsewhere.
+thread_local const CachedProgram* t_tess_native_programs[2] = {nullptr, nullptr};
+
+// Where a stage reads the tessellation constants (tess_constants_where): the
+// constant buffer's V# in its user SGPRs, or in the extended user data table
+// a pointer in them leads to - kind in the top bits, then the user SGPR, then
+// the table's byte offset. 0: neither.
+constexpr std::uint32_t kTessCbDirect = 1u << 30, kTessCbTable = 2u << 30;
+// ... as the translator names that binding (BufferBinding::path.str()).
+std::string tess_cb_path(std::uint32_t where) {
+    const std::uint32_t ud = (where >> 16) & 0xff;
+    if ((where & (3u << 30)) == kTessCbDirect) return "user_sgpr[" + std::to_string(where & 0xff) + "]";
+    if ((where & (3u << 30)) == kTessCbTable) return "user_sgpr[" + std::to_string(ud) + "]->load(+" + std::to_string(where & 0xffff) + ")";
+    return std::string();
+}
+
+// A native hull pipeline's TessLift: the window its tessellation constants
+// describe (gx_hull_layout), folded where the stage reads them (`cb`, as
+// DrawState::tess_cb; 0: it does not).
+gcn::TessLift tess_native_lift(const DrawState& s, std::uint32_t cb) {
+    gcn::TessLift tl;
+    tl.window = true;
+    tl.control_points = s.tess_control_points;
+    tl.ls_stride = s.tess_constants[0];
+    tl.cp_stride = s.tess_constants[1];
+    tl.patch_constants = s.tess_constants[4] / 16;
+    std::memcpy(tl.constants, s.tess_constants, sizeof(tl.constants));
+    tl.constants_path = tess_cb_path(cb);
+    return tl;
+}
+
+// Set 4's layout: a native hull pipeline's two params blocks and the LS's and
+// the hull's storage buffers; for a particle pipeline's LS (hs null), its
+// storage buffers alone - its params stay the evaluation stage's.
+VkDescriptorSetLayout tess_native_set_layout(const gcn::TranslateResult& ls, const gcn::TranslateResult* hs) {
+    std::lock_guard<std::mutex> lk(g_stage_layout_mu);
+    std::vector<VkDescriptorSetLayoutBinding> binds;
+    if (hs) {
+        binds.push_back({kTessNativeLsParams, params_descriptor_type(), 1, VK_SHADER_STAGE_ALL, nullptr});
+        binds.push_back({kTessNativeHsParams, params_descriptor_type(), 1, VK_SHADER_STAGE_ALL, nullptr});
+    }
+    for (const gcn::TranslateResult* m : {&ls, hs}) {
+        if (!m) continue;
+        for (const gcn::BufferBinding& b : m->buffers) binds.push_back({b.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_ALL, nullptr});
+    }
+    std::uint64_t key = 0x7e55e7ull;
+    for (const VkDescriptorSetLayoutBinding& b : binds) {
+        key = fnv1a(&b.binding, sizeof(b.binding), key);
+        key = fnv1a(&b.descriptorType, sizeof(b.descriptorType), key);
+    }
+    if (const auto it = g_stage_set_layouts.find(key); it != g_stage_set_layouts.end()) return it->second;
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = static_cast<std::uint32_t>(binds.size());
+    lci.pBindings = binds.data();
+    VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+    if (vkCreateDescriptorSetLayout(g.device, &lci, nullptr, &layout) != VK_SUCCESS) return VK_NULL_HANDLE;
+    g_stage_set_layouts.emplace(key, layout);
+    return layout;
+}
+
+// The pipeline layout: the vertex and pixel stages' sets, the shared sets 2
+// and 3 (an empty layout where the device has neither), and set 4.
+VkPipelineLayout tess_native_pipeline_layout(VkDescriptorSetLayout vs, VkDescriptorSetLayout ps, VkDescriptorSetLayout tess) {
+    std::lock_guard<std::mutex> lk(g_stage_layout_mu);
+    static VkDescriptorSetLayout empty = VK_NULL_HANDLE;  // under g_stage_layout_mu
+    if (!empty) {
+        VkDescriptorSetLayoutCreateInfo eci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        if (vkCreateDescriptorSetLayout(g.device, &eci, nullptr, &empty) != VK_SUCCESS) return VK_NULL_HANDLE;
+    }
+    const VkDescriptorSetLayout sets[5] = {vs, ps, cb_push_on() ? g.cb_push_layout : empty, g.bindless ? g.bindless_layout : empty, tess};
+    const std::uint64_t key = fnv1a(sets, sizeof(sets), 0x7e55e8ull);
+    if (const auto it = g_stage_pipe_layouts.find(key); it != g_stage_pipe_layouts.end()) return it->second;
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 5;
+    plci.pSetLayouts = sets;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    if (vkCreatePipelineLayout(g.device, &plci, nullptr, &layout) != VK_SUCCESS) return VK_NULL_HANDLE;
+    g_stage_pipe_layouts.emplace(key, layout);
+    return layout;
+}
+
+// The first time each program's lift for a native hull pipeline is decided.
+bool tess_native_first(const std::string& name) {
+    static std::mutex mu;
+    static std::set<std::string> logged;
+    std::lock_guard<std::mutex> lk(mu);
+    return logged.insert(name).second;
+}
+
+// A native hull pipeline's LS and hull: each lifted, or the pipeline is not
+// built (`why`) and the draws keep the LS pass. `vertex_input` is the LS's.
+bool build_tess_native_stages(GfxPipeline& pl, const DrawState& s, const VertexInputPlan* vertex_input, std::string& why) {
+    // On a worker, the copies queue_native_pipeline made (program_at is the
+    // command processor's); in place, the programs themselves.
+    const CachedProgram* ls = t_tess_native_programs[0] ? t_tess_native_programs[0] : program_at(s.ls_va);
+    const CachedProgram* hs = t_tess_native_programs[1] ? t_tess_native_programs[1] : program_at(s.hs_va);
+    if (!ls || !hs) {
+        why = "the LS or the hull shader is not a known program";
+        return false;
+    }
+    if (!vertex_input) {
+        why = "no vertex input for the LS";
+        return false;
+    }
+    if (s.tess_constants[0] % 16 || !s.tess_constants[0] || s.tess_constants[2] != 1) {
+        why = "tessellation constants that are not one window";
+        return false;
+    }
+    pl.tess_native = true;
+    {
+        const gcn::Program prog = gcn::decode(ls->words.data(), ls->words.size());
+        if (!prog.errors.empty()) {
+            why = "LS decode: " + prog.errors[0].what;
+            return false;
+        }
+        gcn::TranslateOptions o = tess_ls_options(s.ls_rsrc1, s.ls_rsrc2, s.tess_constants[0] / 16, nullptr);
+        o.vertex_input = vertex_input->elements;
+        o.cb_ssbo = true;
+        o.cb_no_fallback = true;
+        o.descriptor_set = kTessNativeSet;
+        o.cb_descriptor_set = static_cast<int>(kTessNativeSet);
+        o.cb_binding_base = kTessNativeLsBuffers;
+        const gcn::TranslateResult ref = translate_cached(prog, o);
+        if (!ref.ok()) {
+            why = "LS " + ls->name + ": " + ref.errors[0];
+            return false;
+        }
+        gcn::TessLift tl = tess_native_lift(s, 0);
+        tl.attr_vec4s = s.tess_constants[0] / 16;
+        tl.own_params = true;
+        tl.params_binding = kTessNativeLsParams;
+        gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftLs, prog, o, ref, tl);
+        const bool first = tess_native_first(ls->name);
+        if (!lifted.ok()) {
+            why = "LS " + ls->name + " not lifted: " + lifted.rejections[0];
+            return false;
+        }
+        if (!ref.images.empty() || !ref.samplers.empty()) {
+            why = "LS " + ls->name + " binds images";
+            return false;
+        }
+        name_stage(lifted, ref, ls->name);
+        if (first) {
+            host_log("render: tessellation LS %s lifted as a native hull pipeline's vertex stage (%zu words; translated %zu, %zu buffers)",
+                     ls->name.c_str(), lifted.spirv.size(), ref.spirv.size(), ref.buffers.size());
+        }
+        pl.tess_ls.fresh() = ref;
+        pl.tess_ls.fresh().spirv = std::move(lifted.spirv);
+        pl.tess_ls.lifted = true;
+        dump_spirv(pl.name + "-tess-ls-native", pl.tess_ls.meta().spirv);
+        if (!make_module(pl.tess_ls.meta().spirv, pl.tess_ls.module)) {
+            why = "LS module";
+            return false;
+        }
+    }
+    {
+        const gcn::Program prog = gcn::decode(hs->words.data(), hs->words.size());
+        if (!prog.errors.empty()) {
+            why = "hull decode: " + prog.errors[0].what;
+            return false;
+        }
+        gcn::TranslateOptions o;
+        o.stage = gcn::Stage::TessControl;
+        o.tess_role = gcn::TranslateOptions::TessRole::HullTcs;
+        o.bindless = g.bindless;
+        o.rsrc1 = s.hs_rsrc1;
+        o.rsrc2 = s.hs_rsrc2;
+        o.tess_patch_control_points = s.tess_control_points;
+        o.tess_window = s.tess_window;
+        o.tess_lds_bound = tess_lds_bound();
+        o.tess_quads = s.tess_quads;
+        o.tess_spacing = s.tess_spacing;
+        o.tess_cw = s.tess_cw;
+        o.exec_known = g.exec_known;
+        o.descriptor_set = kTessNativeSet;
+        o.cb_ssbo = true;
+        o.cb_no_fallback = true;
+        o.cb_descriptor_set = static_cast<int>(kTessNativeSet);
+        o.cb_binding_base = kTessNativeHsBuffers;
+        const gcn::TranslateResult ref = translate_cached(prog, o);
+        if (!ref.ok()) {
+            why = "hull shader " + hs->name + ": " + ref.errors[0];
+            return false;
+        }
+        gcn::TessLift tl = tess_native_lift(s, s.tess_cb[1]);
+        tl.own_params = true;
+        tl.params_binding = kTessNativeHsParams;
+        gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftHull, prog, o, ref, tl);
+        const bool first = tess_native_first(hs->name);
+        if (!lifted.ok()) {
+            why = "hull shader " + hs->name + " not lifted: " + lifted.rejections[0];
+            return false;
+        }
+        if (!ref.images.empty() || !ref.samplers.empty()) {
+            why = "hull shader " + hs->name + " binds images";
+            return false;
+        }
+        name_stage(lifted, ref, hs->name);
+        if (first) {
+            host_log("render: hull shader %s lifted as a native hull pipeline's control stage (%zu words; translated %zu, %zu buffers)",
+                     hs->name.c_str(), lifted.spirv.size(), ref.spirv.size(), ref.buffers.size());
+        }
+        dump_spirv(pl.name + "-tess-hs-native", lifted.spirv);
+        if (!make_module(lifted.spirv, pl.tess_tcs)) {
+            why = "hull module";
+            return false;
+        }
+        pl.tess_hs = ref;
+        pl.tess_hs.spirv.clear();  // the bindings are what the draws read
+        pl.tess_hs.spirv.shrink_to_fit();
+        pl.tess_hull_lifted = true;
+    }
+    pl.tess_set_layout = tess_native_set_layout(pl.tess_ls.meta(), &pl.tess_hs);
+    if (!pl.tess_set_layout) {
+        why = "set 4's layout";
+        return false;
+    }
+    return true;
+}
+
 // Translates a pipeline's stages and creates their layouts; with `create`,
 // its Vulkan pipeline too (create_gfx_pipeline).
 GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
@@ -3747,6 +4057,13 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                                 bool cb_no_fallback, const VertexInputPlan* vertex_input, bool create = true, bool layout_only = false) {
     pl.name = vs_name + "+" + ps_name;
     pl.lean = cb_no_fallback;
+    // A fallback laid out from its no-fallback stages is built again in place
+    // (BBHOST_LAYOUT_FROM_LEAN): what the tessellation stages were lifted to
+    // is decided again below.
+    pl.tess_native = false;
+    pl.tess_set_layout = VK_NULL_HANDLE;
+    pl.tess_ls.lifted = false;
+    pl.tess_hull_lifted = false;
     // layout_only: the fallback pipeline laid out from its no-fallback stages,
     // which bind the same resources; the fallback's own translation waits for
     // a draw that has to create it (fallback_for_draw).
@@ -3885,8 +4202,11 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // where vertex shaders are compiled at creation: the loader makes a vertex
     // shader ~7% larger, and on the default path that cost a cold load 1.9 s of
     // command-processor compiles for no compile saved.
-    const bool vs_formats_from_params = vertex_input && g_vertex_format_params && use_pipeline_library() &&
-                                        gcn::vertex_formats_from_params_supported(vertex_input->elements);
+    // A native hull pipeline's vertex input is its LS's: the domain shader in
+    // the vertex slot is translated as the ring path's is, without any.
+    const VertexInputPlan* const vs_input = s.tess_native ? nullptr : vertex_input;
+    const bool vs_formats_from_params = vs_input && g_vertex_format_params && use_pipeline_library() &&
+                                        gcn::vertex_formats_from_params_supported(vs_input->elements);
     pl.vs_formats_from_params = vs_formats_from_params;
     pl.clip_discard = clip_discard;
     pl.tess_hw = s.tess_hw;
@@ -3895,7 +4215,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         s.vs_out_cntl | (clip_discard ? gcn::TranslateOptions::kVsOutCntlClipVarying |
                                             ((clip_discard >> 8) & 31) << gcn::TranslateOptions::kVsOutCntlClipLocationShift
                                       : 0u);
-    const VsStageInputs vs_in{&vs_words, &fetch_words, s.vs_rsrc1, s.vs_rsrc2, vs_out_cntl, vertex_input ? &vertex_input->elements : nullptr,
+    const VsStageInputs vs_in{&vs_words, &fetch_words, s.vs_rsrc1, s.vs_rsrc2, vs_out_cntl, vs_input ? &vs_input->elements : nullptr,
                               vs_formats_from_params, stage_lean, &vs_dims, &vs_sampler_modes, s.domain_level,
                               s.tess_hw,    s.tess_control_points, s.tess_quads, s.tess_cw, s.tess_spacing, s.tess_attrs, s.tess_attr_vec4s,
                               s.tess_window};
@@ -3904,8 +4224,19 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     // that calls no fetch shader at all (its inputs are the vertex and
     // instance indices), outside tessellation.
     const bool vs_fetchless = fetch_words.empty() && !s.tess_hw && !s.domain_level;
-    const bool vs_decomp = stage_lean && (vertex_input || vs_fetchless) && !g_vs_dispatcher && decomp_selects(vs_name);
-    const std::uint64_t vs_key = lift_key(vs_stage_key(vs_in), vs_decomp);
+    const bool vs_decomp = stage_lean && (vertex_input || vs_fetchless) && !s.tess_hw && !s.domain_level && !g_vs_dispatcher && decomp_selects(vs_name);
+    // A domain shader on the host's tessellator, its control point as stage
+    // attributes: lifted as the evaluation stage (gcn::lift_domain_shader).
+    const bool ds_lift = stage_lean && s.tess_hw && s.tess_attrs && (g_lift_tess & kLiftTessDomain) && decomp_selects(vs_name);
+    // A native hull pipeline lifts its domain shader or is not built: the
+    // window's tessellation constants and where they are read are the lift's.
+    const bool ds_native = s.tess_native;
+    if (ds_native && !stage_lean) return fail("a native hull pipeline with the page-table fallback");
+    std::uint64_t vs_key = lift_key(vs_stage_key(vs_in), vs_decomp || ds_lift || ds_native);
+    if (ds_native) {
+        vs_key = fnv1a(s.tess_constants, sizeof(s.tess_constants), vs_key ^ 0x7e5a71f3ull);
+        vs_key = fnv1a(&s.tess_cb[0], sizeof(s.tess_cb[0]), vs_key);
+    }
     const bool vs_cacheable = g_stage_cache_on;
     const std::shared_ptr<const CachedStage> vs_hit = vs_cacheable ? cached_stage(vs_key) : nullptr;
     if (vs_hit) {
@@ -3913,7 +4244,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         pl.vs.module = vs_hit->module;
         if (!t_pipeline_worker) g_pl_stage_repeats.fetch_add(1, std::memory_order_relaxed);
         manifest_note_hit(vs_key);
-        if (note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp) {
+        if (note_vs_precompile_hit(vs_key) && g_precompile_check && !vs_decomp && !ds_lift && !ds_native) {
             const gcn::Program p = gcn::decode(vs_words.data(), vs_words.size());
             check_precompiled_stage("VS", vs_name, vs_hit->meta, gcn::translate(p, vs_translate_options(vs_in, nullptr)));
         }
@@ -3931,11 +4262,11 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         note_vs_precompile_miss(vs_name, vs_in);
         note_image_dims(0, vs_name, vs_prog, pl.vs.meta(), vs_dims);
         note_first_translation(0, vs_name);
-        note_vs_dependencies(vs_name, vs_words, vertex_input, output_links, stage_lean, s, vs_dims, vs_sampler_modes);
+        note_vs_dependencies(vs_name, vs_words, vs_input, output_links, stage_lean, s, vs_dims, vs_sampler_modes);
         {
             std::lock_guard<std::mutex> lk(g_stage_variants.mu);
             if (vo.fetch) g_stage_variants.vs_with_fetch += 1;
-            if (vertex_input) g_stage_variants.vs_with_vertex_input += 1;
+            if (vs_input) g_stage_variants.vs_with_vertex_input += 1;
         }
         if (!t_pipeline_worker) {
             g_pl_translate_us.fetch_add(pl_us_since(t_stage), std::memory_order_relaxed);
@@ -3943,7 +4274,7 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         }
         if (!g_stage_cache_on) note_stage_key(vs_key);
         if (!pl.vs.meta().ok()) return fail("VS: " + pl.vs.meta().errors[0]);
-        if (!vs_in.tess_window) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp);  // the manifest keeps no tessellation shape
+        if (!vs_in.tess_window) manifest_note_vs(vs_key, vs_name, vs_in, vs_decomp || ds_lift);  // the manifest keeps no tessellation shape
         // The lift declares the translation's bindings and outputs (lift.cpp
         // checks the outputs), so layouts and linkage are unchanged; a rejection
         // keeps the translation.
@@ -3967,7 +4298,51 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
                 host_log("render: VS %s not lifted, translated shader kept: %s", vs_name.c_str(), lifted.rejections[0].c_str());
             }
         }
+        if (ds_lift) {
+            gcn::TessLift tl;
+            tl.attr_vec4s = s.tess_attr_vec4s;
+            gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftDomain, vs_prog, vo, pl.vs.meta(), tl);
+            name_stage(lifted, pl.vs.meta(), vs_name);
+            static std::mutex logged_mu;
+            static std::set<std::string> logged;
+            bool first;
+            {
+                std::lock_guard<std::mutex> lk(logged_mu);
+                first = logged.insert(vs_name).second;
+            }
+            if (lifted.ok()) {
+                if (first) {
+                    host_log("render: domain shader %s lifted as the evaluation stage (%zu words; translated %zu)", vs_name.c_str(),
+                             lifted.spirv.size(), pl.vs.meta().spirv.size());
+                }
+                pl.vs.fresh().spirv = std::move(lifted.spirv);
+                pl.vs.lifted = true;
+            } else if (first) {
+                host_log("render: domain shader %s not lifted, translated shader kept: %s", vs_name.c_str(), lifted.rejections[0].c_str());
+            }
+        }
+        if (ds_native) {
+            // The window's control points and patch constants as the control
+            // stage's outputs (gcn::lift_domain_shader, TessLift::window).
+            gcn::LiftResult lifted = lift_tess_cached(TranslationUse::kLiftDomain, vs_prog, vo, pl.vs.meta(), tess_native_lift(s, s.tess_cb[0]));
+            if (!lifted.ok()) return fail("native hull pipeline: domain shader " + vs_name + " not lifted: " + lifted.rejections[0]);
+            name_stage(lifted, pl.vs.meta(), vs_name);
+            static std::mutex logged_mu;
+            static std::set<std::string> logged;
+            bool first;
+            {
+                std::lock_guard<std::mutex> lk(logged_mu);
+                first = logged.insert(vs_name).second;
+            }
+            if (first) {
+                host_log("render: domain shader %s lifted as a native hull pipeline's evaluation stage (%zu words; translated %zu)",
+                         vs_name.c_str(), lifted.spirv.size(), pl.vs.meta().spirv.size());
+            }
+            pl.vs.fresh().spirv = std::move(lifted.spirv);
+            pl.vs.lifted = true;
+        }
     }
+    if (ds_native && !pl.vs.lifted) return fail("native hull pipeline: its domain shader's cached stage is not a lift");
     if (g_dump_spirv || g_token_user_data_check) {
         table_slots_read(pl.vs.meta(), pl.table_reads[0], &pl.user_reads[0]);
     } else if (cb_no_fallback && g_skip_tables) {
@@ -3990,7 +4365,15 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         CachedProgram* ls = program_at(s.ls_va);
         const FetchProgram* fetch = s.ls_fetch_va ? fetch_program_at(s.ls_fetch_va) : nullptr;
         if (!ls || (s.ls_fetch_va && !fetch)) return fail("tessellation LS program");
-        const std::uint64_t ls_key = tess_ls_key(ls->words, fetch ? &fetch->words : nullptr, s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s);
+        // On the vertex input the draw planned for the LS's elements, its lift
+        // (gcn::lift_ls_shader) takes them in place of the fetch shader: a key
+        // of its own, which holds the elements and their formats.
+        const bool ls_lift = stage_lean && vertex_input && (g_lift_tess & kLiftTessLs) && decomp_selects(ls->name);
+        std::uint64_t ls_key = tess_ls_key(ls->words, fetch ? &fetch->words : nullptr, s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s);
+        if (ls_lift) {
+            ls_key = fnv1a(vertex_input->elements.data(), vertex_input->elements.size() * sizeof(gcn::VertexElement), ls_key ^ 0x1515f7ull);
+            ls_key = lift_key(ls_key, true);
+        }
         const std::shared_ptr<const CachedStage> ls_hit = g_stage_cache_on ? cached_stage(ls_key) : nullptr;
         gcn::Program prog;
         if (ls_hit) {
@@ -4000,7 +4383,65 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             prog = gcn::decode(ls->words.data(), ls->words.size());
             gcn::Program fprog;
             if (fetch) fprog = gcn::decode(fetch->words.data(), fetch->words.size());
-            pl.tess_ls.fresh() = translate_cached(prog, tess_ls_options(s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s, fetch ? &fprog : nullptr));
+            const gcn::TranslateOptions lo = tess_ls_options(s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s, fetch ? &fprog : nullptr);
+            bool lifted_ls = false;
+            if (ls_lift && prog.errors.empty()) {
+                gcn::TranslateOptions vo = lo;  // the reference: the elements as vertex input, every buffer bound
+                vo.fetch = nullptr;
+                vo.vertex_input = vertex_input->elements;
+                vo.cb_ssbo = true;
+                vo.cb_no_fallback = true;
+                const gcn::TranslateResult ref = translate_cached(prog, vo);
+                gcn::TessLift tl;
+                tl.attr_vec4s = s.tess_attr_vec4s;
+                gcn::LiftResult lifted = ref.ok() ? lift_tess_cached(TranslationUse::kLiftLs, prog, vo, ref, tl) : gcn::LiftResult{};
+                static std::mutex logged_mu;
+                static std::set<std::string> logged;
+                bool first;
+                {
+                    std::lock_guard<std::mutex> lk(logged_mu);
+                    first = logged.insert(ls->name).second;
+                }
+                if (lifted.ok() && ref.images.empty() && ref.samplers.empty() && ref.buffers.empty()) {
+                    name_stage(lifted, ref, ls->name);
+                    if (first) {
+                        host_log("render: tessellation LS %s lifted as the vertex stage on vertex input (%zu words; translated %zu)", ls->name.c_str(),
+                                 lifted.spirv.size(), ref.spirv.size());
+                    }
+                    pl.tess_ls.fresh() = ref;
+                    pl.tess_ls.fresh().spirv = std::move(lifted.spirv);
+                    pl.tess_ls.lifted = true;
+                    lifted_ls = true;
+                } else if (lifted.ok() && ref.images.empty() && ref.samplers.empty()) {
+                    // It reads constant buffers (the point sprites' LS): bound in a
+                    // set of their own, 4 from binding 16 as a native hull
+                    // pipeline's LS has them, its params still the evaluation
+                    // stage's (its user data in their vertex-formats slot).
+                    gcn::TranslateOptions vo4 = vo;
+                    vo4.cb_descriptor_set = static_cast<int>(kTessNativeSet);
+                    vo4.cb_binding_base = kTessNativeLsBuffers;
+                    const gcn::TranslateResult ref4 = translate_cached(prog, vo4);
+                    gcn::LiftResult lifted4 = ref4.ok() ? lift_tess_cached(TranslationUse::kLiftLs, prog, vo4, ref4, tl) : gcn::LiftResult{};
+                    if (lifted4.ok() && ref4.images.empty() && ref4.samplers.empty()) {
+                        name_stage(lifted4, ref4, ls->name);
+                        if (first) {
+                            host_log("render: tessellation LS %s lifted as the vertex stage on vertex input, its %zu constant buffers in set 4 "
+                                     "(%zu words; translated %zu)", ls->name.c_str(), ref4.buffers.size(), lifted4.spirv.size(), ref4.spirv.size());
+                        }
+                        pl.tess_ls.fresh() = ref4;
+                        pl.tess_ls.fresh().spirv = std::move(lifted4.spirv);
+                        pl.tess_ls.lifted = true;
+                        lifted_ls = true;
+                    } else if (first) {
+                        host_log("render: tessellation LS %s not lifted, translated shader kept: %s", ls->name.c_str(),
+                                 !ref4.ok() ? ref4.errors[0].c_str() : !lifted4.ok() ? lifted4.rejections[0].c_str() : "it binds images");
+                    }
+                } else if (first) {
+                    host_log("render: tessellation LS %s not lifted, translated shader kept: %s", ls->name.c_str(),
+                             !ref.ok() ? ref.errors[0].c_str() : !lifted.ok() ? lifted.rejections[0].c_str() : "it binds images");
+                }
+            }
+            if (!lifted_ls) pl.tess_ls.fresh() = translate_cached(prog, lo);
         }
         if (!prog.errors.empty() || !pl.tess_ls.meta().ok()) {
             host_log("render: tessellation LS %s as a vertex stage: %s", ls->name.c_str(),
@@ -4008,25 +4449,36 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
             return fail("tessellation LS");
         }
         // Both stages read set 0. The evaluation stage's bindings are the only
-        // ones that may be in it, and every LS in this game binds nothing -
-        // but if one did, its numbering would land on the other's.
-        if (!pl.tess_ls.meta().images.empty() || !pl.tess_ls.meta().samplers.empty() || !pl.tess_ls.meta().buffers.empty()) {
+        // ones that may be in it, and an LS translated with its fetch shader
+        // binds nothing; the lift of one that reads constant buffers binds
+        // them in set 4 (above), whose layout the pipeline's then has.
+        const bool ls_set4 = pl.tess_ls.lifted && !pl.tess_ls.meta().buffers.empty();
+        if (!pl.tess_ls.meta().images.empty() || !pl.tess_ls.meta().samplers.empty() || (!pl.tess_ls.meta().buffers.empty() && !ls_set4)) {
             host_log("render: tessellation LS %s binds resources (%zu images, %zu samplers, %zu buffers), which would collide with "
                      "the evaluation stage's set", ls->name.c_str(), pl.tess_ls.meta().images.size(), pl.tess_ls.meta().samplers.size(),
                      pl.tess_ls.meta().buffers.size());
             return fail("tessellation LS bindings");
         }
+        if (ls_set4 && !(pl.tess_set_layout = tess_native_set_layout(pl.tess_ls.meta(), nullptr))) return fail("tessellation LS set 4 layout");
         if (!ls_hit) {
-            dump_spirv(pl.name + "-tess-ls", pl.tess_ls.meta().spirv);
+            dump_spirv(pl.name + (pl.tess_ls.lifted ? "-tess-ls-lifted" : "-tess-ls"), pl.tess_ls.meta().spirv);
             if (!make_module(pl.tess_ls.meta().spirv, pl.tess_ls.module)) return fail("tessellation LS module");
-            if (g_stage_cache_on) cache_stage(ls_key, pl.tess_ls.meta(), pl.tess_ls.module, false);
-            manifest_note_ls(ls_key, ls->name, ls->words, fetch ? &fetch->words : nullptr, s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s);
+            if (g_stage_cache_on) cache_stage(ls_key, pl.tess_ls.meta(), pl.tess_ls.module, pl.tess_ls.lifted);
+            // The manifest replays the translation with the fetch shader: a lift's key is not its to fill.
+            if (!ls_lift) manifest_note_ls(ls_key, ls->name, ls->words, fetch ? &fetch->words : nullptr, s.ls_rsrc1, s.ls_rsrc2, s.tess_attr_vec4s);
         }
     }
     // The two stages of a tessellated draw that carry no GCN code.
     // Shared by every such pipeline with the same factors, which is all of
     // them from one hull shader.
-    if (pl.tess_hw && s.tess_hull) {
+    if (s.tess_native) {
+        // The native hull pipeline's LS and hull, lifted, with a set of their own.
+        std::string why;
+        if (!build_tess_native_stages(pl, s, vertex_input, why)) return fail("native hull pipeline: " + why);
+        host_log("render: native hull pipeline %s: the game's hull shader at 0x%llx lifted, %s patches of %u, window %u bytes",
+                 pl.name.c_str(), static_cast<unsigned long long>(s.hs_va), s.tess_quads ? "quad" : "triangle", s.tess_control_points,
+                 s.tess_window);
+    } else if (pl.tess_hw && s.tess_hull) {
         pl.tess_tcs = tess_hull_module(s, pl.name);
         if (!pl.tess_tcs) return fail("tessellation hull module");
         pl.tess_vs = tess_passthrough_module(pl.name);
@@ -4037,6 +4489,30 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
     } else if (pl.tess_hw) {
         pl.tess_tcs = tess_tcs_module(s.tess_outer, s.tess_inner, s.tess_control_points, pl.tess_attrs ? pl.tess_attr_vec4s : 0, pl.name);
         if (!pl.tess_tcs) return fail("tessellation TCS module");
+        // The control stage the hull's constant factors make is its lift once
+        // gcn::lift_constant_hull shows the program is only that: the same
+        // factors as the host's own reading of them (hs_constant_factors),
+        // nothing else it writes that the evaluation stage reads.
+        if (CachedProgram* hs = (g_lift_tess & kLiftTessHull) && pl.tess_attrs ? program_at(s.hs_va) : nullptr; hs && decomp_selects(hs->name)) {
+            const gcn::Program hprog = gcn::decode(hs->words.data(), hs->words.size());
+            const gcn::HullLift lifted = gcn::lift_constant_hull(hprog);
+            float host[6] = {};
+            const bool same = lifted.ok() && hs_constant_factors(hprog, host) && std::memcmp(host, lifted.factors.data(), sizeof(host)) == 0;
+            pl.tess_hull_lifted = same;
+            static std::mutex logged_mu;
+            static std::set<std::string> logged;
+            bool first;
+            {
+                std::lock_guard<std::mutex> lk(logged_mu);
+                first = logged.insert(hs->name).second;
+            }
+            if (first) {
+                host_log("render: hull shader %s %s", hs->name.c_str(),
+                         same ? "lifted: its constant factors make the control stage"
+                              : (std::string("not lifted, the host's control stage kept: ") +
+                                 (lifted.rejections.empty() ? "its factors differ from the host's reading" : lifted.rejections[0])).c_str());
+            }
+        }
         if (!pl.tess_attrs) {
             pl.tess_vs = tess_passthrough_module(pl.name);
             if (!pl.tess_vs) return fail("tessellation VS module");
@@ -4065,7 +4541,13 @@ GfxPipeline& build_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const std::
         // pre-rasterization library does not depend on its pixel shader (step 6b).
         pl.set_layouts[1] = use_pipeline_library() ? g.gfx_set_layout : stage_set_layout(pl.ps.meta());  // params only without a PS
         pl.layout = pl.set_layouts[0] && pl.set_layouts[1] ? stage_pipeline_layout(pl.set_layouts[0], pl.set_layouts[1]) : VK_NULL_HANDLE;
+        if (pl.tess_set_layout) {  // a native hull pipeline's, or a particle LS's constant buffers
+            pl.layout = pl.set_layouts[0] && pl.set_layouts[1] ? tess_native_pipeline_layout(pl.set_layouts[0], pl.set_layouts[1], pl.tess_set_layout)
+                                                               : VK_NULL_HANDLE;
+        }
         if (!pl.layout) return fail("stage descriptor layouts");
+    } else if (pl.tess_set_layout) {
+        return fail("a tessellation pipeline with a set 4 needs per-stage set layouts (BBHOST_SET_LAYOUTS=0)");
     }
     if (create && !create_gfx_pipeline(pl, s, vertex_input, fetch_words.size())) pl.failed = true;
     return pl;
@@ -5128,7 +5610,10 @@ void precompile_manifest(const ManifestStage& m) {
             const gcn::TranslateOptions options = vs_translate_options(m.vs_inputs(), m.fetch_words.empty() ? nullptr : &fetch_prog);
             stage.fresh() = translate_cached(prog, options);
             if (stage.meta().ok() && m.lift) {
-                gcn::LiftResult lifted = lift_cached(true, prog, options, stage.meta());
+                gcn::TessLift tl;
+                tl.attr_vec4s = m.tess_attr_vec4s;
+                gcn::LiftResult lifted = m.tess_hw ? lift_tess_cached(TranslationUse::kLiftDomain, prog, options, stage.meta(), tl)
+                                                   : lift_cached(true, prog, options, stage.meta());
                 if (lifted.ok()) {
                     stage.fresh().spirv = std::move(lifted.spirv);
                     stage.lifted = true;
@@ -5632,7 +6117,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         si.pName = "main";
         stages.push_back(si);
     };
-    if (pl.tess_hw && (!pl.tess_tcs || !(pl.tess_attrs ? pl.tess_ls.module : pl.tess_vs))) {
+    if (pl.tess_hw && (!pl.tess_tcs || !(pl.tess_attrs || pl.tess_native ? pl.tess_ls.module : pl.tess_vs))) {
         // The generated stages are made in build_gfx_pipeline; a pipeline that
         // reached here without them would hand the driver a null module.
         static std::atomic<int> logs{0};
@@ -5646,7 +6131,7 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
         // carries nothing and the control stage only the hull shader's
         // factors; `pl.vs` holds the domain shader, which is the evaluation
         // stage.
-        stage(VK_SHADER_STAGE_VERTEX_BIT, pl.tess_attrs ? pl.tess_ls.module : pl.tess_vs);
+        stage(VK_SHADER_STAGE_VERTEX_BIT, pl.tess_attrs || pl.tess_native ? pl.tess_ls.module : pl.tess_vs);
         stage(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, pl.tess_tcs);
         stage(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, pl.vs.module);
     } else {
@@ -5656,7 +6141,10 @@ bool create_gfx_pipeline(GfxPipeline& pl, const DrawState& s, const VertexInputP
     if (pl.ps.module) stage(VK_SHADER_STAGE_FRAGMENT_BIT, pl.ps.module);
     // Pixel shaders at wave32: built whole, the fragment stage is given its
     // subgroup size here (linked, in its library: fragment_library).
-    const bool linked = use_pipeline_library() && pl.layout;
+    // A pipeline with set 4 (a native hull pipeline, a particle LS's constant
+    // buffers) is built whole: its layout has a set past the shared ones,
+    // which the fragment library a pixel shader shares does not.
+    const bool linked = use_pipeline_library() && pl.layout && !pl.tess_set_layout;
     const char* const owner = t_library_owner;
     t_library_owner = pl.name.c_str();
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo ps_wave{};
@@ -5900,6 +6388,10 @@ struct LeanBuildJob {
     std::vector<bool> vs_modes, ps_modes;
     bool has_vertex_input = false;
     VertexInputPlan vertex_input;
+    // A native hull pipeline's LS and hull, copied on the command processor
+    // (program_at is its own) for build_tess_native_stages on the worker.
+    bool tess_programs = false;
+    CachedProgram tess_ls, tess_hs;
 };
 struct LeanBuilders {
     std::mutex mu;
@@ -5925,8 +6417,11 @@ LeanBuilders& lean_builders() {
                     }
                     const LeanBuildJob& j = *job;
                     t_pipeline_worker = true;
+                    t_tess_native_programs[0] = j.tess_programs ? &j.tess_ls : nullptr;
+                    t_tess_native_programs[1] = j.tess_programs ? &j.tess_hs : nullptr;
                     build_gfx_pipeline(*j.variant, j.s, j.vs_words, j.fetch_words, j.ps_words, j.vs_name, j.ps_name, j.vs_dims, j.ps_dims,
                                        j.vs_modes, j.ps_modes, true, j.has_vertex_input ? &j.vertex_input : nullptr);
+                    t_tess_native_programs[0] = t_tess_native_programs[1] = nullptr;
                     std::lock_guard<std::mutex> lk(w->mu);
                     w->done.emplace_back(j.base, j.variant);
                     g_lean_builds_ready.store(true, std::memory_order_relaxed);
@@ -5939,16 +6434,23 @@ LeanBuilders& lean_builders() {
     return *builders;
 }
 
-// Under g.mu: reserves the variant's entry and hands the build to a worker.
-void queue_lean_variant(GfxPipeline& base, std::uint64_t lean_key, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
-                        const std::vector<std::uint32_t>& fetch_words, const std::vector<std::uint32_t>& ps_words,
-                        const std::string& vs_name, const std::string& ps_name,
-                        const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
-                        const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
-                        const std::vector<bool>& ps_modes, const VertexInputPlan* vertex_input) {
+// Under g.mu: hands `variant`'s build (no-fallback) to a worker; `base` takes
+// it once done (apply_lean_builds_locked), or is the variant itself.
+void queue_pipeline_build(GfxPipeline& base, GfxPipeline& variant, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
+                          const std::vector<std::uint32_t>& fetch_words, const std::vector<std::uint32_t>& ps_words,
+                          const std::string& vs_name, const std::string& ps_name,
+                          const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
+                          const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
+                          const std::vector<bool>& ps_modes, const VertexInputPlan* vertex_input,
+                          const CachedProgram* tess_ls = nullptr, const CachedProgram* tess_hs = nullptr) {
     auto job = std::make_unique<LeanBuildJob>();
+    if (tess_ls && tess_hs) {
+        job->tess_programs = true;
+        job->tess_ls = *tess_ls;
+        job->tess_hs = *tess_hs;
+    }
     job->base = &base;
-    job->variant = &g_gfx[lean_key];
+    job->variant = &variant;
     job->variant->building = true;
     job->s = s;
     for (int t = 0; t < 8; ++t) {
@@ -5973,7 +6475,7 @@ void queue_lean_variant(GfxPipeline& base, std::uint64_t lean_key, const DrawSta
         job->has_vertex_input = true;
         job->vertex_input = *vertex_input;
     }
-    base.lean_building = true;
+    if (&base != &variant) base.lean_building = true;
     LeanBuilders& w = lean_builders();
     {
         std::lock_guard<std::mutex> lk(w.mu);
@@ -5981,6 +6483,17 @@ void queue_lean_variant(GfxPipeline& base, std::uint64_t lean_key, const DrawSta
     }
     g_lean_builds_queued.fetch_add(1, std::memory_order_relaxed);
     w.cv.notify_one();
+}
+
+// Under g.mu: reserves the variant's entry and hands the build to a worker.
+void queue_lean_variant(GfxPipeline& base, std::uint64_t lean_key, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
+                        const std::vector<std::uint32_t>& fetch_words, const std::vector<std::uint32_t>& ps_words,
+                        const std::string& vs_name, const std::string& ps_name,
+                        const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
+                        const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
+                        const std::vector<bool>& ps_modes, const VertexInputPlan* vertex_input) {
+    queue_pipeline_build(base, g_gfx[lean_key], s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes,
+                         vertex_input);
 }
 
 // Under g.mu: gives finished variants to their base pipelines.
@@ -5995,9 +6508,25 @@ void apply_lean_builds_locked() {
     }
     for (const auto& [base, variant] : done) {
         variant->building = false;
+        if (base == variant) continue;  // a native hull pipeline (queue_native_pipeline): drawn by its own key
         base->lean_variant = variant;
         base->lean_building = false;
     }
+}
+
+// Under g.mu: a native hull pipeline (DrawState::tess_native) built by a
+// worker, as a no-fallback variant is - its lifts and its compile (monolithic,
+// 175 ms cold in the woods) off the command processor. Its entry is reserved
+// now; until the worker is done its draws go through the LS pass.
+void queue_native_pipeline(std::uint64_t key, const DrawState& s, const std::vector<std::uint32_t>& vs_words,
+                           const std::vector<std::uint32_t>& fetch_words, const std::vector<std::uint32_t>& ps_words,
+                           const std::string& vs_name, const std::string& ps_name,
+                           const std::vector<std::pair<std::uint32_t, bool>>& vs_dims,
+                           const std::vector<std::pair<std::uint32_t, bool>>& ps_dims, const std::vector<bool>& vs_modes,
+                           const std::vector<bool>& ps_modes, const VertexInputPlan* vertex_input) {
+    GfxPipeline& entry = g_gfx[key];
+    queue_pipeline_build(entry, entry, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_modes, ps_modes, vertex_input,
+                         program_at(s.ls_va), program_at(s.hs_va));
 }
 
 // ---- pass management ------------------------------------------------------------
@@ -7274,6 +7803,15 @@ void render_report() {
                  static_cast<unsigned long long>(n), static_cast<unsigned long long>(g_tess_patches.load()),
                  static_cast<unsigned long long>(g_tess_vertices.load()), g_tess_max_patches.load(), g_tess_max_level.load(),
                  static_cast<unsigned long long>(g_tess_refused.load()));
+        host_log("render: tessellated draws on the host's tessellator %llu: domain shader lifted %llu, LS lifted %llu, hull lifted %llu, "
+                 "all three %llu; the game's hull as native pipelines %llu, refused %llu, through the LS pass while theirs was built %llu "
+                 "(BBHOST_LIFT_TESS=%u)",
+                 static_cast<unsigned long long>(g.draws_tess[kDrawTess].load()), static_cast<unsigned long long>(g.draws_tess[kDrawTessDomainLifted].load()),
+                 static_cast<unsigned long long>(g.draws_tess[kDrawTessLsLifted].load()), static_cast<unsigned long long>(g.draws_tess[kDrawTessHullLifted].load()),
+                 static_cast<unsigned long long>(g.draws_tess[kDrawTessAllLifted].load()),
+                 static_cast<unsigned long long>(g.draws_tess[kDrawTessNative].load()),
+                 static_cast<unsigned long long>(g_tess_native_refusals.load()), static_cast<unsigned long long>(g_tess_native_waits.load()),
+                 g_lift_tess);
         host_log("render: tessellated draws the game's hull shader ran for %llu (%llu patches); LDS buffer accesses %s",
                  static_cast<unsigned long long>(g_tess_hull_draws.load()), static_cast<unsigned long long>(g_tess_hull_patches.load()),
                  tess_lds_bound() ? "bounded to their window and region (BBHOST_TESS_LDS_BOUND=0: unchecked)"
@@ -10329,8 +10867,65 @@ struct TessDraw {
     std::uint32_t tess_constants[12] = {};
     std::uint32_t tess_vsharp[4] = {};
     std::uint32_t hs_user[16] = {};
+    // The game's hull as a native pipeline (DrawState::tess_native): no LS
+    // pass, the draw is the game's patch list.
+    bool native = false;
+    std::uint32_t tess_cb[2] = {};  // DrawState::tess_cb: the domain shader's and the hull's
+    // For draw captures: the ring lds_address is in, and the game's own draw
+    // (its index buffer and base vertex; count, instances and first point above).
+    VkBuffer lds_buffer = VK_NULL_HANDLE;
+    std::uint64_t lds_ring_address = 0;
+    std::uint64_t index_va = 0;
+    std::uint32_t index_type = 0;
+    std::int32_t base_vertex = 0;
 };
 thread_local const TessDraw* t_tess = nullptr;
+
+// Native hull pipelines (TessDraw::native). The programs a native pipeline was
+// refused for, by tess_native_signature - their draws keep the LS pass - and
+// the single draws refused (kTessNativeMisses of those refuse the programs
+// too); and draw_impl's answer to the attempt it was given, nothing of which
+// it recorded: why it refused, and whether only for that draw.
+constexpr std::uint32_t kTessNativeRefused = 0x80000000u, kTessNativeMisses = 64;
+std::mutex g_tess_native_mu;
+std::unordered_map<std::uint64_t, std::uint32_t> g_tess_native_misses;  // under g_tess_native_mu
+thread_local const char* t_tess_native_refusal = nullptr;
+thread_local bool t_tess_native_this_draw = false;
+thread_local bool t_tess_native_pending = false;  // ... because a worker is still building its pipeline
+// Every constant buffer a stage's translation binds resolved to a buffer.
+bool every_buffer_bound(const gcn::StageParams& p, const gcn::TranslateResult& meta) {
+    return meta.buffers.empty() || p.cb_valid == (1u << meta.buffers.size()) - 1;
+}
+bool tess_native_refuse(const char* why, bool this_draw_only = false) {
+    t_tess_native_refusal = why;
+    t_tess_native_this_draw = this_draw_only;
+    t_tess_native_pending = false;
+    return false;
+}
+// Its native pipeline is being built (queue_native_pipeline): this draw
+// takes the LS pass, and the programs are not held against it.
+bool tess_native_wait() {
+    tess_native_refuse("its native pipeline is being built", true);
+    t_tess_native_pending = true;
+    return false;
+}
+const GpuDrawInputs* tess_gx(const GpuDraw& d);
+// The programs a hull draw runs: its LS, hull and domain shader, and its window.
+std::uint64_t tess_native_signature(const GpuDraw& d, const TessDraw& t) {
+    const GpuDrawInputs* gi = tess_gx(d);
+    std::uint32_t k[8] = {};
+    if (gi) {
+        k[0] = gi->ls_pgm[0];
+        k[1] = gi->ls_pgm[1];
+        k[2] = gi->hs_pgm[0];
+        k[3] = gi->hs_pgm[1];
+        k[4] = gi->vs_pgm[0];
+        k[5] = gi->vs_pgm[1];
+    }
+    k[6] = t.window;
+    k[7] = t.control_points;
+    return fnv1a(k, sizeof(k));
+}
 
 // The tessellation constants' V# where a stage's descriptors ask for constant
 // buffer 0x13 directly in its user SGPRs (type 5: the woods' hull and domain
@@ -10343,6 +10938,28 @@ void put_tess_constants(const GxStageRecords& st, const std::uint32_t vsharp[4],
         const std::uint32_t ud = (d >> 8) & 0xff;
         if ((d & 0xff) == 0x5 && ((d >> 16) & 0xff) == 0x13 && ud + 4 <= 16) std::memcpy(user + ud, vsharp, 16);
     }
+}
+
+// Where a stage's descriptors read the tessellation constants (constant
+// buffer 0x13): directly in its user SGPRs (type 5, put_tess_constants), or in
+// the extended block (type 0x12) that a pointer (type 0x1a) in them leads to -
+// the domain shaders of the hull draws whose patches carry 17 constants, and
+// the water's. As tess_cb_path reads it; 0 for neither.
+std::uint32_t tess_constants_where(const GxStageRecords& st) {
+    std::uint32_t ext = ~0u;  // the V#'s first dword in the extended block
+    for (std::uint32_t i = 0; i < st.ndesc && i < 64; ++i) {
+        const std::uint32_t d = st.desc[i];
+        const std::uint32_t type = d & 0xff, ud = (d >> 8) & 0xff, slot = (d >> 16) & 0xff;
+        if (type == 0x5 && slot == 0x13 && ud + 4 <= 16) return kTessCbDirect | ud;
+        if (type == 0x12 && slot == 0x13 && ud >= 16) ext = ud - 16;
+    }
+    if (ext == ~0u) return 0;
+    for (std::uint32_t i = 0; i < st.ndesc && i < 64; ++i) {
+        const std::uint32_t d = st.desc[i];
+        const std::uint32_t type = d & 0xff, ud = (d >> 8) & 0xff, first = (d >> 16) & 0xff, count = d >> 24;
+        if (type == 0x1a && ud + 2 <= 16 && ext >= first && ext + 4 <= first + count) return kTessCbTable | ud << 16 | (ext - first) * 4;
+    }
+    return 0;
 }
 
 // Vertices a patch: one quad at level 1, and above it a fan of 4L triangles
@@ -10745,6 +11362,27 @@ bool tess_hull_refused(const char* why) {
     return false;
 }
 
+// The game's hull: the tessellation constants for one patch in the ring, and
+// the hull's user data with their V# in it.
+bool tess_hull_constants_locked(const GpuDraw& d, TessDraw& t) {
+    const std::uint64_t tc = ring_place(reinterpret_cast<const std::uint8_t*>(t.tess_constants), sizeof(t.tess_constants), 16);
+    if (!tc) return tess_hull_refused("ring room for the tessellation constants");
+    t.tess_vsharp[0] = static_cast<std::uint32_t>(tc);
+    t.tess_vsharp[1] = static_cast<std::uint32_t>((tc >> 32) & 0xffff) | 16u << 16;  // stride 16
+    t.tess_vsharp[2] = sizeof(t.tess_constants) / 16;
+    t.tess_vsharp[3] = 0x00077fac;  // x, y, z, w; 32-bit float, as the game's constant buffers are
+    GxUserData hu;
+    t_tess_constants = t.tess_vsharp;
+    const GxUserResult hr = build_gx_user_data(d.gx_objects->records->stage[kGxRecordHs], hu, ~0u);
+    t_tess_constants = nullptr;
+    if (hr != kUserBuilt) return tess_hull_refused("the hull's user data");
+    std::memset(t.hs_user, 0, sizeof(t.hs_user));
+    for (int k = 0; k < 16; ++k) {
+        if ((hu.set >> k) & 1) t.hs_user[k] = hu.user[k];
+    }
+    return true;
+}
+
 bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
     const GpuDrawInputs* plan_gx = tess_gx(d);
     t.hw = tess_hw_locked(t);
@@ -10837,6 +11475,7 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
         user = gx_ls_user;
     }
     const FetchProgram* fetch = nullptr;
+    std::uint64_t fetch_va = 0;
     if (ls->fetch_sgpr >= 0 && ls->fetch_sgpr + 1 < 16) {
         // A draw that took a token wrote no user-data registers, so GX names
         // its fetch shader instead of the command stream holding it.
@@ -10845,6 +11484,20 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
                 ? d.gx_objects->fetch_va
                 : static_cast<std::uint64_t>(user[ls->fetch_sgpr]) | (static_cast<std::uint64_t>(user[ls->fetch_sgpr + 1]) << 32);
         if (!(fetch = fetch_program_at(fva))) return false;
+        fetch_va = fva;
+    }
+    // The game's draw, for captures (the windows draw below has neither).
+    t.index_va = d.index_va;
+    t.index_type = d.index_type;
+    t.base_vertex = d.gx && d.gx_render ? static_cast<std::int32_t>(d.gx->base_vertex) : static_cast<std::int32_t>(d.ctx[0x102]);
+    if (t.hull) {
+        // The LS the pass runs, likewise.
+        t.ls_va = plan_gx ? (static_cast<std::uint64_t>(plan_gx->ls_pgm[1] & 0xff) << 40) | (static_cast<std::uint64_t>(plan_gx->ls_pgm[0]) << 8)
+                          : pgm(0x148);
+        t.ls_fetch_va = fetch_va;
+        t.ls_rsrc1 = rsrc1;
+        t.ls_rsrc2 = rsrc2;
+        std::memcpy(t.ls_user, user, sizeof(t.ls_user));
     }
     std::uint64_t stride = 1024, base = 0;
     {
@@ -10857,6 +11510,13 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
         }
     }
 
+    // A native hull pipeline draws the game's patch list itself, the LS its
+    // vertex stage: no pass and no ring, only the tessellation constants the
+    // hull and the domain shader read and the hull's user data.
+    if (t.hull && t.native) {
+        begin_recording_locked();  // the ring placements belong to the recording the draw goes in
+        return tess_hull_constants_locked(d, t);
+    }
     // With the control point carried through the pipeline there
     // is nothing for a compute pass to do. Take what the vertex stage needs of
     // the LS and leave - no pipeline, no ring, no dispatch, and no render pass
@@ -11080,31 +11740,15 @@ bool tess_ls_pass_locked(const GpuDraw& d, TessDraw& t) {
         }
     }
     t.lds_address = (grows ? region->buf.address : ring.address + static_cast<std::uint64_t>(region - regions) * kRegionBytes) + region->off;
+    t.lds_buffer = grows ? region->buf.buffer : ring.buffer;            // what a capture or a native hull draw binds
+    t.lds_ring_address = grows ? region->buf.address : ring.address;    // that buffer's device address
     t.lds_bytes = static_cast<std::uint32_t>(bytes);  // at most a region (checked above)
     region->off = (region->off + bytes + 255) & ~255ull;
     {
         std::lock_guard<std::mutex> lk(g_tess_lds_mu);
         g_tess_lds_uses[g_tess_lds_next++ % kTessLdsUses] = {g_draw_rec_next, t.lds_address, bytes, t.hull ? t.window : 0u};
     }
-    if (t.hull) {
-        // The tessellation constants for one patch, and the hull's user data
-        // with their V# in it.
-        const std::uint64_t tc = ring_place(reinterpret_cast<const std::uint8_t*>(t.tess_constants), sizeof(t.tess_constants), 16);
-        if (!tc) return tess_hull_refused("ring room for the tessellation constants");
-        t.tess_vsharp[0] = static_cast<std::uint32_t>(tc);
-        t.tess_vsharp[1] = static_cast<std::uint32_t>((tc >> 32) & 0xffff) | 16u << 16;  // stride 16
-        t.tess_vsharp[2] = sizeof(t.tess_constants) / 16;
-        t.tess_vsharp[3] = 0x00077fac;  // x, y, z, w; 32-bit float, as the game's constant buffers are
-        GxUserData hu;
-        t_tess_constants = t.tess_vsharp;
-        const GxUserResult hr = build_gx_user_data(d.gx_objects->records->stage[kGxRecordHs], hu, ~0u);
-        t_tess_constants = nullptr;
-        if (hr != kUserBuilt) return tess_hull_refused("the hull's user data");
-        std::memset(t.hs_user, 0, sizeof(t.hs_user));
-        for (int k = 0; k < 16; ++k) {
-            if ((hu.set >> k) & 1) t.hs_user[k] = hu.user[k];
-        }
-    }
+    if (t.hull && !tess_hull_constants_locked(d, t)) return false;
 
     static thread_local StageImages images;
     prefetch_stage_images(pl.meta, user, images);
@@ -11440,8 +12084,13 @@ static bool tess_draw_one(const GpuDraw& d, TessDraw& t) {
     // index buffer into the ring, so it draws without one. With the LS as the
     // vertex stage the draw is the draw the game asked for, index buffer and
     // all.
-    if (!t.attrs) dd.index_va = 0;
-    dd.index_count = t.hull ? t.count * t.instances : t.hw ? t.count * t.control_points : t.count * tess_vertices_a_patch(t.level);
+    // A native hull pipeline draws the game's patch list as it is: its index
+    // buffer, base vertex and instances.
+    if (!t.attrs && !t.native) dd.index_va = 0;
+    dd.index_count = t.native ? t.count
+                     : t.hull ? t.count * t.instances
+                     : t.hw   ? t.count * t.control_points
+                              : t.count * tess_vertices_a_patch(t.level);
     // BBHOST_TESS_DEBUG=7: record the draw with nothing to draw. Everything
     // it does apart from running vertices - its pipeline, its sets, its
     // parameters, its state - still happens.
@@ -11450,20 +12099,26 @@ static bool tess_draw_one(const GpuDraw& d, TessDraw& t) {
         return e && e[0] == '7';
     }();
     if (no_vertices) dd.index_count = 0;
-    dd.instance_count = 1;
+    dd.instance_count = t.native ? t.instances : 1;
     t_tess = &t;
     t_tess_constants = t.hull ? t.tess_vsharp : nullptr;
     const bool ok = draw_impl(dd);
     t_tess_constants = nullptr;
     t_tess = nullptr;
+    if (t.native && t_tess_native_refusal) {
+        // Not drawn native, and nothing of it recorded: host_gpu_draw draws it
+        // through the LS pass.
+        g.draw_calls.fetch_sub(1, std::memory_order_relaxed);  // draw_impl counted it
+        return false;
+    }
     if (hull_trace && t.hull) {
         timespec now{};
         clock_gettime(CLOCK_MONOTONIC, &now);
-        host_log("tess hull: flip %llu at %.3f instances %u HS 0x%llx %u points (%u patches), index 0x%llx base %d, lds 0x%llx: %s",
+        host_log("tess hull: flip %llu at %.3f instances %u HS 0x%llx %u points (%u patches), index 0x%llx base %d, lds 0x%llx: %s%s",
                  static_cast<unsigned long long>(hle_video_flip_count()), now.tv_sec + now.tv_nsec * 1e-9, d.instance_count, static_cast<unsigned long long>(t.hs_va), t.count,
                  t.count / t.control_points, static_cast<unsigned long long>(d.index_va),
                  d.gx && d.gx_render ? static_cast<int>(d.gx->base_vertex) : 0, static_cast<unsigned long long>(t.lds_address),
-                 ok ? "drawn" : "draw failed");
+                 ok ? "drawn" : "draw failed", t.native ? " (native pipeline)" : "");
     }
     g.draw_calls.fetch_sub(1, std::memory_order_relaxed);  // draw_impl counted it again
     g_tess_draws.fetch_add(1, std::memory_order_relaxed);
@@ -11476,7 +12131,13 @@ static bool tess_draw_one(const GpuDraw& d, TessDraw& t) {
         g_tess_hull_draws.fetch_add(1, std::memory_order_relaxed);
         g_tess_hull_patches.fetch_add(patches, std::memory_order_relaxed);
         static std::atomic<int> logs{0};
-        if (logs.fetch_add(1, std::memory_order_relaxed) < 4) {
+        if (t.native) {
+            static std::atomic<int> nlogs{0};
+            if (nlogs.fetch_add(1, std::memory_order_relaxed) < 4) {
+                host_log("render: the game's hull draws %u patches (%u points x %u instances) as a native pipeline: %s", patches, t.count,
+                         t.instances, ok ? "drawn" : "draw failed");
+            }
+        } else if (logs.fetch_add(1, std::memory_order_relaxed) < 4) {
             host_log("render: the game's hull draws %u patches (%u points x %u instances) into %u bytes of LDS ring, windows of %u bytes, "
                      "accesses %s: %s",
                      patches, t.count, t.instances, t.lds_bytes, t.window, tess_lds_bound() ? "bounded" : "unchecked (BBHOST_TESS_LDS_BOUND=0)",
@@ -11534,6 +12195,57 @@ bool host_gpu_draw(const GpuDraw& d) {
         if (skip.first && t.count == skip.first) {
             if (hle_video_flip_count() != flip) flip = hle_video_flip_count(), seen = 0;
             if (skip.second < 0 || seen++ == skip.second) return true;
+        }
+    }
+    // The game's hull as a native pipeline (BBHOST_LIFT_TESS bit 8): its patch
+    // list drawn whole, no LS pass, no ring, no chunks. Refused - a stage that
+    // does not lift, a constant buffer that does not bind - it goes on as below.
+    // While BBHOST_CAPTURE_DRAW is armed the hull draws keep the LS pass, which
+    // a capture describes (tools/drawreplay --native replays it natively).
+    if (t.hull && (g_lift_tess & kLiftTessNative) && !capture_wanted()) {
+        const std::uint64_t sig = tess_native_signature(d, t);
+        bool refused = false;
+        {
+            std::lock_guard<std::mutex> lk(g_tess_native_mu);
+            const auto it = g_tess_native_misses.find(sig);
+            refused = it != g_tess_native_misses.end() && (it->second & kTessNativeRefused);
+        }
+        if (!refused) {
+            TessDraw n = t;
+            n.native = true;
+            if (const GxDrawRecords* rec = d.gx_objects ? d.gx_objects->records : nullptr) {
+                n.tess_cb[0] = tess_constants_where(rec->stage[kGxRecordSet0]);
+                n.tess_cb[1] = tess_constants_where(rec->stage[kGxRecordHs]);
+            }
+            t_tess_native_refusal = nullptr;
+            t_tess_native_pending = false;
+            const bool ok = tess_draw_one(d, n);
+            const char* const why = t_tess_native_refusal;
+            const bool pending = t_tess_native_pending;
+            t_tess_native_refusal = nullptr;
+            t_tess_native_pending = false;
+            if (!why) return ok;
+            if (pending) {
+                g_tess_native_waits.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                g_tess_native_refusals.fetch_add(1, std::memory_order_relaxed);
+                bool for_good;
+                {
+                    std::lock_guard<std::mutex> lk(g_tess_native_mu);
+                    std::uint32_t& m = g_tess_native_misses[sig];
+                    const std::uint32_t misses = (m & ~kTessNativeRefused) + 1;
+                    m = (m & kTessNativeRefused) | (misses & ~kTessNativeRefused);
+                    if (!t_tess_native_this_draw || misses >= kTessNativeMisses) m |= kTessNativeRefused;
+                    for_good = (m & kTessNativeRefused) != 0;
+                }
+                static std::mutex log_mu;
+                static std::map<std::string, int> logged;
+                std::lock_guard<std::mutex> lk(log_mu);
+                if (logged[why]++ < 4) {
+                    host_log("render: the game's hull draw (HS 0x%llx) keeps the LS pass: %s%s", static_cast<unsigned long long>(t.hs_va), why,
+                             for_good ? "" : " (this draw)");
+                }
+            }
         }
     }
     // A hull draw whose windows would not fit a ring region goes in chunks,
@@ -11687,15 +12399,21 @@ static bool draw_impl(const GpuDraw& d) {
         s.ls_rsrc1 = t_tess->ls_rsrc1;
         s.ls_rsrc2 = t_tess->ls_rsrc2;
         std::memcpy(s.ls_user, t_tess->ls_user, sizeof(s.ls_user));
+        s.hs_va = t_tess->hs_va;  // the hull shader (pipeline_key reads it only for the game's hull, below)
         if (t_tess->hull) {
             s.tess_hull = true;
-            s.hs_va = t_tess->hs_va;
             s.hs_rsrc1 = t_tess->hs_rsrc1;
             s.hs_rsrc2 = t_tess->hs_rsrc2;
             s.tess_window = t_tess->window;
             s.tess_quads = t_tess->quads;
             s.tess_cw = t_tess->cw;
             s.tess_spacing = t_tess->spacing;
+            s.tess_native = t_tess->native;
+            if (s.tess_native) {
+                std::memcpy(s.tess_constants, t_tess->tess_constants, sizeof(s.tess_constants));
+                s.tess_cb[0] = t_tess->tess_cb[0];
+                s.tess_cb[1] = t_tess->tess_cb[1];
+            }
         }
     }
     {
@@ -12063,6 +12781,17 @@ static bool draw_impl(const GpuDraw& d) {
             }
         }
     }
+    // The host tessellator's LS as the vertex stage: its elements as vertex
+    // input, which its lift takes in place of the fetch shader (the domain
+    // shader in the vertex slot calls none). The pipeline's key holds the plan.
+    // A native hull pipeline's LS likewise, which it cannot go without.
+    if (t_tess && t_tess->hw && (t_tess->native || (t_tess->attrs && (g_lift_tess & kLiftTessLs))) && gx_geometry && d.gx_render &&
+        g_vertex_input && !use_vertex_input) {
+        if (const FetchProgram* lf = t_tess->ls_fetch_va ? fetch_program_at(t_tess->ls_fetch_va) : nullptr) {
+            use_vertex_input = plan_vertex_input(lf->words, lf->hash, *gx_geometry, vertex_input);
+        }
+    }
+    if (t_tess && t_tess->native && !use_vertex_input) return tess_native_refuse("no vertex input for its LS");
     const std::vector<std::uint32_t>& fetch_words = fetch ? fetch->words : no_words;
     draw_stamp.to(kRenderCostPrograms);
     const std::uint64_t ps_hash = ps_cp ? ps_cp->hash : 0;
@@ -12198,11 +12927,26 @@ static bool draw_impl(const GpuDraw& d) {
     // BBHOST_LEAN_FIRST: translate and lay out the fallback pipeline, but create
     // its Vulkan pipeline only when a draw binds it (below).
     const bool lean_first = g_lean_first && g.cb_lean;
-    const bool layout_only = lean_first && g_layout_from_lean && !gfx_lookup(key);
+    // A native hull pipeline is its own no-fallback variant, lifted, and is
+    // built here: until it is, the draw has no other way to be drawn native.
+    const bool tess_native = t_tess && t_tess->native;
+    if (tess_native) {
+        // Built by a worker, its lifts and its compile off the command
+        // processor; until then the draw goes through the LS pass.
+        GfxPipeline* const built = gfx_lookup(key);
+        if (!built && g_async_pipelines && !g_dump_spirv && !g_token_user_data_check) {
+            queue_native_pipeline(key, s, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims, vs_sampler_modes, ps_sampler_modes,
+                                  vertex_plan);
+            return tess_native_wait();
+        }
+        if (built && built->building) return tess_native_wait();
+    }
+    const bool layout_only = !tess_native && lean_first && g_layout_from_lean && !gfx_lookup(key);
     if (layout_only) g_fallbacks_deferred.fetch_add(1, std::memory_order_relaxed);
     GfxPipeline& pl = gfx_pipeline(s, key, vs_words, fetch_words, ps_words, vs_name, ps_name, vs_dims, ps_dims,
-                                   vs_sampler_modes, ps_sampler_modes, false, vertex_plan, !lean_first, layout_only);
+                                   vs_sampler_modes, ps_sampler_modes, tess_native, vertex_plan, tess_native || !lean_first, layout_only);
     pipeline_timer.next(kPhaseBind);
+    if (tess_native && (pl.failed || !pl.tess_native || !pl.pipeline)) return tess_native_refuse("its native pipeline was not built");
     if (pl.failed) {
         draw_failed(kFailPipeline);
         // Which pipelines, once each: the exit report only counts them.
@@ -12884,7 +13628,9 @@ static bool draw_impl(const GpuDraw& d) {
     // when the no-fallback variant reads its slot, or when no variant says:
     // otherwise the slot keeps the register file's table, which for a draw
     // from a host-draw token belongs to another draw.
-    if (gx_geometry && d.gx_render && use_vertex_input && !vertex_table && gx_geometry->vtx_ud < 15) {
+    // (Not a tessellated draw's: its vertex input is the LS's, and the table
+    // slot is the LS's own user data, not the domain shader's.)
+    if (gx_geometry && d.gx_render && use_vertex_input && !vertex_table && gx_geometry->vtx_ud < 15 && !t_tess) {
         const GfxPipeline* const lean = pl.lean_variant;
         const std::uint32_t reads = lean && !lean->failed ? lean->table_reads[0] : ~0u;
         if ((reads >> gx_geometry->vtx_ud) & 1) {
@@ -12892,7 +13638,8 @@ static bool draw_impl(const GpuDraw& d) {
             if (vertex_table) g_vertex_tables_with_input.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    if (g.queued + 2 >= kMaxQueued * kStageSlots) {
+    // A native hull pipeline's LS and hull take a params block each too.
+    if (g.queued + (pl.tess_native ? 4u : 2u) >= kMaxQueued * kStageSlots) {
         // A frame with more draws than the params ring holds is submitted in
         // the middle. Where that boundary falls depends on how many draws the
         // frame has, which is exactly what removing a pass changes - so it has
@@ -12913,7 +13660,10 @@ static bool draw_impl(const GpuDraw& d) {
     VkDescriptorBufferInfo ubi[2]{};
     const std::size_t image_writes =
         pl.vs.meta().images.size() + pl.vs.meta().samplers.size() + pl.ps.meta().images.size() + pl.ps.meta().samplers.size();
-    const std::size_t buffer_writes = pl.vs.meta().buffers.size() + pl.ps.meta().buffers.size();
+    // With a native hull pipeline's set 4: its two params blocks and the LS's
+    // and the hull's buffers.
+    const std::size_t tess_writes = pl.tess_native ? 2 + pl.tess_ls.meta().buffers.size() + pl.tess_hs.buffers.size() : 0;
+    const std::size_t buffer_writes = pl.vs.meta().buffers.size() + pl.ps.meta().buffers.size() + tess_writes;
     static thread_local std::vector<VkWriteDescriptorSet> writes;
     static thread_local std::vector<VkDescriptorImageInfo> infos;
     static thread_local std::vector<VkDescriptorBufferInfo> buffer_infos;
@@ -13369,6 +14119,58 @@ static bool draw_impl(const GpuDraw& d) {
             draw_stamp.skip();
         }
     }
+    // A native hull pipeline's set 4 (kTessNativeSet): the LS's and the hull's
+    // params blocks and constant buffers, resolved from the user data the
+    // planning built (tess_ls_pass_locked: the LS's from its GX records, the
+    // hull's with the tessellation constants' V#). Its stages bind every
+    // buffer or the draw goes through the LS pass, as it does when the domain
+    // or pixel shader's do not all bind. (A particle LS's set 4 is written
+    // once the pipeline the draw binds is known, below.)
+    const GfxPipeline* set4_pl = nullptr;
+    VkDescriptorSet tess_set = VK_NULL_HANDLE;
+    std::uint32_t tess_set_offsets[2] = {}, tess_set_dynamic = 0;
+    if (pl.tess_native) {
+        if (!all_bound) return tess_native_refuse("a constant buffer of its domain or pixel shader does not bind", true);
+        const gcn::TranslateResult& lm = pl.tess_ls.meta();
+        const gcn::TranslateResult& hm = pl.tess_hs;
+        gcn::StageParams lp{}, hp{};
+        lp.l1_table = g.l1.address;
+        hp.l1_table = g.l1.address;
+        std::memcpy(lp.user_sgpr, t_tess->ls_user, sizeof(lp.user_sgpr));
+        std::memcpy(hp.user_sgpr, t_tess->hs_user, sizeof(hp.user_sgpr));
+        const std::size_t ls_first = buffer_infos.size();
+        resolve_stage_buffers(lm, lp.user_sgpr, lp, buffer_infos);
+        const std::size_t hs_first = buffer_infos.size();
+        resolve_stage_buffers(hm, hp.user_sgpr, hp, buffer_infos);
+        if (!every_buffer_bound(lp, lm) || !every_buffer_bound(hp, hm)) {
+            return tess_native_refuse("a constant buffer of its LS or hull does not bind", true);
+        }
+        tess_set = alloc_set_locked(pl.tess_set_layout);
+        if (!tess_set) return tess_native_refuse("no descriptor set for its LS and hull", true);
+        set4_pl = &pl;
+        VkDescriptorBufferInfo lubi{}, hubi{};
+        alloc_params_slot_locked(lp, lubi);
+        alloc_params_slot_locked(hp, hubi);
+        tess_set_offsets[0] = static_cast<std::uint32_t>(lubi.offset);
+        tess_set_offsets[1] = static_cast<std::uint32_t>(hubi.offset);
+        tess_set_dynamic = set_cache_on() ? 2 : 0;
+        const std::size_t params_at = buffer_infos.size();
+        buffer_infos.push_back(set_cache_on() ? g_params_desc : lubi);  // dynamic: the offsets above select the blocks
+        buffer_infos.push_back(set_cache_on() ? g_params_desc : hubi);
+        const auto put = [&](std::uint32_t binding, VkDescriptorType type, std::size_t info) {
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = tess_set;
+            w.dstBinding = binding;
+            w.descriptorCount = 1;
+            w.descriptorType = type;
+            w.pBufferInfo = &buffer_infos[info];
+            writes.push_back(w);
+        };
+        put(kTessNativeLsParams, params_descriptor_type(), params_at);
+        put(kTessNativeHsParams, params_descriptor_type(), params_at + 1);
+        for (std::size_t i = 0; i < lm.buffers.size(); ++i) put(lm.buffers[i].binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, ls_first + i);
+        for (std::size_t i = 0; i < hm.buffers.size(); ++i) put(hm.buffers[i].binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, hs_first + i);
+    }
     // From here the draw's descriptor writes and commands go to the recorder
     // thread (recorder.cpp), except while something that must see them in
     // place is on: NVIDIA's checkpoints, GPU profiling, a draw capture. AMD's
@@ -13388,7 +14190,7 @@ static bool draw_impl(const GpuDraw& d) {
     // page-table fallback, where the driver can drop the walks and the V#
     // loads that only fed them. Same bindings, so the sets written above fit.
     GfxPipeline* bind_pl = &pl;
-    if (g.cb_lean && any_buffers && all_bound) {
+    if (g.cb_lean && any_buffers && all_bound && !pl.tess_native) {  // a native hull pipeline is its own
         if (!pl.lean_variant && !pl.lean_building) {
             const std::uint64_t lean_key = fnv1a("cb-lean", 7, key);
             // A worker builds the variant only while a created fallback can draw
@@ -13404,7 +14206,12 @@ static bool draw_impl(const GpuDraw& d) {
         }
         if (pl.lean_variant) {
             GfxPipeline& lean = *pl.lean_variant;
-            if (!lean.failed && lean.layout == pl.layout) bind_pl = &lean;  // the sets fit its layout
+            // The sets fit its layout - or, with a set 4 of its own (a particle
+            // LS's constant buffers), its sets 0 and 1 are laid out alike and
+            // set 4 was written for it above.
+            const bool fits = lean.layout == pl.layout || (lean.tess_set_layout && !lean.tess_native && lean.set_layouts[0] == pl.set_layouts[0] &&
+                                                           lean.set_layouts[1] == pl.set_layouts[1]);
+            if (!lean.failed && fits) bind_pl = &lean;
         }
     }
     if (skipped_tables[0] | skipped_tables[1]) {
@@ -13545,6 +14352,66 @@ static bool draw_impl(const GpuDraw& d) {
             cd.vinput.attributes = vertex_input.attributes;
             cd.vinput.binding_va.assign(vertex_input.va, vertex_input.va + vertex_input.bindings.size());
         }
+        if (t_tess && bind_pl->tess_hw) {
+            // The host's tessellator: the stages around the domain shader, as
+            // built for this pipeline (draw_capture.h CaptureTess).
+            const TessDraw& t = *t_tess;
+            CaptureTess& ct = cd.tess;
+            ct.present = true;
+            ct.hull = s.tess_hull;
+            ct.attrs = bind_pl->tess_attrs;
+            ct.control_points = s.tess_control_points;
+            ct.attr_vec4s = bind_pl->tess_attrs ? bind_pl->tess_attr_vec4s : 0;
+            ct.window = s.tess_window;
+            ct.quads = s.tess_quads;
+            ct.cw = s.tess_cw;
+            ct.spacing = s.tess_spacing;
+            std::memcpy(ct.outer, s.tess_outer, sizeof(ct.outer));
+            std::memcpy(ct.inner, s.tess_inner, sizeof(ct.inner));
+            ct.vertex_spirv = ct.attrs ? bind_pl->tess_ls.meta().spirv : gcn::make_tess_passthrough_vs();
+            ct.control_spirv = ct.hull ? tess_hull_spirv(s) : gcn::make_tess_constant_tcs(s.tess_outer, s.tess_inner, s.tess_control_points, ct.attr_vec4s);
+            if (CachedProgram* ls = program_at(t.ls_va)) ct.ls_words = &ls->words;
+            if (t.ls_fetch_va) {
+                if (const FetchProgram* f = fetch_program_at(t.ls_fetch_va)) ct.ls_fetch_words = &f->words;
+            }
+            if (ct.hull) {
+                if (CachedProgram* hs = program_at(t.hs_va)) ct.hs_words = &hs->words;
+            }
+            ct.ls_rsrc1 = t.ls_rsrc1;
+            ct.ls_rsrc2 = t.ls_rsrc2;
+            ct.hs_rsrc1 = t.hs_rsrc1;
+            ct.hs_rsrc2 = t.hs_rsrc2;
+            // The LS's user data as its stage read it: the game's hull's from the
+            // LS pass; the vertex stage's where the params' vertex-formats slot
+            // holds it (built from the GX records above).
+            std::memcpy(ct.ls_user, ct.attrs ? stage_params[0].vertex_formats : t.ls_user, sizeof(ct.ls_user));
+            std::memcpy(ct.hs_user, t.hs_user, sizeof(ct.hs_user));
+            std::memcpy(ct.tess_constants, t.tess_constants, sizeof(ct.tess_constants));
+            if (ct.hull) {
+                ct.lds_buffer = t.lds_buffer;
+                ct.lds_offset = t.lds_address - t.lds_ring_address;
+                ct.lds_bytes = t.lds_bytes;
+            }
+            ct.index_va = t.index_va;
+            ct.index_type = t.index_type;
+            ct.count = t.count;
+            ct.instances = t.hull ? t.instances : 1;
+            ct.first_instance = t.hull ? t.first_instance : 0;
+            ct.first_point = t.hull ? t.first_point : 0;
+            ct.base_vertex = t.base_vertex;
+            // The LS's elements as vertex input, as a vertex shader's would be.
+            if (d.gx_objects && d.gx_objects->geometry && ct.ls_fetch_words) {
+                const FetchProgram* f = fetch_program_at(t.ls_fetch_va);
+                VertexInputPlan plan;
+                if (f && plan_vertex_input(f->words, f->hash, *d.gx_objects, plan)) {
+                    ct.ls_vertex_input = true;
+                    ct.ls_vinput.elements = plan.elements;
+                    ct.ls_vinput.bindings = plan.bindings;
+                    ct.ls_vinput.attributes = plan.attributes;
+                    ct.ls_vinput.binding_va.assign(plan.va, plan.va + plan.bindings.size());
+                }
+            }
+        }
         cd.fixed = fixed_state(s);
         for (int t = 0; t < 8; ++t) {
             cd.color[t] = s.color[t];
@@ -13554,7 +14421,7 @@ static bool draw_impl(const GpuDraw& d) {
         cd.depth_layer = s.depth_layer;
         cd.count = d.index_count;
         cd.instances = d.instance_count;
-        cd.base_vertex = in.base_vertex;
+        cd.base_vertex = t_tess ? 0 : in.base_vertex;  // as drawn (vtx_off below): a tessellated draw's LS took the base vertex
         cd.index_va = d.index_va;
         cd.index_type = d.index_type;
         cd.indirect_va = d.indirect_va;
@@ -13578,6 +14445,10 @@ static bool draw_impl(const GpuDraw& d) {
         // shader's discard, and from it the vertex shader's host bits.
         cd.translate.set("ps_clip_discard", json::hex(bind_pl->clip_discard));
         cd.translate.set("vs_invariant", g_vs_invariant);
+        if (cd.tess.present) {
+            cd.translate.set("tess_lds_bound", tess_lds_bound());  // the tessellation stages' LDS checks (TranslateOptions::tess_lds_bound)
+            cd.translate.set("bindless", g.bindless);
+        }
         capture_session = capture_begin_locked(std::move(cd));
     }
     draw_stamp.to(kRenderCostVariant);
@@ -13713,9 +14584,43 @@ static bool draw_impl(const GpuDraw& d) {
             g_recorded.library_set = true;
         }
     }
+    // A particle pipeline whose lifted LS reads constant buffers (the no-fallback
+    // variant the draw binds, or a fallback laid out from it): its set 4, from
+    // the LS's user data in the vertex-formats slot of the evaluation stage's
+    // params, written now that the pipeline is known.
+    if (!bind_pl->tess_native && bind_pl->tess_set_layout && bind_pl->tess_ls.lifted) {
+        const gcn::TranslateResult& lm = bind_pl->tess_ls.meta();
+        gcn::StageParams lp{};
+        lp.l1_table = g.l1.address;
+        std::memcpy(lp.user_sgpr, stage_params[0].vertex_formats, sizeof(lp.user_sgpr));
+        static thread_local std::vector<VkDescriptorBufferInfo> ls_infos;
+        static thread_local std::vector<VkWriteDescriptorSet> ls_writes;
+        ls_infos.clear();
+        ls_writes.clear();
+        ls_infos.reserve(lm.buffers.size());
+        resolve_stage_buffers(lm, lp.user_sgpr, lp, ls_infos);
+        if (!every_buffer_bound(lp, lm) || !(tess_set = alloc_set_locked(bind_pl->tess_set_layout))) {
+            static std::atomic<int> logs{0};
+            if (logs.fetch_add(1) < 4) host_log("render: pipeline %s: its LS's constant buffers do not all bind; draw skipped", bind_pl->name.c_str());
+            draw_failed(kFailTessLs);
+            return false;
+        }
+        for (std::size_t i = 0; i < lm.buffers.size(); ++i) {
+            VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = tess_set;
+            w.dstBinding = lm.buffers[i].binding;
+            w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w.pBufferInfo = &ls_infos[i];
+            ls_writes.push_back(w);
+        }
+        cmds.update_sets(ls_writes.data(), ls_writes.size());
+        set4_pl = bind_pl;
+    }
     const std::uint32_t params_offsets[2] = {static_cast<std::uint32_t>(ubi[0].offset), static_cast<std::uint32_t>(ubi[1].offset)};
     const VkPipelineLayout draw_layout = bind_pl->layout ? bind_pl->layout : g.gfx_pipe_layout;
     cmds.bind_sets(draw_layout, sets, set_cache_on() ? params_offsets : nullptr, bind_pl->vs.meta().bindless);
+    if (tess_set && bind_pl == set4_pl) cmds.bind_stage_set(draw_layout, kTessNativeSet, tess_set, tess_set_dynamic, tess_set_offsets);
     if (cb_push_on() && any_buffers) {
         // The draw's constant buffers, each bound over its own range.
         std::uint32_t bindings[2 * gcn::kMaxBuffers];
@@ -13799,7 +14704,9 @@ static bool draw_impl(const GpuDraw& d) {
     // adds to every index before the vertex shader sees it in V0. We inline
     // the fetch shader faithfully (so any user-SGPR vertex add still applies);
     // this is the separate hardware add, passed as vertexOffset/firstVertex.
-    const std::int32_t vtx_off = t_tess ? 0 : in.base_vertex;  // the LS pass took the index buffer and base vertex
+    // The LS pass took the index buffer and base vertex; a native hull
+    // pipeline's LS is the vertex stage, and they are the draw's.
+    const std::int32_t vtx_off = t_tess ? (t_tess->native ? t_tess->base_vertex : 0) : in.base_vertex;
     if (vtx_off) {
         static std::atomic<int> vlogs{0};
         if ((vlogs.load(std::memory_order_relaxed) < 16 && vlogs.fetch_add(1) < 16))
@@ -13901,6 +14808,14 @@ static bool draw_impl(const GpuDraw& d) {
     bump(g.draws_ps[draw_ps_kind(*bind_pl)]);
     const int vs_kind = draw_vs_kind(*bind_pl, use_vertex_input, fetch_words.empty() && !s.tess_hw && !s.domain_level);
     bump(g.draws_vs[vs_kind]);
+    if (bind_pl->tess_hw) {
+        bump(g.draws_tess[kDrawTess]);
+        if (bind_pl->vs.lifted) bump(g.draws_tess[kDrawTessDomainLifted]);
+        if (bind_pl->tess_ls.lifted) bump(g.draws_tess[kDrawTessLsLifted]);
+        if (bind_pl->tess_hull_lifted) bump(g.draws_tess[kDrawTessHullLifted]);
+        if (bind_pl->vs.lifted && bind_pl->tess_ls.lifted && bind_pl->tess_hull_lifted) bump(g.draws_tess[kDrawTessAllLifted]);
+        if (bind_pl->tess_native) bump(g.draws_tess[kDrawTessNative]);
+    }
     if (vs_kind == kDrawVsOther) {
         const int why = s.tess_hw                          ? kVsWhyTessHw
                         : s.domain_level                   ? kVsWhyDomain

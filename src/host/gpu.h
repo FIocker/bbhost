@@ -360,7 +360,15 @@ struct GpuStats {
     // lifter does not take (kDrawVsOther) by why (DrawVsWhy).
     std::uint64_t draws_vs[4];
     std::uint64_t draws_vs_why[16];
+    // The draws on the host's tessellator (DrawTess): all of them, and those
+    // whose evaluation, vertex and control stages ran lifted.
+    std::uint64_t draws_tess[6];
 };
+// A draw on the host's tessellator: counted, and by which of its stages ran as
+// typed lifts (BBHOST_LIFT_TESS) - the domain shader as the evaluation stage,
+// the LS as the vertex stage, the hull shader as the control stage, all three;
+// and the game's own hull draws drawn as native pipelines (no LS pass).
+enum DrawTess { kDrawTess, kDrawTessDomainLifted, kDrawTessLsLifted, kDrawTessHullLifted, kDrawTessAllLifted, kDrawTessNative, kDrawTessCount };
 // How a draw's pixel shader ran: its typed lift (BBHOST_DECOMP), a
 // translation in the no-fallback pipeline (not lifted, or not asked to be),
 // the page-table fallback pipeline's translation, or no pixel shader at all.
