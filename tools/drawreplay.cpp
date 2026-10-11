@@ -1796,6 +1796,18 @@ int replay_main(const Options& o) {
         }
         if (!a.stored.empty()) std::printf("  A vs variant stores: %s (%zu bytes in %zu written buffers)\n", av_stores.empty() ? "identical" : av_stores.c_str(),
                                            stored_bytes(a), a.stored.size());
+        // The variant again with the sentinel sink: a variant that reads guest
+        // memory the capture lacks (its own page-table walks) changes output.
+        {
+            ro.name = "variant-sentinel";
+            ro.sentinel = true;
+            const RunResult vs = r.run(ro);
+            ro.sentinel = false;
+            const Verdict svv = compare_runs(v.outputs, vs.outputs, exact, out, "variant-vs-variant-sentinel", false);
+            json::Value vsj = verdict_json(svv, svv.identical, "the variant with the sink page filled: a change means it reads guest memory the capture lacks");
+            comparisons.set("variant_vs_variant_sentinel", vsj);
+            std::printf("  variant with the sentinel sink: %s\n", svv.identical ? "output unchanged" : "OUTPUT CHANGED (the variant reads memory the capture lacks)");
+        }
         if (!o.ps.empty()) vj.set("ps", o.ps.string());
         if (!o.vs.empty()) vj.set("vs", o.vs.string());
         if (o.library) vj.set("library", true);
