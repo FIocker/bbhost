@@ -2103,6 +2103,60 @@ private:
         ++buffer_loads;
     }
 
+    // buffer_store_dword* the reference makes through a binding (translate.cpp
+    // store_bound): dword (soffset + offset12) >> 2 + k of the V#'s binding,
+    // written where it is inside the V#'s range in dwords (StageParams::
+    // cb_stride) and this invocation's EXEC bit is set - as GCN performs a
+    // store only in range and in the lanes EXEC holds. A vertex shader only,
+    // whose invocations have no helpers, and outside loops, so each store
+    // runs once per invocation where the translation's runs.
+    std::size_t buffer_stores = 0;
+    void mubuf(const Inst& in) {
+        if (in.op < 28 || in.op > 31) {
+            reject(std::string(mnemonic(in)) + " is not lifted");
+            return;
+        }
+        if (opt.stage != Stage::Vertex) {
+            reject(std::string(mnemonic(in)) + " outside a vertex shader is not lifted");
+            return;
+        }
+        const auto site = ref.buffer_at.find(in.offset);
+        if (site == ref.buffer_at.end() || site->second >= buffer_vars.size() || !ref.buffers[site->second].written) {
+            reject(std::string(mnemonic(in)) + " is not a store the reference makes through a binding");
+            return;
+        }
+        if (in.idxen || in.offen || in.addr64) {
+            reject(std::string(mnemonic(in)) + ": the reference's bound store has another shape");
+            return;
+        }
+        if (!open_loops.empty()) {
+            reject(std::string(mnemonic(in)) + " inside a loop is not lifted");
+            return;
+        }
+        const Val e = exec_lane();
+        if (e.constant && !e.set) return;  // no invocation stores
+        const int n = in.op == 28 ? 1 : in.op == 29 ? 2 : in.op == 30 ? 4 : 3;
+        const std::uint32_t index = site->second;
+        const Id first = shift(spv::OpShiftRightLogical, ibin(spv::OpIAdd, cu(in.offset12), as_u(read(in.soffset, in))), cu(2));
+        const Id bias = params_load(bias_loads, 4, index);
+        const Id range_dw = params_load(stride_loads, 5, index);
+        for (int k = 0; k < n; ++k) {
+            const Id v = as_u(value(256 + in.vdata + k));
+            const Id at = ibin(spv::OpIAdd, first, cu(static_cast<std::uint32_t>(k)));
+            Id cond = m.emit(spv::OpULessThan, t_bool, {at, range_dw});
+            if (!e.constant) cond = m.emit(spv::OpLogicalAnd, t_bool, {cond, e.id});
+            const Id l_store = m.fresh(), l_merge = m.fresh();
+            m.emit_void(spv::OpSelectionMerge, {l_merge, 0u});
+            m.emit_void(spv::OpBranchConditional, {cond, l_store, l_merge});
+            m.label(l_store);
+            m.store(m.access_chain(p_ssbo_u32, buffer_vars[index], {cu(0), ibin(spv::OpIAdd, bias, at)}), v);
+            m.emit_void(spv::OpBranch, {l_merge});
+            cur_label = m.label(l_merge);
+        }
+        note += " stored";
+        ++buffer_stores;
+    }
+
     // TranslateOptions::vertex_formats_from_params, as translate.cpp
     // load_vertex_element_from_params: the element converted by its descriptor
     // (vertex_format_descriptor) - specialization constant kVertexFormatSpecId
@@ -3077,6 +3131,7 @@ private:
         case Enc::VINTRP: vintrp(in); break;
         case Enc::MIMG: mimg(in); break;
         case Enc::MTBUF: mtbuf(in); break;
+        case Enc::MUBUF: mubuf(in); break;
         case Enc::EXP: exp(in); break;
         case Enc::DS: ds(in); break;
         default: reject(std::string(mnemonic(in) ? mnemonic(in) : "unknown") + " is not lifted"); break;
@@ -3196,6 +3251,11 @@ private:
         case Enc::MTBUF:
             if (in.op >= 4) return false;
             rd_pair(in.srsrc);  // the V# the reference traced to its binding
+            return true;
+        case Enc::MUBUF:
+            if (in.op < 28 || in.op > 31) return false;  // buffer_store_dword*: the V# and the offset SGPR
+            rd_pair(in.srsrc);
+            rd(in.soffset);
             return true;
         case Enc::VINTRP: case Enc::EXP:
             return true;
@@ -4972,6 +5032,10 @@ private:
                                        "as GCN checks it)"
                                      : std::string()) +
                        "; " + std::to_string(masked_writes) + " VGPR writes under a varying EXEC become selects");
+        if (buffer_stores) {
+            head.push_back(std::to_string(buffer_stores) + " buffer stores, every one through a binding the reference writes, each dword where "
+                           "it is inside the V#'s range and this invocation's EXEC bit is set, outside loops");
+        }
         if (clip_discard) {
             head.push_back("a pixel whose clip distances (the vertex stage's, at location " + std::to_string(opt.ps_clip_location()) +
                            ") are negative is discarded at entry, by the translator's own prologue");

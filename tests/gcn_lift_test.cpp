@@ -3212,9 +3212,251 @@ void run() {
 
 }  // namespace vertex
 
+// ---- buffer stores in a vertex shader -------------------------------------------------
+// The particle copies (VS_VFX_StandardParticle, VS_VFX_SparkParticle) store
+// with buffer_store_dword* through a V# from a table, at the V#'s base plus an
+// SGPR offset plus the instruction's: the reference writes the V#'s binding
+// (BufferBinding::written, bound whole: ranged), and the lift writes dword
+// (soffset + offset12) >> 2 + k where it is inside the V#'s range and the
+// invocation's EXEC bit is set - checked here through an interpreter of the
+// lifted module that keeps the storage buffers' words, at offsets inside,
+// straddling and past the range, with a bias, and with a constant soffset.
+namespace vertex_stores {
+
+struct Asm {
+    std::vector<std::uint32_t> w;
+    void smrd(std::uint32_t op, std::uint32_t sdst, std::uint32_t sbase, std::uint32_t offset_dw) {
+        w.push_back(0xc0000000u | op << 22 | sdst << 15 | (sbase / 2) << 9 | 1u << 8 | offset_dw);
+    }
+    void vmov(std::uint32_t vdst, std::uint32_t src0) { w.push_back(0x7e000000u | vdst << 17 | 1u << 9 | src0); }
+    // buffer_store_dword* (op 28 x1, 29 x2, 30 x4, 31 x3) vdata, s[srsrc..+3], soffset (a scalar code), offset12;
+    // `offen`: the VGPR vaddr adds its value (an address form the reference does not bind).
+    void store(std::uint32_t op, std::uint32_t vdata, std::uint32_t srsrc, std::uint32_t soffset, std::uint32_t offset12, bool offen = false,
+               std::uint32_t vaddr = 0) {
+        w.push_back(0xe0000000u | op << 18 | (offen ? 1u << 12 : 0u) | offset12);
+        w.push_back(vaddr | vdata << 8 | (srsrc / 4) << 16 | soffset << 24);
+    }
+    void waitcnt() { w.push_back(0xbf8c0000u); }
+    void endpgm() { w.push_back(0xbf810000u); }
+};
+
+gcn::TranslateOptions options(std::vector<std::string> exclude = {}, gcn::Stage stage = gcn::Stage::Vertex) {
+    gcn::TranslateOptions o;
+    o.stage = stage;
+    o.rsrc2 = 8u << 1;  // eight user SGPRs
+    if (stage == gcn::Stage::Pixel) o.ps_input_ena = 2;
+    o.descriptor_set = stage == gcn::Stage::Pixel ? 1 : 0;
+    o.cb_ssbo = true;
+    o.cb_no_fallback = true;
+    o.cb_ssbo_exclude = std::move(exclude);
+    return o;
+}
+
+// The V# at dword 4 of the table s[2:3] in s[8:11]; v1..v3 from s5..s7; stores
+// at s4 + 0 (one dword), s4 + 8 (two) and at the constant 0 + 4 (one).
+std::vector<std::uint32_t> program(bool offen = false) {
+    Asm a;
+    a.smrd(2, 8, 2, 4);  // s_load_dwordx4 s[8:11], s[2:3], 0x4
+    a.waitcnt();
+    a.vmov(1, 5);
+    a.vmov(2, 6);
+    a.vmov(3, 7);
+    a.store(28, 1, 8, 4, 0, offen, 1);
+    a.store(29, 2, 8, 4, 8);
+    a.store(28, 1, 8, 128, 4);  // soffset: the inline constant 0
+    a.endpgm();
+    return a.w;
+}
+
+struct Lifted {
+    gcn::TranslateResult ref;
+    gcn::LiftResult lift;
+};
+Lifted lift(const std::vector<std::uint32_t>& words, const gcn::TranslateOptions& o) {
+    const gcn::Program p = gcn::decode(words.data(), words.size());
+    Lifted r;
+    r.ref = gcn::translate(p, o);
+    if (!r.ref.ok()) std::fprintf(stderr, "reference failed: %s\n", r.ref.errors[0].c_str());
+    r.lift = o.stage == gcn::Stage::Vertex ? gcn::lift_vertex_shader(p, o, r.ref) : gcn::lift_pixel_shader(p, o, r.ref);
+    return r;
+}
+
+// One invocation of the lifted module: the params' user SGPRs, biases and
+// ranges, and the storage buffers by binding, which its stores change.
+struct Run {
+    bool ok = false;
+    std::string error;
+    std::map<std::uint32_t, std::vector<std::uint32_t>> buffers;
+};
+Run run(const std::vector<std::uint32_t>& spv, const std::array<std::uint32_t, 16>& user, const std::array<std::uint32_t, 16>& bias,
+        const std::array<std::uint32_t, 16>& range, std::map<std::uint32_t, std::vector<std::uint32_t>> buffers) {
+    Run r;
+    r.buffers = std::move(buffers);
+    std::map<std::uint32_t, std::uint32_t> val, constants, binding, storage;
+    struct Chain {
+        std::uint32_t base;
+        std::vector<std::uint32_t> idx;
+    };
+    std::map<std::uint32_t, Chain> chains;
+    const auto fail = [&](const std::string& why) {
+        r.error = why;
+        return r;
+    };
+    bool in_body = false;
+    std::uint32_t skip_to = 0;  // a label: the instructions before it are not run (a then-block whose condition is false)
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+        if (n == 0 || i + n > spv.size()) return fail("malformed module");
+        const std::uint32_t* a = &spv[i + 1];
+        i += n;
+        if (!in_body) {
+            if (op == 71 && a[1] == 33) binding[a[0]] = a[2];   // OpDecorate Binding
+            if (op == 59) storage[a[1]] = a[2];                  // OpVariable
+            if (op == 43) constants[a[1]] = a[2];                // OpConstant
+            if (op == 41) constants[a[1]] = 1;                   // OpConstantTrue
+            if (op == 42) constants[a[1]] = 0;                   // OpConstantFalse
+            if (op == 50) constants[a[1]] = a[2];                // OpSpecConstant: its default
+            if (op == 248) in_body = true;                       // OpLabel
+            continue;
+        }
+        if (skip_to) {
+            if (op == 248 && a[0] == skip_to) skip_to = 0;
+            continue;
+        }
+        const auto g = [&](std::uint32_t id) {
+            const auto c = constants.find(id);
+            return c != constants.end() ? c->second : val[id];
+        };
+        const auto word_of = [&](const Chain& c, bool for_store) -> std::uint32_t* {
+            if (storage[c.base] != 12) return nullptr;
+            auto b = r.buffers.find(binding[c.base]);
+            if (b == r.buffers.end() || c.idx.size() != 2 || c.idx[0] != 0 || c.idx[1] >= b->second.size()) return nullptr;
+            (void)for_store;
+            return &b->second[c.idx[1]];
+        };
+        switch (op) {
+        case 65: {  // OpAccessChain
+            Chain c{a[2], {}};
+            for (std::uint32_t k = 3; k < n - 1; ++k) c.idx.push_back(g(a[k]));
+            chains[a[1]] = c;
+            break;
+        }
+        case 61: {  // OpLoad
+            const auto c = chains.find(a[2]);
+            if (c == chains.end()) return fail("a load of something other than the params or a storage buffer");
+            if (storage[c->second.base] == 2) {
+                const auto& idx = c->second.idx;
+                if (idx.size() != 3) return fail("a params load of another shape");
+                const std::uint32_t k = idx[1] * 4 + idx[2];
+                if (k >= 16) return fail("a params entry past 16");
+                if (idx[0] == 2) val[a[1]] = user[k];
+                else if (idx[0] == 4) val[a[1]] = bias[k];
+                else if (idx[0] == 5) val[a[1]] = range[k];
+                else return fail("a params member the test does not give: " + std::to_string(idx[0]));
+            } else if (std::uint32_t* w = word_of(c->second, false)) {
+                val[a[1]] = *w;
+            } else {
+                return fail("a load the test does not give");
+            }
+            break;
+        }
+        case 62: {  // OpStore
+            const auto c = chains.find(a[0]);
+            std::uint32_t* w = c == chains.end() ? nullptr : word_of(c->second, true);
+            if (!w) return fail("a store outside the storage buffers the test gives");
+            *w = g(a[1]);
+            break;
+        }
+        case 124: val[a[1]] = g(a[2]); break;                          // OpBitcast
+        case 128: val[a[1]] = g(a[2]) + g(a[3]); break;                // OpIAdd
+        case 176: val[a[1]] = g(a[2]) < g(a[3]); break;                // OpULessThan
+        case 167: val[a[1]] = g(a[2]) && g(a[3]); break;               // OpLogicalAnd
+        case 194: val[a[1]] = g(a[2]) >> (g(a[3]) & 31); break;        // OpShiftRightLogical
+        case 196: val[a[1]] = g(a[2]) << (g(a[3]) & 31); break;        // OpShiftLeftLogical
+        case 199: val[a[1]] = g(a[2]) & g(a[3]); break;                // OpBitwiseAnd
+        case 169: val[a[1]] = g(a[2]) ? g(a[3]) : g(a[4]); break;      // OpSelect
+        case 247: break;                                               // OpSelectionMerge
+        case 250: if (!g(a[0])) skip_to = a[2]; break;                 // OpBranchConditional: the false label is the merge
+        case 249: case 248: case 253: case 56: break;                  // OpBranch, OpLabel, OpReturn, OpFunctionEnd
+        default: return fail("unsupported opcode " + std::to_string(op));
+        }
+    }
+    r.ok = true;
+    return r;
+}
+
+void cases() {
+    const Lifted l = lift(program(), options());
+    CHECK(lane_ops::lifted_valid(l.lift));
+    CHECK(lane_ops::proof_has(l.lift, "3 buffer stores, every one through a binding the reference writes"));
+    const std::string path = "user_sgpr[2]->load(+16)";
+    int store_binding = -1;
+    for (std::size_t k = 0; k < l.ref.buffers.size(); ++k) {
+        if (l.ref.buffers[k].path.str() == path) store_binding = static_cast<int>(k);
+    }
+    CHECK(store_binding >= 0 && l.ref.buffers[static_cast<std::size_t>(store_binding)].written &&
+          l.ref.buffers[static_cast<std::size_t>(store_binding)].ranged && !l.ref.buffers[static_cast<std::size_t>(store_binding)].indexed);
+    CHECK(l.ref.walks.empty());
+    if (!l.lift.ok() || store_binding < 0) return;
+    const std::uint32_t b_table = l.ref.buffers[0].binding == l.ref.buffers[static_cast<std::size_t>(store_binding)].binding ? l.ref.buffers[1].binding
+                                                                                                                           : l.ref.buffers[0].binding;
+    const std::uint32_t b_out = l.ref.buffers[static_cast<std::size_t>(store_binding)].binding;
+    for (const auto& [offset, range_dw, bias_dw] : {std::array<std::uint32_t, 3>{0, 10, 0}, {32, 10, 0}, {28, 10, 0}, {4, 3, 0}, {8, 16, 6},
+                                                    {0xfffffffcu, 10, 0}, {2, 10, 0}, {0, 0, 0}}) {
+        std::array<std::uint32_t, 16> user{}, bias{}, range{};
+        user[4] = offset;
+        user[5] = 0xa0a0a0a0u;
+        user[6] = 0xb1b1b1b1u;
+        user[7] = 0xc2c2c2c2u;
+        bias[static_cast<std::size_t>(store_binding)] = bias_dw;
+        range[static_cast<std::size_t>(store_binding)] = range_dw;
+        std::vector<std::uint32_t> out(32, 0x55555555u);
+        const Run r = run(l.lift.spirv, user, bias, range, {{b_table, std::vector<std::uint32_t>(16, 0)}, {b_out, out}});
+        if (!r.ok) std::fprintf(stderr, "vertex stores at %u: %s\n", offset, r.error.c_str());
+        CHECK(r.ok);
+        if (!r.ok) continue;
+        // GCN: dword (soffset + offset12) >> 2 + k of the V#'s range, written only inside it.
+        std::vector<std::uint32_t> want = out;
+        const auto put = [&](std::uint32_t byte, std::uint32_t v) {
+            const std::uint32_t at = byte >> 2;
+            if (at < range_dw) want[bias_dw + at] = v;
+        };
+        put(offset + 0, user[5]);
+        put(offset + 8, user[6]);
+        put(offset + 12, user[7]);
+        put(0 + 4, user[5]);
+        const std::vector<std::uint32_t>& got = r.buffers.at(b_out);
+        if (got != want) {
+            for (std::size_t k = 0; k < want.size(); ++k) {
+                if (got[k] != want[k]) std::fprintf(stderr, "vertex stores at byte %u (range %u, bias %u): dword %zu holds %08x, expected %08x\n",
+                                                    offset, range_dw, bias_dw, k, got[k], want[k]);
+            }
+            ++g_failures;
+        }
+    }
+    // A store with a VGPR offset keeps the page-table walk (its address is
+    // per lane), and the lift does not take it; nor one left to the page table,
+    // nor one in a pixel shader.
+    CHECK(rejected_with(lift(program(true), options()).lift, "is not a store the reference makes through a binding"));
+    CHECK(rejected_with(lift(program(), options({path})).lift, "is not a store the reference makes through a binding"));
+    {
+        std::vector<std::uint32_t> w = program();
+        w.pop_back();
+        w.push_back(0xf8000000u | 1u << 12 | 1u << 11 | 0xfu);  // exp mrt0 v1, v1, v1, v1 done vm
+        w.push_back(0x01010101u);
+        w.push_back(0xbf810000u);
+        CHECK(rejected_with(lift(w, options({}, gcn::Stage::Pixel)).lift, "outside a vertex shader is not lifted"));
+    }
+}
+
+void run() { cases(); }
+
+}  // namespace vertex_stores
+
 int main(int argc, char** argv) {
     // Hand-encoded programs first: they need no game files.
     vertex::run();
+    vertex_stores::run();
     control_flow::run();
     cndmask_modifiers();
     packed_exports();
