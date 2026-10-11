@@ -1161,6 +1161,12 @@ void copy_versions_put_in_place_locked(int why);
 // covers part of one: put them in place first), or kCopyVersionNone.
 enum { kCopyVersionNone, kCopyVersionInside, kCopyVersionStraddles };
 int copy_version_lookup_locked(std::uint64_t base, std::uint64_t bytes, Located* out);
+// Draw captures take a binding's bytes from the guest memory it imports. A
+// binding resolved to a copy of guest memory taken as the draw records (a
+// YEBIS window's, the aligned scratch) is noted with the guest address its
+// first byte stands for (gpu.cpp keeps the last few); 0 when none is noted.
+void note_copy_binding_locked(const VkDescriptorBufferInfo& info, std::uint64_t guest);
+std::uint64_t copy_binding_guest_locked(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range);
 // The bytes of [base, base + bytes) as this point in the stream has them, over
 // `to` (which holds guest memory's): for a snapshot taken as a draw records.
 void copy_versions_overlay_locked(std::uint64_t base, std::uint64_t bytes, std::uint8_t* to);

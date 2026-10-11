@@ -618,7 +618,18 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
             } else {
                 std::uint64_t va = 0;
                 const std::uint8_t* bytes = imported_bytes_locked(info.buffer, info.offset, info.range, &va);
-                if (!bytes) return reject(where + " is not over imported guest memory");
+                std::vector<std::uint8_t> copied;
+                if (!bytes) {
+                    // A copy of guest memory taken as the draw recorded (a YEBIS
+                    // window's, the aligned scratch): the guest bytes it holds,
+                    // read now, as the copy was this recording.
+                    va = copy_binding_guest_locked(info.buffer, info.offset, info.range);
+                    if (!va || !hle_kernel_va_mapped(va, info.range)) return reject(where + " is not over imported guest memory or a copy of it");
+                    copied.resize(info.range);
+                    read_guest_locked(va, info.range, copied.data());
+                    bytes = copied.data();
+                    bj.set("bound_from", "a copy taken as the draw recorded");
+                }
                 bj.set("kind", "guest");
                 bj.set("guest_va", json::hex(va));
                 s.blob(name, bytes, info.range);

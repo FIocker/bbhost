@@ -8528,8 +8528,9 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
             copy_versions_put_in_place_locked(kCvStraddle);
             version = kCopyVersionNone;
         }
+        bool in_window = false;  // loc is a window's copy (a capture reads its guest bytes)
         if (outcome == kUnmapped && version == kCopyVersionNone &&
-            (b.written || t_draw_windows.empty() || !draw_window_locked(base, bytes, loc))) {
+            (b.written || t_draw_windows.empty() || !(in_window = draw_window_locked(base, bytes, loc)))) {
             loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
         }
         if (g_import_audit && base) audit_range(base, bytes, loc.buffer && loc.avail >= bytes ? kUseBound : kUsePageTable);
@@ -8605,6 +8606,8 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                     params.cb_valid |= 1u << i;
                     params.cb_bias_dw[i] = 0;
                     outcome = kBound;
+                    // The guest bytes, unless a copy-back's copy laid over them.
+                    if (version == kCopyVersionNone && copy_version_lookup_locked(base, bytes, nullptr) == kCopyVersionNone) note_copy_binding_locked(info, base);
                     g_cb_realigned.fetch_add(1, std::memory_order_relaxed);
                     g_cb_realigned_bytes.fetch_add(bytes, std::memory_order_relaxed);
                 }
@@ -8618,6 +8621,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 params.cb_valid |= 1u << i;
                 params.cb_bias_dw[i] = static_cast<std::uint32_t>(bias / 4);
                 outcome = kBound;
+                if (in_window) note_copy_binding_locked(info, base - bias);
                 note_arena_read(kArenaConstants, base, bytes);
                 // The draw writes this memory as it runs: no mirror copy made in
                 // this recording serves it as vertex or index data before that.

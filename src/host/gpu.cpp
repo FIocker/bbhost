@@ -4854,6 +4854,27 @@ void defer_destroy_private_view(VkImageView view) {
     if (view) g.slots[g.slot].dead_views.push_back(view);
 }
 
+namespace {
+struct CopyBinding {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0, range = 0;
+    std::uint64_t guest = 0;
+};
+CopyBinding g_copy_bindings[64];  // under g.mu
+std::size_t g_copy_binding_next = 0;
+}  // namespace
+
+void note_copy_binding_locked(const VkDescriptorBufferInfo& info, std::uint64_t guest) {
+    g_copy_bindings[g_copy_binding_next++ % 64] = {info.buffer, info.offset, info.range, guest};
+}
+std::uint64_t copy_binding_guest_locked(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize range) {
+    for (std::size_t k = 1; k <= 64 && k <= g_copy_binding_next; ++k) {  // the latest first: the scratch ring reuses offsets
+        const CopyBinding& c = g_copy_bindings[(g_copy_binding_next - k) % 64];
+        if (c.buffer == buffer && c.offset == offset && c.range == range) return c.guest;
+    }
+    return 0;
+}
+
 const std::uint8_t* imported_bytes_locked(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, std::uint64_t* guest_va) {
     if (guest_va) *guest_va = 0;
     if (!buffer) return nullptr;
