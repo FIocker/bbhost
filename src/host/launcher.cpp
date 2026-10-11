@@ -633,11 +633,6 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("The game's own speed. Uncapped steps it by the frame time: the display's refresh rate with V-Sync on, up to 240 fps off.");
         ImGui::SetNextItemWidth(200 * scale);
-        static const char* const kTuningLabels[] = {"FPS++ (Kyo)", "Original"};
-        ImGui::Combo("Camera tuning", &camera_tuning, kTuningLabels, 2);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Above 30 fps: FPS++ is the retuned camera from Kyo's 60 FPS++ patch, which trails the character more; Original is the game's own camera, as it moves at 30. At 30 fps both are the game's.");
-        ImGui::SetNextItemWidth(200 * scale);
         ImGui::Combo("Render resolution", &resolution, kResolutions, static_cast<int>(sizeof(kResolutions) / sizeof(kResolutions[0])));
         ImGui::TextDisabled("F10 in the game has every other setting.");
 

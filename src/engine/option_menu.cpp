@@ -596,7 +596,7 @@ Toggle g_cam_mouse_auto_rotation{"mouse_auto_rotation", kCamMouseAutoRotation, 0
 // when the game starts, so a change shows at once and applies then.
 const Choice kCameraTunings[2] = {{0, 121030}, {1, 121031}};
 std::uint8_t g_cam_tuning = 0, g_cam_tuning_last = 0xff;
-constexpr int kCameraRows = 5;
+constexpr int kCameraRows = 4;
 
 // Steam Deck (on one only, host_steam_deck): the frame rate as a left/right
 // choice of the two configurations - 0 is 30 fps at the screen's 1280x800, 1
@@ -838,9 +838,6 @@ GUEST_ABI void pc_camera_handler(void* dialog, void* params) {
     seed(g_cam_mouse_auto_rotation);
     add_toggle_row(dialog, &g_cam_mouse_auto_rotation.value, g_cam_mouse_auto_rotation.id,
                    default_of(g_cam_mouse_auto_rotation));
-    seed_camera_tuning();
-    const int tuning_default = host_opt_default_index("camera_tuning");
-    add_pair_row(dialog, &g_cam_tuning, kCamTuning, kCameraTunings, static_cast<std::uint8_t>(tuning_default == 1 ? 1 : 0));
     log_rows("PCCamera", dialog, kCameraRows, kCameraRows);
 }
 

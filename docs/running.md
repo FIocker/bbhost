@@ -212,15 +212,9 @@ with the fractions kept (the game drops them: its clock ran 4% slow at 60 and
 and its frames are shown as they come, so 90 on a 60 Hz display shows 60 of
 them a second; a rate the machine cannot hold runs slower than real time in
 the few places that count frames.
-Camera tuning (PC Camera, F10, the setup window; applies on the next run)
-picks how the follow camera moves above 30: FPS++, the default, keeps the
-retune from Kyo's 60 FPS++ patch that every bbhost before it used - its own
-chase rates and fast-turn angle, a smoother camera that trails the character
-more; Original runs the game's own values, so the camera at 60, 90, 120 or
-Uncapped moves as it does at 30. Either is converted to each frame's length,
-and at 30 both are the game's own.
-`BBHOST_CAMERA_TUNING=fps++|original` overrides it for a run, and a
-`frame rate:` line in the log says which tuning runs.
+The follow camera runs the game's own values at every frame rate, converted
+to each frame's length, so above 30 it moves as it does at 30.
+`BBHOST_CAMERA_TUNING=fps++` runs Kyo's 60 FPS++ camera retune instead.
 `BBHOST_GAME_FPS=30|60|90|120|0` overrides the setting for a run (0 is
 uncapped), `BBHOST_UNCAPPED_FPS=N` sets the uncapped limit (30-240) whatever
 V-Sync says, and `BBHOST_FRAME_RATE_LOG=1` logs once a second the frame time the

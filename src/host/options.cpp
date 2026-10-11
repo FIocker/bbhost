@@ -260,7 +260,6 @@ const Row g_rows[] = {
     {Row::Option, nullptr, kFov},
     {Row::Option, nullptr, kCameraDistance},
     {Row::Option, nullptr, kCameraHeight},
-    {Row::Option, nullptr, kCameraTuning},
     {Row::Header, "INPUT"},
     {Row::Option, nullptr, kMouseMenu},
     {Row::Option, nullptr, kMouseCamera},

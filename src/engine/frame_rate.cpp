@@ -1353,16 +1353,17 @@ int wanted_fps() {
     return mode_of(host_settings().frame_cap);
 }
 
-// The Camera tuning option as the game started with it: true for Original.
-// BBHOST_CAMERA_TUNING=original (or orig, 1) / fps++ (or kyo, 0) overrides it.
+// The follow camera's tuning above 30 fps: the game's own (Original) unless
+// BBHOST_CAMERA_TUNING=fps++ (or kyo, 0) asks for Kyo's 60 FPS++ retune. The
+// menus no longer offer it; a saved camera_tuning is ignored.
 bool camera_original() {
     if (const char* e = std::getenv("BBHOST_CAMERA_TUNING"); e && *e) {
         const std::string v(e);
         if (v == "original" || v == "orig" || v == "1") return true;
         if (v == "fps++" || v == "kyo" || v == "0") return false;
-        host_log("frame rate: BBHOST_CAMERA_TUNING=%s is neither fps++ nor original; the option decides", e);
+        host_log("frame rate: BBHOST_CAMERA_TUNING=%s is neither fps++ nor original; Original runs", e);
     }
-    return host_settings().camera_original;
+    return true;
 }
 
 // Whether every site of a group holds the list's old bytes; the first that
