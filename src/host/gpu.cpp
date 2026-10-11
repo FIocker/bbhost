@@ -49,7 +49,7 @@ namespace gpu {
 Gpu g;
 std::atomic<std::uint64_t> g_validation_messages{0};  // warnings and errors the validation layer reported
 
-void device_lost_locked(const char* where);  // below, with the reports it makes
+void device_lost_locked(const char* where, bool declared = false);  // below, with the reports it makes
 bool take_marked_start(std::string& why);    // the same: a start after a lost device runs with markers
 
 namespace {
@@ -3779,7 +3779,9 @@ std::atomic<bool> g_device_lost{false};
 // the fault, how far the GPU's markers got, the last draws recorded, the other
 // programs hooked in; the note for the next starts; and the flag the window's
 // loop reads to tell the player and close (host_gpu_device_lost).
-void device_lost_locked(const char* where) {
+// `declared`: no driver said so - bbhost takes the device for lost because
+// a submission never finished (fence_wait_locked).
+void device_lost_locked(const char* where, bool declared) {
     g.ok = false;
     // Nothing recorded will run now: land the CP writes still queued.
     for (const auto& [va, span] : g.pending_writes) {
@@ -3788,7 +3790,13 @@ void device_lost_locked(const char* where) {
     g.pending_writes.clear();
     if (g_device_lost.exchange(true)) return;
     const unsigned long long flip = static_cast<unsigned long long>(hle_video_flip_count());
-    host_log("gpu: the device is lost (%s, flip %llu): the GPU stopped responding and the system reset it", where, flip);
+    if (declared) {
+        host_log("gpu: the device is taken for lost (%s, flip %llu): the driver reports no loss, but the GPU never finished "
+                 "that work, so nothing more is sent to it and bbhost ends",
+                 where, flip);
+    } else {
+        host_log("gpu: the device is lost (%s, flip %llu): the GPU stopped responding and the system reset it", where, flip);
+    }
     report_device_fault();
     report_checkpoints();
     if (!g.has_checkpoints) host_log("gpu: no progress markers this run; the next %d starts run with them", kMarkedRuns);
@@ -3946,7 +3954,7 @@ bool fence_wait_locked(int k, std::uint64_t& waited_us) {
         if (!sl.said_stuck) {
             sl.said_stuck = true;
             say_stuck_locked(k, secs);
-        } else {
+        } else if (secs < fence_limit_s()) {
             host_log("gpu: submission %llu is still running after %.0f s", static_cast<unsigned long long>(sl.serial), secs);
         }
         if (secs >= fence_limit_s()) break;
@@ -3963,7 +3971,7 @@ bool fence_wait_locked(int k, std::uint64_t& waited_us) {
     if (r == VK_TIMEOUT) {
         host_log("gpu: submission %llu has not finished after %.0f s: the GPU is taken for stuck, and bbhost stops",
                  static_cast<unsigned long long>(sl.serial), secs);
-        device_lost_locked("a submission the GPU had not finished within the limit");
+        device_lost_locked("a submission the GPU had not finished within the limit", true);
         return false;
     }
     host_log("gpu: waiting for submission %d failed (%d)%s", k, r, r == VK_ERROR_DEVICE_LOST ? "; device lost, GPU execution disabled" : "");
