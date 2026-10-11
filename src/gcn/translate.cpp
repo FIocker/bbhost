@@ -37,7 +37,7 @@ std::string translation_switches() {
     };
     std::string s = std::string("offsets=") + (runtime_sample_offsets() ? "1" : "0") + ";half_rtz=" + (native_half_rtz() ? "1" : "0") +
                     ";export_rtz=" + (export_rtz_on() ? "1" : "0") + ";legacy_mul=" + (legacy_mul_min_form() ? "min" : "select") + ";";
-    for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS", "BBHOST_CB_RANGED",
+    for (const char* name : {"BBHOST_DST_SEL_BRANCH", "BBHOST_LOOP_BLOCKS", "BBHOST_LOOP_REACH", "BBHOST_SPILL_CELLS", "BBHOST_COPY_DEFS", "BBHOST_CB_RANGED", "BBHOST_BOUND_STORES",
                              "BBHOST_TBUFFER_DST_SEL"}) {
         s += env(name);
     }
@@ -67,6 +67,17 @@ constexpr std::uint32_t kFetchBias = 0x01000000;  // block offsets of the inline
 bool ranged_buffers_on() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_CB_RANGED");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+// BufferBinding::written: a dword buffer store through a V# traced to user
+// data, at the V#'s base plus an SGPR or constant offset, writes the V#'s
+// binding in the no-fallback variant (Translator::store_bound).
+// BBHOST_BOUND_STORES=0: every store walks the page table, as before.
+bool bound_stores_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_BOUND_STORES");
         return !(e && e[0] == '0');
     }();
     return on;
@@ -884,6 +895,48 @@ struct Translator {
         std::vector<Id> vals;
         for (Id v : vars) vals.push_back(ld(v));
         return vals;
+    }
+    // buffer_store_dword* in the no-fallback variant through a V# traced to
+    // user data, with no index and no VGPR offset - the address is the V#'s
+    // base plus soffset (an SGPR or a constant) plus the instruction's offset,
+    // as the particle vertex shaders' copies write it: into the V#'s binding,
+    // which the host binds whole (BufferBinding::ranged, its length in dwords
+    // in cb_stride) and over the guest memory itself (BufferBinding::written:
+    // never a copy). The address is truncated to a dword, as the loads read
+    // it, and a dword at or past the range is not written, as GCN does not
+    // perform a store past num_records. False, with nothing emitted, for any
+    // other store: it walks the page table.
+    bool store_bindable(const Inst& in, ResourcePath& path, std::string& key) {
+        if (!opt.cb_ssbo || !opt.cb_no_fallback || !bound_stores_on() || in.op < 28 || in.op > 31 || in.idxen || in.offen || in.addr64) return false;
+        if (!sym_path(in.srsrc, 4, path) || path.user_sgpr < 0 || path.user_sgpr + 1 >= 16) return false;
+        key = path.str();
+        if (std::find(opt.cb_ssbo_exclude.begin(), opt.cb_ssbo_exclude.end(), key) != opt.cb_ssbo_exclude.end()) return false;
+        if (const auto it = buffer_index.find(key); it != buffer_index.end() && res.buffers[it->second].indexed) return false;
+        return buffer_index.count(key) || res.buffers.size() < kMaxBuffers;
+    }
+    bool store_bound(const Inst& in, int n) {
+        ResourcePath path;
+        std::string key;
+        if (!store_bindable(in, path, key)) return false;
+        const std::size_t index = buffer_for(path, key, false, static_cast<std::uint32_t>(n));
+        res.buffers[index].ranged = true;
+        res.buffers[index].written = true;
+        res.buffer_at[cur_offset] = static_cast<std::uint32_t>(index);
+        buffer_sites.push_back({in.srsrc, index, sym_key(sym_of(in.srsrc)), sym_key(sym_of(in.srsrc + 1)), def_seq++, cur_block});
+        const Id first = shr(iadd(cu(in.offset12), read_s(in.soffset, in)), cu(2));
+        std::vector<Id> vals;
+        for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));
+        exec_guard([&] {
+            const Id bias = params_u32(4, index);
+            const Id range_dw = params_u32(5, index);
+            for (int k = 0; k < n; ++k) {
+                const Id at = iadd(first, cu(static_cast<std::uint32_t>(k)));
+                if_then(ult(at, range_dw), [&] {
+                    m.store(m.access_chain(p_ssbo_u32, buffer_vars[index], {c_zero_u, iadd(bias, at)}), vals[static_cast<std::size_t>(k)]);
+                });
+            }
+        });
+        return true;
     }
     // StageParams member `member` (an array of 8 dwords in uvec4s), entry `index`.
     Id params_u32(std::uint32_t member, std::size_t index) {
@@ -2275,7 +2328,11 @@ struct Translator {
     }
     void mubuf(const Inst& in) {
         const std::uint32_t op = in.op;
-        if (op < 112) note_walk(mnemonic(in) + buffer_walk_form(in));
+        {
+            ResourcePath path;
+            std::string key;
+            if (op < 112 && !store_bindable(in, path, key)) note_walk(mnemonic(in) + buffer_walk_form(in));
+        }
         if ((op >= 4 && op <= 7) || (op >= 24 && op <= 31) || (op >= 48 && op < 112)) note_store(in);
         auto load_n = [&](int n) {
             const BufferAddr ba = buffer_address(in);
@@ -2283,6 +2340,7 @@ struct Translator {
             for (int k = 0; k < n; ++k) write_v(in.vdata + k, vals[k]);
         };
         auto store_n = [&](int n) {
+            if (store_bound(in, n)) return;
             const BufferAddr ba = buffer_address(in);
             std::vector<Id> vals;
             for (int k = 0; k < n; ++k) vals.push_back(ld(vgpr_var(in.vdata + k)));

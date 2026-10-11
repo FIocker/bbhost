@@ -296,6 +296,54 @@ struct Fixture {
         return ok;
     }
 
+    // buffer_store_dwordx4 v[16:19] through the V# in s[12:15] at its base
+    // plus s20 (`offset`, or with `constant` the inline 0) plus offset12 16:
+    // in the no-fallback variant (`cb` 2) the store goes through the V#'s
+    // binding (BufferBinding::written, ranged), and each dword at or past the
+    // V#'s range is not written, as GCN does not perform it; walked (`cb` 0)
+    // it lands in guest memory with no range check (the translator's walk).
+    bool run_bound_store(int cb, std::uint32_t offset, bool constant, std::uint32_t stride, std::uint32_t records, const char* what) {
+        auto* params = static_cast<gcn::StageParams*>(mapped);
+        params->user_sgpr[3] = 0xfac; params->user_sgpr[8] = 0;
+        std::uint32_t* mem = reinterpret_cast<std::uint32_t*>(guest_map + (kGuestData & 0xffff));
+        for (int k = 0; k < 64; ++k) mem[k] = cb_map[k] = 0x5555u;
+        params->user_sgpr[12] = static_cast<std::uint32_t>(kGuestData);
+        params->user_sgpr[13] = static_cast<std::uint32_t>(kGuestData >> 32) | stride << 16;
+        params->user_sgpr[14] = records;
+        params->user_sgpr[15] = 0x77fac;
+        const std::uint32_t range = static_cast<std::uint32_t>(gcn::vsharp_range_dwords(params->user_sgpr[13], records));
+        params->cb_valid = cb ? 1u : 0u;
+        params->cb_bias_dw[0] = 0;
+        params->cb_stride[0] = range;
+        std::vector<gcn::Inst> body;
+        gcn::Inst movk; movk.enc = gcn::Enc::SOPK; movk.op = 0; movk.dst = 20; movk.imm = static_cast<std::int32_t>(offset); body.push_back(movk);
+        for (int k = 0; k < 4; ++k) body.push_back(vmov(16 + k, 0x1000u + static_cast<std::uint32_t>(k)));
+        gcn::Inst st; st.enc = gcn::Enc::MUBUF; st.op = 30;  // buffer_store_dwordx4 v[16:19], off, s[12:15], s20 offset:16
+        st.vdata = 16; st.srsrc = 12; st.soffset = static_cast<std::uint16_t>(constant ? 128 : 20); st.offset12 = 16;
+        body.push_back(st);
+        image_store_body(body);
+        gcn::TranslateResult tr;
+        dispatch_compute(body, 16, cb, &tr);
+        params->cb_valid = 0;
+        const bool written = cb == 2 && tr.buffers.size() == 1 && tr.buffers[0].written && tr.buffers[0].ranged && tr.walks.empty();
+        const bool walked = cb == 0 && tr.buffers.empty() && !tr.walks.empty();
+        const std::uint32_t* got = cb == 2 ? cb_map : mem;
+        const std::uint32_t first = ((constant ? 0u : offset) + 16) >> 2;
+        bool ok = written || walked;
+        for (std::uint32_t k = 0; k < 64; ++k) {
+            const bool stored = k >= first && k < first + 4 && (cb == 0 || k < range);
+            const std::uint32_t want = stored ? 0x1000u + (k - first) : 0x5555u;
+            if (got[k] != want) {
+                std::printf("  dword %u holds %08x, expected %08x\n", k, got[k], want);
+                ok = false;
+            }
+        }
+        std::printf("%s buffer_store_dwordx4 at %s (%s): offset %u, stride %u, records %u (%s)%s\n", ok ? "PASS" : "FAIL",
+                    constant ? "a constant offset" : "a register offset", cb == 2 ? "bound" : "walked", offset, stride, records, what,
+                    written || walked ? "" : " - not the expected binding");
+        return ok;
+    }
+
     // tbuffer_load_format_* takes the instruction's format and the identity
     // select - X000, XY00, XYZ0 or XYZW by the format's components - whatever
     // the V#'s DST_SEL holds (the ISA's buffer instruction table); its VGPRs
@@ -719,5 +767,13 @@ int main() try {
             ok &= f.run_ranged_load(cb, bound, 36, 0, 38, {109, 0, 0, 0}, "a dword in range when it starts inside");
         }
     }
+    // Buffer stores at a register or constant offset, bound (no fallback) and walked.
+    ok &= f.run_bound_store(2, 0, false, 0, 64, "inside");
+    ok &= f.run_bound_store(2, 24, false, 0, 48, "straddling the end");
+    ok &= f.run_bound_store(2, 48, false, 0, 48, "past the end");
+    ok &= f.run_bound_store(2, 3, false, 0, 64, "the low bits ignored");
+    ok &= f.run_bound_store(2, 0, false, 16, 2, "records times the stride, straddling");
+    ok &= f.run_bound_store(2, 99, true, 0, 64, "a constant offset");
+    ok &= f.run_bound_store(0, 8, false, 0, 64, "walked");
     return ok ? 0 : 1;
 } catch (const std::exception& e) { std::fprintf(stderr,"%s\n",e.what()); return 1; }

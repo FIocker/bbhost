@@ -8514,12 +8514,22 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
         Located loc;
         // A copy-back still in its copy (copy versions): the copy, or the copies
         // put in place first when the binding covers part of one.
-        int version = outcome == kUnmapped ? copy_version_lookup_locked(base, bytes, &loc) : kCopyVersionNone;
+        // A binding the shader stores to (BufferBinding::written) is the guest
+        // memory itself - a copy would take the stores in its place - after any
+        // copy-back to it is in place, as the page-table walk it replaces had.
+        int version = kCopyVersionNone;
+        if (outcome == kUnmapped && b.written) {
+            if (copy_version_lookup_locked(base, bytes, &loc) != kCopyVersionNone) copy_versions_put_in_place_locked(kCvWalks);
+            loc = Located{};
+        } else if (outcome == kUnmapped) {
+            version = copy_version_lookup_locked(base, bytes, &loc);
+        }
         if (version == kCopyVersionStraddles) {
             copy_versions_put_in_place_locked(kCvStraddle);
             version = kCopyVersionNone;
         }
-        if (outcome == kUnmapped && version == kCopyVersionNone && (t_draw_windows.empty() || !draw_window_locked(base, bytes, loc))) {
+        if (outcome == kUnmapped && version == kCopyVersionNone &&
+            (b.written || t_draw_windows.empty() || !draw_window_locked(base, bytes, loc))) {
             loc = locate(base, std::min<std::uint64_t>(bytes, g.ssbo_max_range ? g.ssbo_max_range : bytes));
         }
         if (g_import_audit && base) audit_range(base, bytes, loc.buffer && loc.avail >= bytes ? kUseBound : kUsePageTable);
@@ -8578,6 +8588,7 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                                          b.pointer ? ", a pointer" : "");
                 realign = realign || glitch_snapshot_draw();  // BBHOST_GLITCH_SNAPSHOT: the bytes as recorded
             }
+            if (b.written) realign = false;  // stores go to the guest memory, never to a copy
             static DevBuffer scratch;
             static VkDeviceSize scratch_next = 0;
             constexpr VkDeviceSize kScratch = 64ull << 20;
@@ -8608,6 +8619,9 @@ void resolve_stage_buffers(const gcn::TranslateResult& meta, const std::uint32_t
                 params.cb_bias_dw[i] = static_cast<std::uint32_t>(bias / 4);
                 outcome = kBound;
                 note_arena_read(kArenaConstants, base, bytes);
+                // The draw writes this memory as it runs: no mirror copy made in
+                // this recording serves it as vertex or index data before that.
+                if (b.written) shadow_written_locked(base, bytes, true);
             }
         }
         if (outcome != kBound) {

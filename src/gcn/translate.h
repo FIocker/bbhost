@@ -83,6 +83,11 @@ struct BufferBinding {
     // dwords as cb_stride, which the shader checks each dword against, as GCN
     // does (a dword past the range reads 0). Never also `indexed`.
     bool ranged = false;
+    // A buffer store writes it (buffer_store_dword* at the V#'s base plus an
+    // SGPR or constant offset, Translator::store_bound): always also `ranged`,
+    // and the host binds the guest memory itself - never a copy or snapshot,
+    // which would take the stores in its place.
+    bool written = false;
 };
 // A V#'s range in dwords as GCN checks a buffer load against it, from its
 // words 1 (stride in [29:16]) and 2 (num_records): num_records bytes, times the

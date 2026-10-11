@@ -561,6 +561,7 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
             bj.set("max_dw", b.max_dw);
             if (b.indexed) bj.set("indexed", true);
             if (b.ranged) bj.set("ranged", true);
+            if (b.written) bj.set("written", true);  // the shaders store to it: drawreplay compares it after the draw
             bj.set("bias_dw", cs.params.cb_bias_dw[i]);
             bj.set("bytes", info.range);
             if (info.buffer == g.sink.buffer) {
