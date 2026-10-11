@@ -24,7 +24,10 @@
 // A draw that took Vulkan vertex input replays with the captured bindings'
 // bytes as vertex buffers and the captured bindings and attributes.
 // Every run restores the guest pages and buffers from the blobs and checks
-// afterwards that the draw left them unchanged. Writes report.json, the runs'
+// afterwards that the draw left them unchanged - except a storage buffer the
+// shaders store to (the manifest's "written": translate.cpp store_bound): its
+// contents after each run are an output, compared byte for byte between A and
+// B and between A and the variant like the targets. Writes report.json, the runs'
 // raw target contents and error heatmaps to --out (default <capture>/replay-N).
 // Exit 0: every check passed; 1: a check failed; 2: bad capture or Vulkan error.
 #include "core/sha256.h"
@@ -560,6 +563,9 @@ struct RunResult {
     std::string name;
     std::vector<Output> outputs;
     std::vector<std::string> writes;  // guest memory or buffers the draw changed
+    // The written storage buffers' contents after the run, in stage and binding
+    // order (StageData::buffer_written).
+    std::vector<std::vector<std::uint8_t>> stored;
     double gpu_ms = -1.0;             // RunOptions::timed: GPU time of the draws
 };
 
@@ -1145,6 +1151,7 @@ public:
             result.outputs.push_back(std::move(p.out));
         }
         result.writes = changed_inputs(ro.sentinel);
+        result.stored = stored_buffers();
         for (VkImageView v : run_views) vkDestroyImageView(dev_.device, v, nullptr);
         for (VkImageView v : color_views) vkDestroyImageView(dev_.device, v, nullptr);
         if (depth_view) vkDestroyImageView(dev_.device, depth_view, nullptr);
@@ -1181,6 +1188,7 @@ private:
         std::vector<Buffer> buffers;
         std::vector<VkDeviceSize> buffer_bytes;
         std::vector<std::string> buffer_blobs;
+        std::vector<bool> buffer_written;  // the shaders store to it (an output, not an input)
     };
 
     static Subresource whole(VkFormat format, std::uint32_t aspect, std::uint32_t w, std::uint32_t h) {
@@ -1388,6 +1396,8 @@ private:
                 sd.buffers.push_back(buf);
                 sd.buffer_bytes.push_back(bytes.size());
                 sd.buffer_blobs.push_back(name);
+                const json::Value* written = b.find("written");  // set only on a buffer the shaders store to
+                sd.buffer_written.push_back(written && json::flag(b, "written"));
             }
         }
     }
@@ -1423,8 +1433,21 @@ private:
         for (int st = 0; st < 2; ++st) {
             const StageData& sd = stages_[st];
             for (std::size_t i = 0; i < sd.buffers.size(); ++i) {
+                if (sd.buffer_written[i]) continue;  // an output: stored_buffers()
                 const auto& bytes = cap_.blob(sd.buffer_blobs[i]);
                 if (std::memcmp(sd.buffers[i].map, bytes.data(), bytes.size()) != 0) out.push_back("storage buffer " + sd.buffer_blobs[i]);
+            }
+        }
+        return out;
+    }
+    std::vector<std::vector<std::uint8_t>> stored_buffers() const {
+        std::vector<std::vector<std::uint8_t>> out;
+        for (int st = 0; st < 2; ++st) {
+            const StageData& sd = stages_[st];
+            for (std::size_t i = 0; i < sd.buffers.size(); ++i) {
+                if (!sd.buffer_written[i]) continue;
+                const auto* p = static_cast<const std::uint8_t*>(sd.buffers[i].map);
+                out.emplace_back(p, p + sd.buffer_bytes[i]);
             }
         }
         return out;
@@ -1553,6 +1576,23 @@ void save_outputs(const RunResult& r, const fs::path& out) {
     for (const Output& o : r.outputs) write_file(out / (r.name + "-" + o.target + ".bin"), o.bytes.data(), o.bytes.size());
 }
 
+// The written buffers of two runs, byte for byte: "" when equal, else where they first part.
+std::string stored_difference(const RunResult& x, const RunResult& y) {
+    if (x.stored.size() != y.stored.size()) return "a different number of written buffers";
+    for (std::size_t i = 0; i < x.stored.size(); ++i) {
+        if (x.stored[i].size() != y.stored[i].size()) return "written buffer " + std::to_string(i) + " has another size";
+        for (std::size_t k = 0; k < x.stored[i].size(); ++k) {
+            if (x.stored[i][k] != y.stored[i][k]) return "written buffer " + std::to_string(i) + " differs at byte " + std::to_string(k);
+        }
+    }
+    return "";
+}
+std::size_t stored_bytes(const RunResult& r) {
+    std::size_t n = 0;
+    for (const auto& b : r.stored) n += b.size();
+    return n;
+}
+
 json::Value writes_json(const RunResult& r) {
     json::Value a = json::Value::make_array();
     for (const std::string& w : r.writes) a.push(w);
@@ -1648,8 +1688,17 @@ int replay_main(const Options& o) {
     save_outputs(a, out);
     save_outputs(b, out);
     const Verdict ab = compare_runs(a.outputs, b.outputs, o.tol, out, "A-vs-B", false);
-    const bool deterministic = ab.match && a.writes.empty() && b.writes.empty();
-    comparisons.set("A_vs_B", verdict_json(ab, deterministic, "the captured modules twice from identical captured inputs"));
+    const std::string ab_stores = stored_difference(a, b);
+    const bool deterministic = ab.match && a.writes.empty() && b.writes.empty() && ab_stores.empty();
+    {
+        json::Value abj = verdict_json(ab, deterministic, "the captured modules twice from identical captured inputs");
+        if (!a.stored.empty()) {
+            abj.set("written_buffers", static_cast<std::uint64_t>(a.stored.size()));
+            abj.set("written_bytes", static_cast<std::uint64_t>(stored_bytes(a)));
+            abj.set("stores", ab_stores.empty() ? std::string("identical") : ab_stores);
+        }
+        comparisons.set("A_vs_B", abj);
+    }
     runs.set("A", writes_json(a));
     runs.set("B", writes_json(b));
 
@@ -1737,7 +1786,16 @@ int replay_main(const Options& o) {
         ro.library = false;
         save_outputs(v, out);
         const Verdict vv = compare_runs(a.outputs, v.outputs, o.tol, out, "A-vs-variant", true);
-        json::Value vj = verdict_json(vv, vv.match && v.writes.empty(), "shader variant against the captured modules (reported, not part of the exit status)");
+        const std::string av_stores = stored_difference(a, v);
+        json::Value vj = verdict_json(vv, vv.match && v.writes.empty() && av_stores.empty(),
+                                      "shader variant against the captured modules (reported, not part of the exit status)");
+        if (!a.stored.empty()) {
+            vj.set("written_buffers", static_cast<std::uint64_t>(a.stored.size()));
+            vj.set("written_bytes", static_cast<std::uint64_t>(stored_bytes(a)));
+            vj.set("stores", av_stores.empty() ? std::string("identical") : av_stores);
+        }
+        if (!a.stored.empty()) std::printf("  A vs variant stores: %s (%zu bytes in %zu written buffers)\n", av_stores.empty() ? "identical" : av_stores.c_str(),
+                                           stored_bytes(a), a.stored.size());
         if (!o.ps.empty()) vj.set("ps", o.ps.string());
         if (!o.vs.empty()) vj.set("vs", o.vs.string());
         if (o.library) vj.set("library", true);
