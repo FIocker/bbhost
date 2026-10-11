@@ -240,6 +240,7 @@ public:
     bool done = false;
     bool quiet = false;  // rejected before anything worth reporting
     std::vector<std::uint32_t> indirect_args;  // an indirect draw's arguments as read (captured as a direct draw)
+    std::vector<std::uint64_t> pages;          // a dispatch's guest pages, read again after it ran
 
     void blob(const std::string& name, const std::uint8_t* data, std::size_t bytes) {
         host_blobs.emplace_back(name, std::vector<std::uint8_t>(data, data + bytes));
@@ -1001,6 +1002,10 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
     return session;
 }
 
+namespace {
+void write_session_locked(CaptureSession& s);
+}
+
 void capture_finish_locked(CapturePtr session, const CaptureDynamic& dyn) {
     if (!session) return;
     CaptureSession& s = *session;
@@ -1049,7 +1054,14 @@ void capture_finish_locked(CapturePtr session, const CaptureDynamic& dyn) {
     m.set("dynamic", dj);
 
     flush_locked();
+    write_session_locked(s);
+}
 
+namespace {
+
+// Writes a finished session's readbacks and blobs, then its manifest.
+void write_session_locked(CaptureSession& s) {
+    json::Value& m = s.manifest;
     json::Value blobs = json::Value::make_object();
     std::uint64_t total = 0;
     bool ok = true;
@@ -1088,11 +1100,276 @@ void capture_finish_locked(CapturePtr session, const CaptureDynamic& dyn) {
         host_log("capture: %s: writing the manifest failed", s.dir.c_str());
         return;
     }
-    ++g_captured;
-    if (g_armed > 0) --g_armed;
-    host_log("capture: wrote %s/manifest.json (%s, flip %llu, draw %llu, %zu blobs, %llu bytes)", s.dir.c_str(),
-             s.draw.pipeline.c_str(), static_cast<unsigned long long>(s.draw.flip), static_cast<unsigned long long>(s.draw.draw_index),
+    if (s.pages.empty() && json::str(m, "schema") == "bbhost-draw-capture") {
+        ++g_captured;
+        if (g_armed > 0) --g_armed;
+    }
+    host_log("capture: wrote %s/manifest.json (%s, flip %llu, %s %llu, %zu blobs, %llu bytes)", s.dir.c_str(), s.draw.pipeline.c_str(),
+             static_cast<unsigned long long>(s.draw.flip), s.pages.empty() ? "draw" : "dispatch", static_cast<unsigned long long>(s.draw.draw_index),
              blobs.object.size(), static_cast<unsigned long long>(total));
+}
+
+}  // namespace
+
+// ---- compute dispatches (BBHOST_CAPTURE_DISPATCH) ----
+
+namespace {
+
+struct DispatchConfig {
+    bool enabled = false;
+    std::string prefix;
+    int count = 1, every = 1;
+};
+
+const DispatchConfig& dispatch_config() {
+    static const DispatchConfig c = [] {
+        DispatchConfig c;
+        const char* e = std::getenv("BBHOST_CAPTURE_DISPATCH");
+        if (!e || !*e) return c;
+        c.prefix = e;
+        c.enabled = true;
+        if (const char* n = std::getenv("BBHOST_CAPTURE_DISPATCH_COUNT")) c.count = std::max(1, std::atoi(n));
+        if (const char* n = std::getenv("BBHOST_CAPTURE_DISPATCH_EVERY")) c.every = std::max(1, std::atoi(n));
+        return c;
+    }();
+    return c;
+}
+
+int g_dispatches_captured = 0, g_dispatches_rejected = 0;  // under g.mu
+std::uint64_t g_dispatch_matches = 0;
+
+}  // namespace
+
+bool capture_dispatch_candidate(const std::string& program, std::uint64_t flip) {
+    const DispatchConfig& c = dispatch_config();
+    if (!c.enabled || g_dispatches_captured >= c.count || g_dispatches_rejected >= kMaxRejections || flip < config().min_flip) return false;
+    bool any = false;
+    for (std::size_t at = 0; at <= c.prefix.size() && !any;) {
+        const std::size_t comma = std::min(c.prefix.find(',', at), c.prefix.size());
+        const std::size_t n = comma - at;
+        if (n && program.compare(0, n, c.prefix, at, n) == 0) any = true;
+        at = comma + 1;
+    }
+    return any && g_dispatch_matches++ % static_cast<std::uint64_t>(c.every) == 0;
+}
+
+CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& d) {
+    CapturePtr session(new CaptureSession);
+    CaptureSession& s = *session;
+    s.draw.pipeline = d.pipeline;
+    s.draw.flip = d.flip;
+    s.draw.draw_index = d.dispatch_index;
+    const auto reject = [&](const std::string& why) {
+        s.quiet = true;
+        ++g_dispatches_rejected;
+        static std::set<std::string> seen;
+        if (seen.size() < 32 && seen.insert(why).second) {
+            host_log("capture: dispatch %s %llu (flip %llu) not captured: %s", d.pipeline.c_str(), static_cast<unsigned long long>(d.dispatch_index),
+                     static_cast<unsigned long long>(d.flip), why.c_str());
+        }
+        return CapturePtr();
+    };
+    if (!d.meta || !d.spirv || !d.images || d.images->images.size() != d.meta->images.size() || d.images->samplers.size() != d.meta->samplers.size()) {
+        return reject("bindings and resolved resources disagree");
+    }
+    // An indirect dispatch's arguments, read now that everything recorded
+    // before it has run, captured as the direct dispatch they make.
+    std::uint32_t args[3] = {d.dim[0], d.dim[1], d.dim[2]};
+    if (d.indirect_va) {
+        if (!hle_kernel_va_mapped(d.indirect_va, sizeof(args))) return reject("its indirect arguments are not mapped");
+        read_guest_locked(d.indirect_va, sizeof(args), args);
+        if (!args[0] || !args[1] || !args[2]) {
+            s.quiet = true;  // no work: not a candidate, not a rejection
+            --g_dispatch_matches;
+            return CapturePtr();
+        }
+        if (args[0] > 65535 || args[1] > 65535 || args[2] > 65535) return reject("its indirect arguments ask past 65535 workgroups a dimension");
+    }
+
+    namespace fs = std::filesystem;
+    char leaf[160];
+    std::snprintf(leaf, sizeof(leaf), "dispatch-%s-f%llu-n%llu", d.pipeline.c_str(), static_cast<unsigned long long>(d.flip),
+                  static_cast<unsigned long long>(d.dispatch_index));
+    s.dir = config().dir + "/" + leaf;
+    std::error_code ec;
+    if (fs::exists(s.dir, ec)) return reject("capture directory " + s.dir + " already exists");
+    if (!fs::create_directories(fs::path(s.dir) / "blobs", ec)) return reject("cannot create " + s.dir + ": " + ec.message());
+
+    const gcn::TranslateResult& meta = *d.meta;
+    const std::uint32_t* user = d.params.user_sgpr;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    s.blob("cs-spirv", reinterpret_cast<const std::uint8_t*>(d.spirv->data()), d.spirv->size() * 4);
+    if (d.gcn_words && !d.gcn_words->empty()) s.blob("cs-gcn", reinterpret_cast<const std::uint8_t*>(d.gcn_words->data()), d.gcn_words->size() * 4);
+    s.blob("cs-params", reinterpret_cast<const std::uint8_t*>(&d.params), sizeof(d.params));
+    json::Value stage = json::Value::make_object();
+    stage.set("stage", "compute");
+    stage.set("spirv", "cs-spirv");
+    if (d.gcn_words && !d.gcn_words->empty()) stage.set("gcn", "cs-gcn");
+    json::Value pj = json::Value::make_object();
+    pj.set("blob", "cs-params");
+    pj.set("bytes", static_cast<unsigned>(sizeof(d.params)));
+    pj.set("user_sgpr", hex_words(user, 16));
+    pj.set("l1_table_replaced_on_replay", json::hex(d.params.l1_table));
+    stage.set("params", pj);
+
+    // Images: sampled ones only (a storage image would be an output too).
+    std::map<VkImageView, std::string> image_ids;
+    json::Value images = json::Value::make_object();
+    json::Value ij = json::Value::make_array();
+    for (std::size_t k = 0; k < meta.images.size(); ++k) {
+        const gcn::ImageBinding& b = meta.images[k];
+        const StageImages::Image& im = d.images->images[k];
+        const std::string where = "image binding " + std::to_string(b.binding) + " (" + b.path.str() + ")";
+        if (b.storage) return reject(where + " is a storage image");
+        if (!im.resolved || !im.view || im.dim != b.dim || im.arrayed != b.arrayed) return reject(where + " is bound to a dummy image");
+        ViewRecord rec;
+        if (!describe_view_locked(im.view, rec)) return reject(where + " has a view the texture cache did not record");
+        std::uint32_t words[8] = {};
+        resolve_resource(b.path, user, b.r128 ? 4 : 8, words, &ranges);
+        std::string id;
+        if (auto found = image_ids.find(im.view); found != image_ids.end()) {
+            id = found->second;
+        } else {
+            id = "image" + std::to_string(image_ids.size());
+            image_ids[im.view] = id;
+            json::Value rj = json::Value::make_object();
+            rj.set("kind", rec.render_target ? "render-target" : "surface");
+            rj.set("guest_base", json::hex(rec.guest_base));
+            rj.set("image", image_info_json(rec.image_info));
+            rj.set("view", view_info_json(rec.view_info));
+            rj.set("alias", nullptr);
+            json::Value subs = json::Value::make_array();
+            std::string why;
+            const VkImageSubresourceRange& r = rec.view_info.subresourceRange;
+            if (!s.readback(id, rec.image, r.aspectMask, rec.image_info.format, rec.image_info.imageType, rec.image_info.extent, r.baseMipLevel,
+                            r.levelCount, r.baseArrayLayer, r.layerCount, subs, why)) {
+                return reject(where + ": " + why);
+            }
+            rj.set("blob", id);
+            rj.set("subresources", subs);
+            images.set(id, rj);
+        }
+        json::Value bj = json::Value::make_object();
+        bj.set("binding", b.binding);
+        bj.set("path", b.path.str());
+        bj.set("dim", b.dim);
+        bj.set("arrayed", b.arrayed);
+        bj.set("r128", b.r128);
+        bj.set("tsharp", hex_words(im.w, 8));
+        bj.set("image", id);
+        ij.push(bj);
+    }
+    stage.set("images", ij);
+    if (!meta.samplers.empty()) return reject("the program samples (dispatch captures take image loads only)");
+
+    // What the program writes: the V#s it stores through and the counters it
+    // counts in, for the replay to compare.
+    json::Value written = json::Value::make_array();
+    for (const gcn::ResourcePath& path : meta.store_buffers) {
+        std::uint32_t v[4] = {};
+        if (!resolve_resource(path, user, 4, v, &ranges)) return reject("a buffer it stores through (" + path.str() + ") does not resolve");
+        const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xff) << 32);
+        const std::uint32_t stride = (v[1] >> 16) & 0x3fff;
+        const std::uint64_t bytes = stride ? std::uint64_t{v[2]} * stride : v[2];
+        json::Value wj = json::Value::make_object();
+        wj.set("path", path.str());
+        wj.set("guest_va", json::hex(base));
+        wj.set("stride", stride);
+        wj.set("records", v[2]);
+        wj.set("bytes", bytes);
+        written.push(wj);
+        if (base && bytes) ranges.push_back({base, bytes});
+    }
+    for (const gcn::BufferBinding& b : meta.buffers) {
+        std::uint32_t v[4] = {};
+        if (resolve_resource(b.path, user, b.pointer ? 2 : 4, v, &ranges) && !b.pointer) {
+            const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xff) << 32);
+            const std::uint32_t stride = (v[1] >> 16) & 0x3fff;
+            const std::uint64_t bytes = stride ? std::uint64_t{v[2]} * stride : v[2];
+            if (base && bytes && bytes <= kMaxVsharpBytes) ranges.push_back({base, bytes});
+        }
+    }
+    json::Value counters = json::Value::make_array();
+    for (std::uint64_t w : d.counters) {
+        counters.push(json::hex(w));
+        ranges.push_back({w, 4});
+    }
+    program_ranges(d.gcn_words, user, ranges);
+
+    std::set<std::uint64_t> pages;
+    for (const auto& [va, bytes] : ranges) {
+        if (!bytes || va + bytes < va) continue;
+        for (std::uint64_t p = va & ~(kPage - 1); p < va + bytes; p += kPage) {
+            if (!page_in_gpu_table_locked(p) || !hle_kernel_va_mapped(p, kPage)) continue;
+            pages.insert(p);
+            if (pages.size() > kMaxPages) return reject("program-reachable guest memory exceeds " + std::to_string(kMaxPages) + " pages");
+        }
+    }
+    json::Value memory = json::Value::make_object();
+    memory.set("page_bytes", kPage);
+    json::Value page_list = json::Value::make_array();
+    std::vector<std::uint8_t> page_bytes(pages.size() * kPage);
+    std::size_t at = 0;
+    for (std::uint64_t p : pages) {
+        page_list.push(json::hex(p));
+        read_guest_locked(p, kPage, page_bytes.data() + at);
+        at += kPage;
+        s.pages.push_back(p);
+    }
+    memory.set("pages", page_list);
+    memory.set("blob", "memory");
+    memory.set("after", "memory-after");
+    s.blob("memory", page_bytes.data(), page_bytes.size());
+
+    json::Value dj = json::Value::make_object();
+    json::Value groups = json::Value::make_array();
+    for (std::uint32_t a : args) groups.push(a);
+    dj.set("groups", groups);
+    json::Value threads = json::Value::make_array();
+    for (std::uint32_t t : d.threads) threads.push(t);
+    dj.set("threads", threads);
+    dj.set("indirect", d.indirect_va != 0);
+    if (d.indirect_va) dj.set("indirect_va", json::hex(d.indirect_va));
+    dj.set("gds_base", d.params.gds_base);
+    dj.set("gds_counters", counters);
+    dj.set("written", written);
+
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(g.phys, &props);
+    json::Value identity = json::Value::make_object();
+    identity.set("pipeline", d.pipeline);
+    identity.set("flip", d.flip);
+    identity.set("dispatch_index", d.dispatch_index);
+    identity.set("device", props.deviceName);
+    identity.set("vendor_id", json::hex(props.vendorID));
+    identity.set("device_id", json::hex(props.deviceID));
+    identity.set("driver_version", json::hex(props.driverVersion));
+
+    json::Value& m = s.manifest;
+    m.set("schema", "bbhost-dispatch-capture");
+    m.set("version", 1);
+    m.set("identity", identity);
+    m.set("translate", d.translate);
+    m.set("dispatch", dj);
+    m.set("stage", stage);
+    m.set("images", images);
+    m.set("memory", memory);
+    json::Value notes = json::Value::make_array();
+    notes.push("The GPU was settled (every earlier submission completed, the GDS counters' starts included) before the inputs were read.");
+    notes.push("memory-after is the same pages read after the dispatch alone ran.");
+    m.set("notes", notes);
+    return session;
+}
+
+void capture_dispatch_finish_locked(CapturePtr session) {
+    if (!session) return;
+    CaptureSession& s = *session;
+    flush_locked();
+    std::vector<std::uint8_t> after(s.pages.size() * kPage);
+    for (std::size_t k = 0; k < s.pages.size(); ++k) read_guest_locked(s.pages[k], kPage, after.data() + k * kPage);
+    s.blob("memory-after", after.data(), after.size());
+    write_session_locked(s);
+    if (s.done) ++g_dispatches_captured;
 }
 
 }  // namespace gpu

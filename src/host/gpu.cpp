@@ -4,6 +4,7 @@
 #include "core/portable.h"
 #include "host/dispatch_guard.h"
 #include "host/foreign_hooks.h"
+#include "host/draw_capture.h"
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
 #include "host/shaders/gpu_stall.spv.h"
@@ -5881,6 +5882,14 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     transfer_flush_locked();
     render_end_pass_locked();
     copy_versions_flush_locked();  // a compute shader reads memory without looking at them
+    // BBHOST_CAPTURE_DISPATCH (draw_capture.h): run everything recorded so
+    // far - the counters' starts too - before this dispatch's set exists, so
+    // memory and images hold its inputs.
+    const bool capture = capture_dispatch_candidate(pl.name, hle_video_flip_count());
+    if (capture) {
+        capture_settle_locked();
+        begin_recording_locked();
+    }
     gcn::StageParams params{};
     params.l1_table = g.l1.address;
     std::memcpy(params.user_sgpr, d.user_data, sizeof(params.user_sgpr));
@@ -5911,6 +5920,34 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pl.pipeline);
     const std::uint32_t params_offset = static_cast<std::uint32_t>(ubi.offset);
     rec().bind_sets(VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_layout, 0, 1, &set, set_cache_on() ? 1 : 0, &params_offset);
+    CapturePtr capture_session;
+    if (capture) {
+        CaptureDispatch cd;
+        cd.pipeline = pl.name;
+        cd.flip = hle_video_flip_count();
+        cd.dispatch_index = g.dispatches.load();
+        cd.meta = &pl.meta;
+        cd.spirv = &pl.meta.spirv;
+        cd.gcn_words = &words;
+        cd.params = params;
+        cd.images = &stage_images;
+        std::memcpy(cd.dim, d.dim, sizeof(cd.dim));
+        std::memcpy(cd.threads, d.threads, sizeof(cd.threads));
+        cd.indirect_va = d.indirect_va;
+        if (gds_bound) {
+            for (const GpuDispatch::GdsCounter& c : d.gds) {
+                if (c.word) cd.counters.push_back(c.word);
+            }
+        }
+        cd.translate = json::Value::make_object();
+        cd.translate.set("stage", "compute");
+        cd.translate.set("rsrc1", json::hex(d.rsrc1));
+        cd.translate.set("rsrc2", json::hex(d.rsrc2));
+        cd.translate.set("gds_counters", host_gpu_gds_counters());
+        cd.translate.set("exec_known", g.exec_known);
+        cd.translate.set("max_lds_bytes", g.max_lds_bytes);
+        capture_session = capture_dispatch_begin_locked(std::move(cd));
+    }
     profile_begin_locked(&pl.name);
     note_dispatch_name(g.dispatches.load(), pl.name.c_str());
     gpu_checkpoint(2, g.dispatches.load());
@@ -6029,6 +6066,7 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                          nullptr, 0, nullptr);
     g.dispatches.fetch_add(1);
+    if (capture_session) capture_dispatch_finish_locked(std::move(capture_session));
     return true;
 }
 

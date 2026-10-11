@@ -16,6 +16,14 @@
 //   BBHOST_CAPTURE_DIR=<dir>                              parent directory (default tmp/captures)
 //   BBHOST_CAPTURE_COUNT=<n>                              draws to capture (default 1)
 //   BBHOST_CAPTURE_EVERY=<n>                              one of every n matching draws (default 1)
+//
+// BBHOST_CAPTURE_DISPATCH=<program prefix>[,<prefix>...]: a compute dispatch
+// the same way, for drawreplay's dispatch mode - its module, params block
+// (the GDS counters' words included), images, and the guest pages its program
+// reaches before and after it ran. BBHOST_CAPTURE_DISPATCH_COUNT (default 1),
+// BBHOST_CAPTURE_DISPATCH_EVERY (default 1), BBHOST_CAPTURE_MIN_FLIP and
+// BBHOST_CAPTURE_DIR as for draws. An indirect dispatch whose arguments ask
+// for no work, read after the settle, is passed over.
 #pragma once
 
 #include "host/gpu_internal.h"
@@ -118,6 +126,22 @@ struct CaptureDynamic {
     float blend_constants[4] = {};
 };
 
+// A compute dispatch (BBHOST_CAPTURE_DISPATCH).
+struct CaptureDispatch {
+    std::string pipeline;  // the program's name
+    std::uint64_t flip = 0, dispatch_index = 0;
+    const gcn::TranslateResult* meta = nullptr;
+    const std::vector<std::uint32_t>* spirv = nullptr;
+    const std::vector<std::uint32_t>* gcn_words = nullptr;
+    gcn::StageParams params{};  // as written to the params ring, GDS counters included
+    const StageImages* images = nullptr;
+    std::uint32_t dim[3] = {1, 1, 1};
+    std::uint32_t threads[3] = {1, 1, 1};
+    std::uint64_t indirect_va = 0;  // read after the settle and captured as the direct dispatch it makes
+    std::vector<std::uint64_t> counters;  // the GDS counter words bound (StageParams::gds_counter)
+    json::Value translate;
+};
+
 class CaptureSession;
 struct CaptureSessionDeleter {
     void operator()(CaptureSession* session) const;  // an unfinished session is logged as abandoned
@@ -142,5 +166,15 @@ CapturePtr capture_begin_locked(CaptureDraw&& draw);
 // After the draw command: reads the targets back, flushes and writes the
 // manifest and blobs.
 void capture_finish_locked(CapturePtr session, const CaptureDynamic& dynamic);
+
+// True when BBHOST_CAPTURE_DISPATCH selects this program and captures remain.
+bool capture_dispatch_candidate(const std::string& program, std::uint64_t flip);
+// After the descriptor set is written and before the dispatch (settled first
+// with capture_settle_locked, so guest memory holds its inputs): copies its
+// inputs and records its images' readbacks. Null when rejected.
+CapturePtr capture_dispatch_begin_locked(CaptureDispatch&& dispatch);
+// After the dispatch: runs it, reads the same guest pages again and writes the
+// manifest and blobs.
+void capture_dispatch_finish_locked(CapturePtr session);
 
 }  // namespace gpu
