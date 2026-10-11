@@ -303,6 +303,29 @@ public:
         return true;
     }
 
+    // The same for a range of a buffer (a tessellated draw's LDS ring).
+    bool buffer_readback(const std::string& name, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, std::string& why) {
+        Readback rb;
+        rb.blob = name;
+        rb.bytes = bytes;
+        if (!bytes || !create_dev_buffer(rb.staging, bytes, true)) {
+            why = "no host-visible staging buffer of " + std::to_string(bytes) + " bytes";
+            return false;
+        }
+        readbacks.push_back(rb);
+        begin_recording_locked();
+        transfer_flush_locked();
+        render_end_pass_locked();
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(g_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0,
+                             nullptr);
+        const VkBufferCopy region{offset, 0, bytes};
+        vkCmdCopyBuffer(g_cmd(), buffer, rb.staging.buffer, 1, &region);
+        return true;
+    }
+
     bool target_readbacks(const char* when, json::Value& targets, std::string& why) {
         const CaptureDraw& d = draw;
         json::Value& colors = const_cast<json::Value&>(json::member(targets, "color"));
@@ -352,6 +375,82 @@ void CaptureSessionDeleter::operator()(CaptureSession* s) const {
         for (Readback& r : s->readbacks) defer_destroy(r.staging);
     }
     delete s;
+}
+
+namespace {
+
+// Vulkan vertex input as the manifest holds it: the elements, the attributes,
+// and each binding's bytes from its first one up to the last vertex the draw
+// reads (`last` with the base vertex added), in blobs named <prefix><binding>.
+bool vertex_input_json(CaptureSession& s, const CaptureVertexInput& vi, std::uint64_t last, const char* prefix, json::Value& out,
+                       std::string& why) {
+    out = json::Value::make_object();
+    json::Value elements = json::Value::make_array();
+    for (const gcn::VertexElement& e : vi.elements) {
+        json::Value ej = json::Value::make_object();
+        ej.set("location", e.location);
+        ej.set("vdata", e.vdata);
+        ej.set("count", e.count);
+        ej.set("w3", json::hex(e.w3));
+        elements.push(ej);
+    }
+    out.set("elements", elements);
+    json::Value bindings = json::Value::make_array();
+    for (std::size_t b = 0; b < vi.bindings.size(); ++b) {
+        const VkVertexInputBindingDescription& bd = vi.bindings[b];
+        if (bd.binding != b) {
+            why = "vertex input bindings are not numbered in order";
+            return false;
+        }
+        std::uint64_t bytes = 0;
+        for (const VkVertexInputAttributeDescription& a : vi.attributes) {
+            if (a.binding != bd.binding) continue;
+            const std::uint32_t w3 = a.location < vi.elements.size() ? vi.elements[a.location].w3 : 0;
+            bytes = std::max<std::uint64_t>(bytes, a.offset + last * bd.stride + vertex_element_bytes((w3 >> 15) & 0xf));
+        }
+        const std::uint64_t va = b < vi.binding_va.size() ? vi.binding_va[b] : 0;
+        const std::string where = "vertex input binding " + std::to_string(b);
+        if (!va || !bytes || bytes > kMaxVertexBytes) {
+            why = where + " has no guest address or is too large to capture";
+            return false;
+        }
+        if (!hle_kernel_va_mapped(va, bytes)) {
+            why = where + " is not mapped";
+            return false;
+        }
+        std::vector<std::uint8_t> data(bytes);
+        read_guest_locked(va, bytes, data.data());
+        const std::string name = prefix + std::to_string(b);
+        s.blob(name, data.data(), data.size());
+        json::Value bj = json::Value::make_object();
+        bj.set("binding", bd.binding);
+        bj.set("stride", bd.stride);
+        bj.set("guest_va", json::hex(va));
+        bj.set("bytes", bytes);
+        bj.set("blob", name);
+        bindings.push(bj);
+    }
+    out.set("bindings", bindings);
+    json::Value attributes = json::Value::make_array();
+    for (const VkVertexInputAttributeDescription& a : vi.attributes) {
+        json::Value aj = json::Value::make_object();
+        aj.set("location", a.location);
+        aj.set("binding", a.binding);
+        aj.set("format", static_cast<unsigned>(a.format));
+        aj.set("offset", a.offset);
+        attributes.push(aj);
+    }
+    out.set("attributes", attributes);
+    return true;
+}
+
+}  // namespace
+
+bool capture_wanted() {
+    const Config& c = config();
+    if (!c.enabled) return false;
+    std::lock_guard<GpuMutex> lock(g.mu);  // the counts are the capturing draws'
+    return g_captured < c.count && g_rejected < kMaxRejections;
 }
 
 bool capture_candidate(const std::string& pipeline, std::uint32_t count, std::uint64_t flip, bool lean_ready, std::uint64_t indirect_va) {
@@ -644,6 +743,14 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
         stages.push(sj);
     }
 
+    // A tessellated draw's LS and hull programs reach memory through the page
+    // table with their own user data.
+    if (d.tess.present) {
+        program_ranges(d.tess.ls_words, d.tess.ls_user, ranges);
+        program_ranges(d.tess.ls_fetch_words, d.tess.ls_user, ranges);
+        program_ranges(d.tess.hs_words, d.tess.hs_user, ranges);
+    }
+
     // Guest pages in the GPU page table that the shaders can reach.
     std::set<std::uint64_t> pages;
     for (const auto& [va, bytes] : ranges) {
@@ -707,55 +814,113 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
     json::Value vertex_input;  // null for a draw that runs its fetch shader
     if (d.vertex_input) {
         if (d.base_vertex < 0) return reject("vertex input with a negative base vertex");
-        const std::uint64_t base = static_cast<std::uint64_t>(d.base_vertex);
-        vertex_input = json::Value::make_object();
-        json::Value elements = json::Value::make_array();
-        for (const gcn::VertexElement& e : d.vinput.elements) {
-            json::Value ej = json::Value::make_object();
-            ej.set("location", e.location);
-            ej.set("vdata", e.vdata);
-            ej.set("count", e.count);
-            ej.set("w3", json::hex(e.w3));
-            elements.push(ej);
+        std::string why;
+        if (!vertex_input_json(s, d.vinput, static_cast<std::uint64_t>(d.base_vertex) + last_vertex, "vertex-binding", vertex_input, why)) {
+            return reject(why);
         }
-        vertex_input.set("elements", elements);
-        json::Value bindings = json::Value::make_array();
-        for (std::size_t b = 0; b < d.vinput.bindings.size(); ++b) {
-            const VkVertexInputBindingDescription& bd = d.vinput.bindings[b];
-            if (bd.binding != b) return reject("vertex input bindings are not numbered in order");
-            std::uint64_t bytes = 0;
-            for (const VkVertexInputAttributeDescription& a : d.vinput.attributes) {
-                if (a.binding != bd.binding) continue;
-                const std::uint32_t w3 = a.location < d.vinput.elements.size() ? d.vinput.elements[a.location].w3 : 0;
-                bytes = std::max<std::uint64_t>(bytes, a.offset + (base + last_vertex) * bd.stride + vertex_element_bytes((w3 >> 15) & 0xf));
+    }
+
+    // A draw on the host's tessellator: the stages around the domain shader,
+    // the LS's and hull's programs, the LDS the LS pass left in the ring (the
+    // game's hull), and the draw as the game made it.
+    json::Value tess_json;  // null for other draws
+    if (d.tess.present) {
+        const CaptureTess& t = d.tess;
+        tess_json = json::Value::make_object();
+        tess_json.set("kind", t.hull ? "hull" : t.attrs ? "attributes" : "constant");
+        tess_json.set("control_points", t.control_points);
+        tess_json.set("attr_vec4s", t.attr_vec4s);
+        tess_json.set("window", t.window);
+        tess_json.set("quads", t.quads);
+        tess_json.set("cw", t.cw);
+        tess_json.set("spacing", t.spacing);
+        json::Value outer = json::Value::make_array(), inner = json::Value::make_array();
+        for (float f : t.outer) outer.push(json::f32(f));
+        for (float f : t.inner) inner.push(json::f32(f));
+        tess_json.set("outer", outer);
+        tess_json.set("inner", inner);
+        if (t.vertex_spirv.empty() || t.control_spirv.empty()) return reject("a tessellated draw without its vertex or control stage module");
+        s.blob("tess-vs-spirv", reinterpret_cast<const std::uint8_t*>(t.vertex_spirv.data()), t.vertex_spirv.size() * 4);
+        s.blob("tess-tcs-spirv", reinterpret_cast<const std::uint8_t*>(t.control_spirv.data()), t.control_spirv.size() * 4);
+        tess_json.set("vertex_spirv", "tess-vs-spirv");
+        tess_json.set("control_spirv", "tess-tcs-spirv");
+        const auto program = [&](const char* key, const std::vector<std::uint32_t>* words, const char* blob) {
+            if (words && !words->empty()) {
+                s.blob(blob, reinterpret_cast<const std::uint8_t*>(words->data()), words->size() * 4);
+                tess_json.set(key, blob);
+            } else {
+                tess_json.set(key, nullptr);
             }
-            const std::uint64_t va = b < d.vinput.binding_va.size() ? d.vinput.binding_va[b] : 0;
-            const std::string where = "vertex input binding " + std::to_string(b);
-            if (!va || !bytes || bytes > kMaxVertexBytes) return reject(where + " has no guest address or is too large to capture");
-            if (!hle_kernel_va_mapped(va, bytes)) return reject(where + " is not mapped");
-            std::vector<std::uint8_t> data(bytes);
-            read_guest_locked(va, bytes, data.data());
-            const std::string name = "vertex-binding" + std::to_string(b);
-            s.blob(name, data.data(), data.size());
-            json::Value bj = json::Value::make_object();
-            bj.set("binding", bd.binding);
-            bj.set("stride", bd.stride);
-            bj.set("guest_va", json::hex(va));
-            bj.set("bytes", bytes);
-            bj.set("blob", name);
-            bindings.push(bj);
+        };
+        program("ls_gcn", t.ls_words, "ls-gcn");
+        program("ls_fetch_gcn", t.ls_fetch_words, "ls-fetch-gcn");
+        program("hs_gcn", t.hs_words, "hs-gcn");
+        json::Value rs = json::Value::make_array();
+        rs.push(json::hex(t.ls_rsrc1));
+        rs.push(json::hex(t.ls_rsrc2));
+        tess_json.set("ls_rsrc", rs);
+        rs = json::Value::make_array();
+        rs.push(json::hex(t.hs_rsrc1));
+        rs.push(json::hex(t.hs_rsrc2));
+        tess_json.set("hs_rsrc", rs);
+        tess_json.set("ls_user", hex_words(t.ls_user, 16));
+        tess_json.set("hs_user", hex_words(t.hs_user, 16));
+        tess_json.set("tess_constants", hex_words(t.tess_constants, 12));
+        if (t.hull) {
+            std::string why;
+            if (!t.lds_buffer || !s.buffer_readback("tess-lds", t.lds_buffer, t.lds_offset, t.lds_bytes, why)) {
+                return reject("the LDS ring: " + why);
+            }
+            json::Value lj = json::Value::make_object();
+            lj.set("blob", "tess-lds");
+            lj.set("bytes", t.lds_bytes);
+            lj.set("note", "the ring from the draw's lds_address after the LS pass, before the draw; the evaluation stage's params "
+                           "point at it, and a replay puts its own copy there");
+            tess_json.set("lds", lj);
         }
-        vertex_input.set("bindings", bindings);
-        json::Value attributes = json::Value::make_array();
-        for (const VkVertexInputAttributeDescription& a : d.vinput.attributes) {
-            json::Value aj = json::Value::make_object();
-            aj.set("location", a.location);
-            aj.set("binding", a.binding);
-            aj.set("format", static_cast<unsigned>(a.format));
-            aj.set("offset", a.offset);
-            attributes.push(aj);
+        // The game's draw: an index range of control points, its instances.
+        json::Value nd = json::Value::make_object();
+        nd.set("count", t.count);
+        nd.set("instances", t.instances);
+        nd.set("first_instance", t.first_instance);
+        nd.set("first_point", t.first_point);
+        nd.set("base_vertex", t.base_vertex);
+        nd.set("indexed", t.index_va != 0);
+        std::uint64_t ls_last = t.count ? t.first_point + t.count - 1 : 0;
+        if (t.index_va) {
+            const std::size_t isz = t.index_type ? 4 : 2;
+            const std::uint64_t first_byte = static_cast<std::uint64_t>(t.first_point) * isz;
+            const std::size_t bytes = static_cast<std::size_t>(t.count) * isz;
+            if (!hle_kernel_va_mapped(t.index_va + first_byte, bytes)) return reject("the tessellated draw's index buffer is not mapped");
+            std::vector<std::uint8_t> indices(bytes);
+            read_guest_locked(t.index_va + first_byte, bytes, indices.data());
+            s.blob("tess-index", indices.data(), indices.size());
+            ls_last = 0;
+            for (std::size_t k = 0; k < t.count; ++k) {
+                std::uint32_t v = 0;
+                if (t.index_type) {
+                    std::memcpy(&v, indices.data() + k * 4, 4);
+                } else {
+                    std::uint16_t v16 = 0;
+                    std::memcpy(&v16, indices.data() + k * 2, 2);
+                    v = v16;
+                }
+                ls_last = std::max<std::uint64_t>(ls_last, v);
+            }
+            nd.set("index_type", t.index_type ? "uint32" : "uint16");
+            nd.set("index_blob", "tess-index");
+            nd.set("index_va", json::hex(t.index_va));
         }
-        vertex_input.set("attributes", attributes);
+        tess_json.set("draw", nd);
+        json::Value lvi;
+        if (t.ls_vertex_input && t.base_vertex >= 0) {
+            std::string why;
+            if (!vertex_input_json(s, t.ls_vinput, static_cast<std::uint64_t>(t.base_vertex) + ls_last, "ls-vertex-binding", lvi, why)) {
+                lvi = json::Value();  // the replay of an LS on vertex input is then not possible; the rest is
+                tess_json.set("ls_vertex_input_refused", why);
+            }
+        }
+        tess_json.set("ls_vertex_input", lvi);
     }
 
     json::Value shaders = json::Value::make_object();
@@ -821,6 +986,7 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
     m.set("pipeline", fixed_json(d.fixed));
     m.set("draw", draw);
     m.set("vertex_input", vertex_input);
+    if (d.tess.present) m.set("tessellation", tess_json);
     m.set("stages", stages);
     m.set("images", images);
     m.set("samplers", samplers);

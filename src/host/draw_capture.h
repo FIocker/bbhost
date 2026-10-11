@@ -45,9 +45,48 @@ struct CaptureVertexInput {
     std::vector<std::uint64_t> binding_va;  // guest address of each binding's first byte
 };
 
+// A draw on the host's tessellator: the stages around the domain shader (which
+// is stages[0], bound as the evaluation stage) and what they read.
+//   attributes: the LS is the pipeline's vertex stage and its control point
+//     travels as stage attributes; the control stage is the one made for the
+//     hull shader's constant factors.
+//   hull: the game's own hull shader is the control stage; the LS ran as a
+//     compute pass into the LDS ring before the draw, which then draws one
+//     patch a window (pass-through vertex stage, no index buffer).
+struct CaptureTess {
+    bool present = false;
+    bool hull = false;
+    bool attrs = false;
+    std::uint32_t control_points = 1, attr_vec4s = 0, window = 0;
+    bool quads = true, cw = true;
+    int spacing = 0;
+    float outer[4] = {}, inner[2] = {};
+    std::vector<std::uint32_t> vertex_spirv, control_spirv;  // the modules the pipeline was built with
+    const std::vector<std::uint32_t>* ls_words = nullptr;
+    const std::vector<std::uint32_t>* ls_fetch_words = nullptr;
+    const std::vector<std::uint32_t>* hs_words = nullptr;
+    std::uint32_t ls_rsrc1 = 0, ls_rsrc2 = 0, hs_rsrc1 = 0, hs_rsrc2 = 0;
+    std::uint32_t ls_user[16] = {}, hs_user[16] = {};
+    // hull: the ring the LS pass wrote, read back before the draw.
+    VkBuffer lds_buffer = VK_NULL_HANDLE;
+    VkDeviceSize lds_offset = 0;
+    std::uint32_t lds_bytes = 0;
+    std::uint32_t tess_constants[12] = {};
+    // The draw as the game made it, which a pipeline without the ring draws.
+    std::uint64_t index_va = 0;
+    std::uint32_t index_type = 0, count = 0, instances = 1, first_instance = 0, first_point = 0;
+    std::int32_t base_vertex = 0;
+    // The LS's elements as Vulkan vertex input (its fetch shader and the draw's
+    // vertex table), for an LS lifted on vertex input; empty when the plan
+    // does not cover them.
+    bool ls_vertex_input = false;
+    CaptureVertexInput ls_vinput;
+};
+
 struct CaptureDraw {
     std::string pipeline;
     bool lean = false;  // the no-fallback variant is bound
+    CaptureTess tess;
     std::uint64_t flip = 0, draw_index = 0;
     const char* source = "packets";  // "token": drawn from a host-draw token (BBHOST_GX_NATIVE=2)
     CaptureStage stages[2];  // vertex, pixel
@@ -85,6 +124,10 @@ struct CaptureSessionDeleter {
 };
 using CapturePtr = std::unique_ptr<CaptureSession, CaptureSessionDeleter>;
 
+// True while BBHOST_CAPTURE_DRAW is set and captures remain: the game's hull
+// draws then take the LS pass, which a capture describes, instead of native
+// pipelines (render.cpp).
+bool capture_wanted();
 // True when BBHOST_CAPTURE_DRAW selects this draw and captures remain.
 // `lean_ready`: the pipeline's no-fallback variant is built, so the draw will most likely bind it (the `*` mode needs it).
 // `indirect_va`: an indirect draw's arguments; one whose arguments count nothing now is not a candidate.
