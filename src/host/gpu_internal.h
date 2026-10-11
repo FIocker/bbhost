@@ -745,6 +745,11 @@ std::string untile_gpu_report();
 // next read copy it again, or - written by the GPU - bind it from the import.
 bool buffer_shadow_on();  // BBHOST_BUFFER_SHADOW, else on except on an integrated GPU or with tight memory
 void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
+// A copy of [va, va+bytes) - `loc`, its import, which the mirrors keep in host
+// memory - made for one draw in device memory, in the same uploads; `loc`
+// becomes the copy. False, `loc` unchanged, for a range past 1 MiB, one the
+// GPU writes earlier in this recording, or no room left in the staging chunks.
+bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu);
 // Diagnostic: describes what the mirror holds for a range and whether a page it
 // is still serving has been written since this recording's check of it.

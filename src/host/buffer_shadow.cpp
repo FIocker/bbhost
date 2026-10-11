@@ -317,6 +317,58 @@ Mirror* mirror_for(std::uint32_t chunk) {
     return &m;
 }
 
+// ---- per-draw copies of vertex ranges left in host memory ----------------------
+// A page the game keeps rewriting is read from host memory for good
+// (go_dynamic), and a draw on vertex input then fetches it across PCIe vertex
+// by vertex: two Scaleform pipelines went from 72 to 183 and from 64 to 97 us a
+// draw on an RTX 4070 when their vertex tables first came from memory
+// (render.cpp vertex_table_from_memory). shadow_stage_locked copies such a
+// range for its draw alone into device memory, in the uploads that run just
+// ahead of the draw's submission: the copy holds what the draw used to read
+// from host memory as it ran, and the uploads' closing barrier orders it before
+// the vertex fetch. The copies are packed into device-local chunks, which a
+// slot holds from its first upload until its upload buffer is begun again -
+// by then every submission that read them has retired.
+struct StageChunk {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+};
+constexpr VkDeviceSize kStageChunkBytes = 4ull << 20;
+constexpr VkDeviceSize kStageMaxBytes = 1ull << 20;  // a larger range stays in host memory
+constexpr std::size_t kStageMaxChunks = 32;          // 128 MiB of video memory at most
+std::vector<StageChunk> g_stage_free;
+std::vector<StageChunk> g_stage_held[kSlots];  // each slot's chunks, the last the one being filled
+VkDeviceSize g_stage_fill[kSlots] = {};        // bytes used in the slot's last chunk
+std::size_t g_stage_chunks = 0;                // chunks made
+std::atomic<std::uint64_t> g_staged{0}, g_staged_bytes{0}, g_stage_refused{0};
+
+void stage_release_slot(int slot) {
+    for (const StageChunk& c : g_stage_held[slot]) g_stage_free.push_back(c);
+    g_stage_held[slot].clear();
+    g_stage_fill[slot] = 0;
+}
+
+bool new_stage_chunk(StageChunk& c) {
+    if (g_stage_chunks >= kStageMaxChunks || g_given_back) return false;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = kStageChunkBytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+    if (vkCreateBuffer(g.device, &bci, nullptr, &c.buffer) != VK_SUCCESS) return false;
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g.device, c.buffer, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex = find_memory_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (mai.memoryTypeIndex == UINT32_MAX || vkAllocateMemory(g.device, &mai, nullptr, &c.memory) != VK_SUCCESS) {
+        vkDestroyBuffer(g.device, c.buffer, nullptr);
+        c = StageChunk{};
+        return false;
+    }
+    vkBindBufferMemory(g.device, c.buffer, c.memory, 0);
+    ++g_stage_chunks;
+    return true;
+}
+
 VkCommandBuffer upload_cmd_locked() {
     if (g_upload_slot == g.slot) return g_upload_cmd[g.slot];
     VkCommandBuffer& cmd = g_upload_cmd[g.slot];
@@ -345,6 +397,7 @@ VkCommandBuffer upload_cmd_locked() {
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &bi);
+    stage_release_slot(g.slot);  // the slot's last uploads have run: their staged copies are free
     // Earlier submissions' reads of the mirror finish before these writes.
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT;
@@ -632,6 +685,55 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
 // next one, so `valid + checked-this-recording + written` is a page whose
 // mirror the GPU will read stale. Pure: `write_watch_dirty` only memoises a
 // clean answer, and a written watch stays written until it is armed again.
+bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc) {
+    if (!buffer_shadow_on() || !bytes || !loc.buffer || loc.avail < bytes) return false;
+    if (bytes > kStageMaxBytes) {
+        bump(g_stage_refused);
+        return false;
+    }
+    // A page the GPU writes earlier in this recording: the copy would run
+    // ahead of that write. The mirror's page state is what tells; without a
+    // mirror for the chunk there is none, and the range stays where it is.
+    std::uint32_t chunk = 0;
+    std::uint64_t off = 0;
+    if (!phys_of(va, bytes, chunk, off)) return false;
+    const Mirror& m = g_mirrors[chunk];
+    if (m.pages.empty()) return false;
+    const std::uint64_t stamp = g.record_serial + 1;
+    for (std::uint64_t p = off >> kPageShift; p <= (off + bytes - 1) >> kPageShift; ++p) {
+        if (m.pages[p].gpu_written == stamp) {
+            bump(g_stage_refused);
+            return false;
+        }
+    }
+    const VkCommandBuffer cmd = upload_cmd_locked();
+    if (!cmd) return false;
+    const int slot = g.slot;
+    const VkDeviceSize need = (bytes + 255) & ~VkDeviceSize{255};
+    if (g_stage_held[slot].empty() || g_stage_fill[slot] + need > kStageChunkBytes) {
+        StageChunk c;
+        if (!g_stage_free.empty()) {
+            c = g_stage_free.back();
+            g_stage_free.pop_back();
+        } else if (!new_stage_chunk(c)) {
+            bump(g_stage_refused);
+            return false;
+        }
+        g_stage_held[slot].push_back(c);
+        g_stage_fill[slot] = 0;
+    }
+    const StageChunk& c = g_stage_held[slot].back();
+    const VkBufferCopy region{loc.offset, g_stage_fill[slot], bytes};
+    vkCmdCopyBuffer(cmd, loc.buffer, c.buffer, 1, &region);
+    loc.buffer = c.buffer;
+    loc.offset = g_stage_fill[slot];
+    loc.avail = bytes;
+    g_stage_fill[slot] += need;
+    bump(g_staged);
+    g_staged_bytes.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+}
+
 void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::size_t n) {
     if (!out || !n) return;
     out[0] = 0;
@@ -1020,7 +1122,12 @@ std::string shadow_report() {
                       static_cast<unsigned long long>(g_returns));
         out += gr;
     }
-    return out;
+    char st[200];
+    std::snprintf(st, sizeof(st), "; vertex ranges copied for their draw %llu (%.1f MiB), left in host memory %llu, staging chunks %zu (%zu MiB)",
+                  static_cast<unsigned long long>(g_staged.load()), static_cast<double>(g_staged_bytes.load()) / (1 << 20),
+                  static_cast<unsigned long long>(g_stage_refused.load()), g_stage_chunks,
+                  static_cast<std::size_t>((g_stage_chunks * kStageChunkBytes) >> 20));
+    return out + st;
 }
 
 }  // namespace gpu

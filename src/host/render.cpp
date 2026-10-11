@@ -385,6 +385,7 @@ const int g_vertex_input = [] {
 }();
 std::atomic<std::uint64_t> g_vertex_input_draws{0}, g_vertex_input_kept{0}, g_vertex_tables_read{0};
 std::atomic<std::uint64_t> g_vertex_tables_with_input{0};  // vertex-input draws whose vertex shader still reads the table
+std::atomic<std::uint64_t> g_vertex_staged_records{0};  // plan_vertex_input: records copied into device memory for their draw
 // BBHOST_GX_SKIP_TABLES (on unless 0): GX draws leave out of the
 // host ring the user-data tables and blocks their no-fallback variant does not
 // read (table_slots_read), once that variant exists. A draw that ends up on the
@@ -7475,6 +7476,8 @@ void render_report() {
                  "read them %llu; tables the game bound itself, read from memory %llu",
                  static_cast<unsigned long long>(g_vertex_input_draws.load()), static_cast<unsigned long long>(g_vertex_input_kept.load()),
                  static_cast<unsigned long long>(g_vertex_tables_with_input.load()), static_cast<unsigned long long>(g_vertex_tables_read.load()));
+        host_log("render: vertex records the buffer shadow keeps in host memory, copied into device memory for their draw %llu",
+                 static_cast<unsigned long long>(g_vertex_staged_records.load()));
     }
     if (const std::uint64_t n = g_set_reused.load() + g_set_built.load()) {
         host_log("render: stage descriptor sets %llu, taken from the stage's previous draw %llu (%.1f%%), written %llu; "
@@ -9069,16 +9072,24 @@ bool vertex_format_usable(VkFormat f) {
 // record from one user-data pair, so the records are read from that table
 // now, as the fetch shader would read them on the GPU, and the draw can take
 // Vulkan vertex input like the rest instead of walking the page table for
-// every vertex. False when the fetch shader loads from more than one pair or
-// a record is unreadable. BBHOST_VERTEX_TABLE_FROM_MEMORY=1 turns it on: it
-// moved ~174k draws a run onto vertex input but paid for nothing - the Steam
-// Deck at the spawn within noise (GPU 16.80/16.73 against 16.76/16.69 ms a
-// frame, windowed 57.1/57.1 against 57.0/57.3 fps), and on the RTX 4070 two of
-// those pipelines got slower (72 -> 183 and 64 -> 97 us a draw: their vertex
-// data stays in host memory, which its fixed-function fetch reads over PCIe).
+// every vertex - and so its vertex shader can be lifted. False when the fetch
+// shader loads from more than one pair or a record is unreadable. On unless
+// BBHOST_VERTEX_TABLE_FROM_MEMORY=0. When it was first tried, on the RTX 4070
+// two of those pipelines got slower (72 -> 183 and 64 -> 97 us a draw): their
+// vertex data is a ring the game rewrites, which the buffer shadow leaves in
+// host memory, and the fixed-function fetch read it across PCIe vertex by
+// vertex. Such a range is now copied into device memory for its draw
+// (shadow_stage_locked, BBHOST_VERTEX_STAGE).
 const bool g_vertex_table_from_memory = [] {
     const char* e = std::getenv("BBHOST_VERTEX_TABLE_FROM_MEMORY");
-    return e && e[0] == '1';
+    return !(e && e[0] == '0');
+}();
+// BBHOST_VERTEX_STAGE (on unless 0): a vertex-input range the buffer shadow
+// keeps in host memory is copied into device memory for its draw
+// (shadow_stage_locked) instead of fetched from the import.
+const bool g_vertex_stage = [] {
+    const char* e = std::getenv("BBHOST_VERTEX_STAGE");
+    return !(e && e[0] == '0');
 }();
 bool vertex_table_from_memory(const std::vector<std::uint32_t>& fetch_words, std::uint64_t fetch_hash, const std::uint32_t* vs_user,
                               const GxDrawObjects& o, GxDrawObjects& out) {
@@ -9226,6 +9237,8 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         }
         // Read from device memory when the record's whole extent can be kept
         // there (buffer_shadow.cpp); every element of the record shares it.
+        // A record the mirrors keep in host memory (a ring the game rewrites)
+        // is copied into device memory for this draw (shadow_stage_locked).
         const RecordShadow* rs = nullptr;
         for (std::size_t k = 0; k < n_shadows; ++k) {
             if (std::memcmp(shadows[k].w, w, 12) == 0) rs = &shadows[k];
@@ -9239,7 +9252,13 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
                 shadow_locate_locked(record_va, record_bytes, ns.whole);
-                if (ns.whole.buffer == loc.buffer) ns.whole = {};  // stays in host memory
+                if (ns.whole.buffer == loc.buffer) {  // stays in host memory
+                    if (g_vertex_stage && shadow_stage_locked(record_va, record_bytes, ns.whole)) {
+                        bump(g_vertex_staged_records);
+                    } else {
+                        ns.whole = {};
+                    }
+                }
             }
             rs = &ns;
         }
