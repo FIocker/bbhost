@@ -2,7 +2,6 @@
 #include "core/host_clock.h"
 #include "core/paced_file.h"
 #include "core/portable.h"
-#include "host/dispatch_guard.h"
 #include "host/foreign_hooks.h"
 #include "host/draw_capture.h"
 #include "host/gpu_internal.h"
@@ -4200,6 +4199,7 @@ void retire_slot_locked(int k) {
     }
     vkResetFences(g.device, 1, &sl.fence);
     indirect_stats_retired_locked(sl.serial);
+    indirect_clamp_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
     for (DevBuffer& b : sl.garbage) {
@@ -5562,52 +5562,6 @@ std::atomic<int> g_gds_traced{0};
 bool counter_start_locked(const GpuDispatch::GdsCounter& c);
 }
 
-bool hle_gnm_small_copy_source(std::uint64_t va, std::uint64_t* src);  // gnm_exec.cpp
-
-namespace {
-// An indirect dispatch whose arguments ask for more than 65,535 thread groups
-// in a dimension is skipped (host/dispatch_guard.h), said once a shader.
-// BBHOST_INDIRECT_GUARD=0 runs it.
-const bool g_indirect_guard = [] {
-    const char* e = std::getenv("BBHOST_INDIRECT_GUARD");
-    return !(e && e[0] == '0');
-}();
-std::atomic<std::uint64_t> g_indirect_skipped{0};
-std::set<std::string> g_indirect_skipped_shaders;  // under g.mu
-
-// The arguments of an indirect dispatch as the GPU will read them: the
-// command processor's copies into them are done by now (on the CPU, as it
-// walks the stream), and a CP write still pending is laid over memory.
-// False, after saying so once a shader, when they ask past the limit.
-bool indirect_dispatch_fits(const GpuDispatch& d, const std::string& name) {
-    std::uint32_t groups[3] = {};
-    if (!hle_kernel_va_mapped(d.indirect_va, sizeof(groups))) return true;  // the dispatch's own path refuses it
-    read_guest_locked(d.indirect_va, sizeof(groups), groups);
-    if (dispatch_guard::groups_fit(groups)) return true;
-    const std::uint64_t n = g_indirect_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (g_indirect_skipped_shaders.insert(name).second) {
-        char from[160];
-        std::uint64_t src = 0;
-        if (hle_gnm_small_copy_source(d.indirect_va, &src)) {
-            std::uint32_t now = 0;
-            if (hle_kernel_va_mapped(src, sizeof(now))) read_guest_locked(src, sizeof(now), &now);
-            std::snprintf(from, sizeof(from), "the command processor copied them from 0x%llx (an append buffer's counter, holding %u, 0x%08x)",
-                          static_cast<unsigned long long>(src), now, now);
-        } else {
-            std::snprintf(from, sizeof(from), "no copy of the command processor's wrote them");
-        }
-        host_log("gpu: an indirect dispatch of %s asks for %ux%ux%u thread groups, past D3D11's %u a dimension, which this engine's "
-                 "PC renderer keeps to: skipped, as is every such dispatch of it from now on (BBHOST_INDIRECT_GUARD=0 runs them). Its "
-                 "arguments at 0x%llx: %s",
-                 name.c_str(), groups[0], groups[1], groups[2], dispatch_guard::kMaxGroups, static_cast<unsigned long long>(d.indirect_va),
-                 from);
-    } else if (n % 1000 == 0) {
-        host_log("gpu: %llu indirect dispatches skipped for asking past %u thread groups a dimension", static_cast<unsigned long long>(n),
-                 dispatch_guard::kMaxGroups);
-    }
-    return false;
-}
-}  // namespace
 bool host_gpu_gds_counters() {
     static const bool on = [] {
         const char* e = std::getenv("BBHOST_GDS_COUNTERS");
@@ -5643,9 +5597,6 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         g_dispatch_shaders.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(g_dispatch_census_mu);
         ++g_dispatch_census[name];
-    }
-    if (d.indirect_va && g_indirect_guard && !indirect_dispatch_fits(d, name)) {
-        return true;  // nothing recorded: no native renderer of this engine asks for it
     }
     const auto t_pt = std::chrono::steady_clock::now();
     const bool pt_ok = rebuild_page_tables();
@@ -5917,6 +5868,21 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     infos.reserve(pl.meta.images.size() + pl.meta.samplers.size() + 1);
     bind_stage_images(set, pl.meta, stage_images, writes, infos, pl.name.c_str());
     vkUpdateDescriptorSets(g.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    // An indirect dispatch's arguments, checked on the GPU just before it
+    // reads them (indirect_clamp.cpp): a group count past 65,535 runs nothing.
+    VkBuffer args_buffer = VK_NULL_HANDLE;
+    VkDeviceSize args_offset = 0;
+    if (d.indirect_va) {
+        if (g_import_audit) audit_range(d.indirect_va, 12, kUseIndex);
+        const Located loc = locate(d.indirect_va, 12);
+        if (!loc.buffer || loc.avail < 12) {
+            g.failures.fetch_add(1);
+            return false;
+        }
+        args_buffer = loc.buffer;
+        args_offset = loc.offset;
+        if (!g_render_min) indirect_clamp_locked(loc.buffer, loc.offset, d.indirect_va, name, args_buffer, args_offset);
+    }
     rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pl.pipeline);
     const std::uint32_t params_offset = static_cast<std::uint32_t>(ubi.offset);
     rec().bind_sets(VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_layout, 0, 1, &set, set_cache_on() ? 1 : 0, &params_offset);
@@ -5952,14 +5918,7 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     note_dispatch_name(g.dispatches.load(), pl.name.c_str());
     gpu_checkpoint(2, g.dispatches.load());
     if (d.indirect_va) {
-        if (g_import_audit) audit_range(d.indirect_va, 12, kUseIndex);
-        const Located loc = locate(d.indirect_va, 12);
-        if (!loc.buffer || loc.avail < 12) {
-            profile_end_locked();
-            g.failures.fetch_add(1);
-            return false;
-        }
-        if (!g_render_min) rec().dispatch_indirect(loc.buffer, loc.offset);
+        if (!g_render_min) rec().dispatch_indirect(args_buffer, args_offset);
         note_indirect_locked(d.indirect_va, 0, pl.meta.gds_counters != 0);
     } else {
         if (!g_render_min) rec().dispatch(d.dim[0], d.dim[1], d.dim[2]);
@@ -7143,6 +7102,7 @@ void host_gpu_report() {
         host_log("gpu:   recognised as an image copy: %llu image-to-image, %llu buffer-to-image (they still run their shader)",
                  static_cast<unsigned long long>(g_dispatch_image_blits.load()),
                  static_cast<unsigned long long>(g_dispatch_buf_to_image.load()));
+        host_log("gpu: %s", indirect_clamp_report().c_str());
         host_log("gpu: dispatch census: %llu reached a shader over %zu programs, %llu were a fill and %llu a copy (no shader runs "
                  "for those)",
                  static_cast<unsigned long long>(g_dispatch_shaders.load()), g_dispatch_census.size(),

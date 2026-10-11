@@ -6,7 +6,6 @@
 #include "hle/common.h"
 #include "core/portable.h"
 #include "engine/yebis_bind.h"
-#include "host/dispatch_guard.h"
 #include "host/frame_stats.h"
 #include "hle/modules.h"
 #include "host/gpu.h"
@@ -36,12 +35,6 @@
 #endif
 
 namespace {
-
-// The command processor's last small copies (host/dispatch_guard.h): when
-// host_gpu_dispatch skips an indirect dispatch for its size, they name the
-// counter its arguments were copied from. Per CP thread: a copy and the
-// dispatch it feeds are in one command stream, walked on one thread.
-thread_local dispatch_guard::SmallCopies t_small_copies;
 
 constexpr std::uint32_t kNop = 0x10;
 constexpr std::uint32_t kIndirectBufferConst = 0x33;
@@ -1474,7 +1467,6 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                         g_exec_writes.fetch_add(1);
                         std::memmove(reinterpret_cast<void*>(static_cast<std::uintptr_t>(dst)),
                                      reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src)), bytes);
-                        t_small_copies.note(dst, src, bytes);
                     }
                 }
             }
@@ -2080,10 +2072,6 @@ void execute(const std::uint32_t* cb, std::size_t dwords, int depth) {
 }
 
 }  // namespace
-
-// Where the command processor's newest small copy over `va` read it from
-// (host_gpu_dispatch's indirect-dispatch guard).
-bool hle_gnm_small_copy_source(std::uint64_t va, std::uint64_t* src) { return t_small_copies.source_of(va, *src); }
 
 namespace {
 

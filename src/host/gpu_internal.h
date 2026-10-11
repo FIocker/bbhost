@@ -759,6 +759,16 @@ void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu);
 // a second the log says what they held. `counting`: a dispatch whose program
 // counts in GDS.
 void note_indirect_locked(std::uint64_t args_va, int kind, bool counting);
+// indirect_clamp.cpp: an indirect dispatch's arguments (src at src_offset,
+// guest `va`) copied into a ring slot and checked on the GPU in stream order,
+// a count past 65,535 groups a dimension zeroed; the dispatch then reads
+// buffer/offset. False when the check is off (BBHOST_INDIRECT_GUARD=0) or
+// unavailable: read the arguments in place. `name`: the program, logged once
+// if it is ever clamped (when its submission is done).
+bool indirect_clamp_locked(VkBuffer src, VkDeviceSize src_offset, std::uint64_t va, const std::string& name, VkBuffer& buffer,
+                           VkDeviceSize& offset);
+void indirect_clamp_retired_locked(std::uint64_t serial);
+std::string indirect_clamp_report();
 // Diagnostic: describes what the mirror holds for a range and whether a page it
 // is still serving has been written since this recording's check of it.
 void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::size_t n);
