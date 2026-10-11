@@ -3,6 +3,8 @@
 #include "hle/libc_abi.h"
 #include "hle/libc_stdio.h"
 #include "hle/libc_float.h"
+#include "guest_abi.h"
+#include "hle/sysv_va.h"
 
 #include <elf.h>
 #include <sys/mman.h>
@@ -20,6 +22,11 @@
 #define CHECK(expr) do { if (!(expr)) { \
     std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr); \
     std::exit(1); } } while (0)
+
+extern "C" GUEST_ABI int oracle_wide_body(char16_t* b, std::uint64_t n, const char16_t* fmt, SysvVaList* ap) {
+    return sysv_vswprintf(b, n, fmt, ap);
+}
+SYSV_VA_ENTRY(oracle_wide_format, oracle_wide_body, 3, rcx)
 
 namespace {
 int oracle_errno;
@@ -182,6 +189,41 @@ int main() {
         std::memcpy(&flags, wrong_direction, sizeof(flags));
         CHECK(flags & 0x200);
     }
+    const auto native_swprintf = lib.function<int(*)(char16_t*, std::size_t, const char16_t*, ...)>("nJz16JE1txM");
+    const auto native_swprintf_s = lib.function<int(*)(char16_t*, std::size_t, const char16_t*, ...)>("Im55VJ-Bekc");
+    bool compare_secure = true;
+    auto compare_format = [&](std::size_t n, const char16_t* fmt, auto... args) {
+        char16_t native[300], host[300];
+        std::fill(std::begin(native), std::end(native), 0xa5a5);
+        std::fill(std::begin(host), std::end(host), 0xa5a5);
+        const auto a = native_swprintf(native, n, fmt, args...);
+        const auto b = oracle_wide_format(host, n, fmt, args...);
+        CHECK(a == b && std::memcmp(native, host, sizeof(host)) == 0);
+        if (a >= 0 && n && compare_secure) {
+            char16_t secure[300];
+            std::fill(std::begin(secure), std::end(secure), 0xa5a5);
+            CHECK(native_swprintf_s(secure, n, fmt, args...) == a);
+            CHECK(std::memcmp(secure, host, sizeof(host)) == 0);
+        }
+    };
+    compare_format(300, u"%ls%ls%ls", u"title:/Shader/", u"Tex1", u".vpo");
+    compare_format(128, u"syntax error at line %d near: ", 137);
+    compare_format(300, u"\u3042[%*.*ls][%-4lc][%s][%c]", 5, 2, u"\u00e9\u3042\u03a9", 0x03a9, "ASCII", 'x');
+    compare_format(300, u"%ld|%lld|%.2f|%d", 1234567890123LL, -9876543210LL, 1.25, -7);
+    compare_format(300, u"%d %d %d %d %d %d %d %d %d %.1f", 1,2,3,4,5,6,7,8,9,2.5);
+    for (std::size_t n = 0; n < 7; ++n) compare_format(n, u"abcd");
+    compare_format(300, u"%ls", std::u16string(270, u'\u3042').c_str());
+    compare_format(300, u"[%s][%3.1s]", "\xc3\xa9\xe3\x81\x82", "\xc3\xa9\xe3\x81\x82");
+    compare_format(0, u"");
+    // Secure formatter rejects null %s through its runtime-constraint
+    // handler; that policy/import is deliberately outside this oracle.
+    compare_secure = false;
+    compare_format(300, u"[%s][%ls]", static_cast<const char*>(nullptr), static_cast<const char16_t*>(nullptr));
+    oracle_errno = 73;
+    char16_t invalid[20];
+    CHECK(native_swprintf(invalid, 20, u"prefix%c", 0xe9) == -1 && oracle_errno == 73);
+    oracle_errno = 73;
+    CHECK(native_swprintf(invalid, 20, u"prefix%s", "\xff") == -1 && oracle_errno == 86);
     std::mt19937_64 rng(37);
     const char* extra[] = {"0x", "0xg", "0x1", "0778", "--12", "+-12", "-+12", "++12", " - 12",
         "9223372036854775808", "-9223372036854775809", "18446744073709551616", "-18446744073709551616"};

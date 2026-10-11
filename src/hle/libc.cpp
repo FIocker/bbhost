@@ -863,14 +863,6 @@ GUEST_ABI const Gwchar* hle_wmemchr(const Gwchar* s, Gwchar c, std::uint64_t n) 
     }
     return nullptr;
 }
-GUEST_ABI int hle_swprintf(Gwchar* b, std::uint64_t n, const Gwchar* fmt, ...) {
-    if (!b || n == 0) {
-        return 0;
-    }
-    b[0] = 0;
-    (void)fmt;
-    return 0;
-}
 GUEST_ABI int hle_wprintf(const Gwchar*, ...) { return 0; }
 // swscanf: narrow both strings (ASCII data in practice) and defer to vsscanf.
 // %s/%c conversions would need wide targets; they are rejected (return 0).
@@ -924,6 +916,15 @@ extern "C" GUEST_ABI int hle_va_fscanf_body(FILE* f, const char* fmt, SysvVaList
 extern "C" GUEST_ABI int hle_va_sscanf_body(const char* s, const char* fmt, SysvVaList* ap) {
     return sysv_vsscanf(s, fmt, ap);
 }
+extern "C" GUEST_ABI int hle_va_swprintf_body(Gwchar* b, std::uint64_t n, const Gwchar* fmt, SysvVaList* ap) {
+    const int saved_errno = errno;
+    errno = 0;
+    const int r = sysv_vswprintf(b, n, fmt, ap);
+    const int error = errno;
+    errno = saved_errno;
+    if (error == EILSEQ) set_guest_errno_bsd(86);
+    return r;
+}
 extern "C" GUEST_ABI int hle_va_swscanf_body(const Gwchar* s, const Gwchar* fmt, SysvVaList* ap) {
     return hle_swscanf_body(s, fmt, ap);
 }
@@ -934,6 +935,7 @@ SYSV_VA_ENTRY(hle_sprintf_s, hle_va_snprintf_body, 3, rcx)
 SYSV_VA_ENTRY(hle_fprintf, hle_va_fprintf_body, 2, rdx)
 SYSV_VA_ENTRY(hle_fscanf, hle_va_fscanf_body, 2, rdx)
 SYSV_VA_ENTRY(hle_sscanf, hle_va_sscanf_body, 2, rdx)
+SYSV_VA_ENTRY(hle_swprintf, hle_va_swprintf_body, 3, rcx)
 SYSV_VA_ENTRY(hle_swscanf, hle_va_swscanf_body, 2, rdx)
 
 void hle_register_libc() {
