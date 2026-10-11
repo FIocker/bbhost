@@ -985,6 +985,47 @@ void cases() {
     };
     CHECK(lifted(lift(nested(false))));
     CHECK(rejected_with(lift(nested(true)), "a whole-quad block computes v12 from a value the lift may hold differently"));
+    // A register written in whole-quad mode for one region's quads (EXEC M),
+    // then by a sample under another region's EXEC (N & ~M), as the G-buffer
+    // shaders' two arms do: exact in M's quads and in the N & ~M pixels, so a
+    // comparison under N & ~M is lifted. Under the EXEC both regions came
+    // from it is still refused: in the pixels outside both, GCN kept the old
+    // value where the lift wrote the block's for every pixel.
+    const auto two_regions = [](bool compare_after) {
+        Asm a;
+        a.sop1(4, 20, kExec);
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vopc(1, kZero, 3);              // v_cmp_lt_f32 vcc, 0, v3: N
+        a.sop1(4, 26, kVcc);
+        a.vopc(1, kZero, 2);              // v_cmp_lt_f32 vcc, 0, v2: M
+        a.sop1(4, 28, kVcc);
+        a.sop1(36, 22, kVcc);             // s_and_saveexec_b64 s[22:23], vcc: EXEC = M
+        std::size_t skip = a.branch(8);
+        quad_coords(a);                   // v8, v9 in the quads of M
+        a.mimg(kSample, 4, 8, 0xf);
+        a.land(skip);
+        a.sop1(4, kExec, 22);
+        a.sop2(21, kExec, 26, 28);        // s_andn2_b64 exec, s[26:27], s[28:29]: EXEC = N & ~M
+        skip = a.branch(8);
+        a.sop1(4, 24, kExec);
+        a.wqm();
+        a.vop2(8, 10, kHalf, 3);          // v10, v11 in the quads of N & ~M
+        a.vop2(8, 11, kHalf, 2);
+        a.sop1(4, kExec, 24);
+        a.mimg(kSample, 8, 10, 0xf);      // v8..v11 under N & ~M, over the block's v8, v9
+        a.vopc(2, kZero, 9);              // v_cmp_eq_f32 vcc, 0, v9
+        a.vop2(0, 4, 256 + 8, 4);         // v_cndmask_b32 v4, v8, v4
+        a.land(skip);
+        a.sop1(4, kExec, 22);             // EXEC as the regions found it
+        if (compare_after) a.vopc(2, kZero, 9);
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        return a.w;
+    };
+    CHECK(lifted(lift(two_regions(false))));
+    CHECK(rejected_with(lift(two_regions(true)), "a lane mask is computed from a value the lift may hold differently"));
     // An if on a scalar condition inside the region: the coordinates come from
     // a block on one arm and from plain moves on the other; at the join they
     // hold GCN's value in the quads of the region's EXEC, as the sample needs.

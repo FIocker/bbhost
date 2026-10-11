@@ -2340,8 +2340,57 @@ private:
         return std::any_of(open_regions.begin(), open_regions.end(), [](const Region* r) { return r->kill && r->widened && !r->quad_exact; });
     }
 
-    // The pixels of `a` lie within those of `b`.
-    bool within(const Exact& a, const Exact& b) const { return (b.quad || !a.quad) && implies(a.mask, b.mask); }
+    // A write under EXEC E leaves a register exact in two places at once: the
+    // E pixels where the value is, and the others where the old value was.
+    // Neither need lie within the other (a value written in whole-quad mode
+    // for one arm's quads, then the other arm's pixels written over it), so
+    // `Exact` may name a union: a mask id made for it alone, never in the
+    // module, whose parts are listed here. Every test of an Exact goes
+    // through parts(); a mask test that does not (implies) finds no
+    // relation for such an id, which only rejects.
+    std::map<Id, std::vector<Exact>> unions;
+    Id next_union = 0x7f000000u;  // above any id a module reaches
+    std::vector<Exact> parts(const Exact& x) const {
+        if (!x.mask.constant) {
+            if (const auto it = unions.find(x.mask.id); it != unions.end()) return it->second;
+        }
+        return {x};
+    }
+    static bool within_part(const Lifter& l, const Exact& a, const Exact& b) { return (b.quad || !a.quad) && l.implies(a.mask, b.mask); }
+    // Exact in the pixels of `a` and in those of `b` (a part that lies within
+    // another is left out); `fallback` when that takes more than eight parts.
+    Exact union_of(const Exact& a, const Exact& b, const Exact& fallback) {
+        std::vector<Exact> out;
+        const auto add = [&](const Exact& x) {
+            for (const Exact& q : out) {
+                if (within_part(*this, x, q)) return;
+            }
+            out.erase(std::remove_if(out.begin(), out.end(), [&](const Exact& q) { return within_part(*this, q, x); }), out.end());
+            out.push_back(x);
+        };
+        for (const Exact& x : parts(a)) add(x);
+        for (const Exact& x : parts(b)) add(x);
+        if (out.size() == 1) return out[0];
+        if (out.size() > 8) return fallback;
+        const Exact u{false, lane(next_union++)};
+        unions[u.mask.id] = std::move(out);
+        return u;
+    }
+
+    // The pixels of `a` lie within those of `b`: each part of `a` within a part of `b`.
+    bool within(const Exact& a, const Exact& b) const {
+        for (const Exact& x : parts(a)) {
+            bool in = false;
+            for (const Exact& y : parts(b)) {
+                if (within_part(*this, x, y)) {
+                    in = true;
+                    break;
+                }
+            }
+            if (!in) return false;
+        }
+        return true;
+    }
     Where where_reg(int key) const {
         const auto it = partial.find(key);
         return it == partial.end() ? Where{} : Where{true, it->second};
@@ -2357,22 +2406,44 @@ private:
     void note_exact_read(int key) {
         if (partial.count(key)) reads = meet(reads, where_reg(key));
     }
-    // Exact in every pixel whose bit of `e` is set ...
-    bool exact_in(const Where& w, const Val& e) const { return !w.partial || implies(e, w.at.mask); }
+    // Exact in every pixel whose bit of `e` is set (within one part) ...
+    bool exact_in(const Where& w, const Val& e) const {
+        if (!w.partial) return true;
+        for (const Exact& x : parts(w.at)) {
+            if (implies(e, x.mask)) return true;
+        }
+        return false;
+    }
     // ... and in every pixel of each quad holding one.
-    bool quad_exact_in(const Where& w, const Val& e) const { return !w.partial || (w.at.quad && implies(e, w.at.mask)); }
+    bool quad_exact_in(const Where& w, const Val& e) const {
+        if (!w.partial) return true;
+        for (const Exact& x : parts(w.at)) {
+            if (x.quad && implies(e, x.mask)) return true;
+        }
+        return false;
+    }
     // Exact in every pixel whose bit of `e` is clear.
     bool exact_outside(const Where& w, const Val& e) const {
         if (!w.partial || (e.constant && e.set)) return true;
         if (e.constant) return false;
         const auto n = negation_of.find(e.id);
-        return n != negation_of.end() && implies(lane(n->second), w.at.mask);
+        if (n == negation_of.end()) return false;
+        for (const Exact& x : parts(w.at)) {
+            if (implies(lane(n->second), x.mask)) return true;
+        }
+        return false;
     }
-    // Register `key` after a write under EXEC `e` of a value exact at `v`.
+    // Register `key` after a write under EXEC `e` of a value exact at `v`:
+    // exact in the E pixels where the value is and elsewhere where the old
+    // value was. With the value exact in all of E and the old one not outside
+    // it, that is the union of E and the old value's pixels.
     void note_exact_write(int key, const Where& v, const Val& e) {
         const Where old = where_reg(key);
         const bool v_in = exact_in(v, e), old_out = exact_outside(old, e);
-        const Where r = v_in && old_out ? Where{} : v_in ? old : old_out ? v : meet(v, old);
+        const Where r = v_in && old_out ? Where{}
+                        : v_in          ? Where{true, union_of(Exact{false, e}, old.at, old.at)}
+                        : old_out       ? v
+                                        : meet(v, old);
         if (r.partial) {
             partial[key] = r.at;
         } else {
