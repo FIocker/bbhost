@@ -29,6 +29,9 @@ std::string host_gpu_profile_report() { return ""; }
 bool host_gpu_mem_write(std::uint64_t, const void*, std::size_t) { return false; }
 bool host_gpu_mem_fill(std::uint64_t, std::uint32_t, std::size_t) { return false; }
 bool host_gpu_mem_copy(std::uint64_t, std::uint64_t, std::size_t) { return false; }
+bool host_gpu_gds_counters() { return false; }
+bool host_gpu_counter_copy(std::uint64_t, std::uint64_t, std::size_t) { return false; }
+bool host_gpu_counter_fill(std::uint64_t, std::uint32_t, std::size_t) { return false; }
 bool host_gpu_copy_guest(std::uint64_t, std::uint64_t, std::size_t) { return false; }
 bool host_gpu_copy_back(std::uint64_t, std::uint64_t, std::size_t) { return false; }
 bool host_gpu_draw_window(std::uint64_t, const void*, std::uint32_t) { return false; }

@@ -5526,6 +5526,13 @@ bool indirect_dispatch_fits(const GpuDispatch& d, const std::string& name) {
     return false;
 }
 }  // namespace
+bool host_gpu_gds_counters() {
+    static const bool on = [] {
+        const char* e = std::getenv("BBHOST_GDS_COUNTERS");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
 
 bool host_gpu_dispatch(const GpuDispatch& d) {
     DispatchStamp stamp;
@@ -5841,7 +5848,11 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
     }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT;
+    // What follows may also take indirect arguments a shader wrote (the
+    // particles' counter passes write the next dispatch's) or copy out of
+    // memory it wrote (a counter, into the arguments).
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT |
+                       VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
     rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0,
                          nullptr, 0, nullptr);
     g.dispatches.fetch_add(1);
@@ -6541,6 +6552,43 @@ bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes) 
     return true;
 }
 
+std::atomic<std::uint64_t> g_counter_copies{0}, g_counter_fills{0};
+
+bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok || !bytes) return false;
+    if (dst < src + bytes && src < dst + bytes) return false;
+    import_windows(src, bytes);
+    import_windows(dst, bytes);
+    Located d, sr;
+    if (!locate_range(dst, bytes, d) || !locate_range(src, bytes, sr)) return false;
+    note_gpu_write_over_marker("counter copy", dst, src, bytes);
+    transfer_begin_locked();
+    transfer_order_locked(sr.buffer, sr.offset, d.buffer, d.offset, bytes, true);
+    VkBufferCopy region{sr.offset, d.offset, bytes};
+    rec().copy_buffer(sr.buffer, d.buffer, 1, &region);
+    transfer_end_locked();
+    shadow_written_locked(dst, bytes, true);
+    g_counter_copies.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t bytes) {
+    std::lock_guard<GpuMutex> lock(g.mu);
+    if (!g.ok || !bytes) return false;
+    import_windows(dst, bytes);
+    Located d;
+    if (!locate_range(dst, bytes, d)) return false;
+    note_gpu_write_over_marker("counter fill", dst, value, bytes);
+    transfer_begin_locked();
+    transfer_order_locked(VK_NULL_HANDLE, 0, d.buffer, d.offset, bytes, true);
+    rec().fill_buffer(d.buffer, d.offset, bytes, value);
+    transfer_end_locked();
+    shadow_written_locked(dst, bytes, true);
+    g_counter_fills.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 // Copy tokens whose source was a render target, copied as images.
 std::atomic<std::uint64_t> g_guest_copy_targets{0};
 std::uint64_t host_gpu_guest_copy_targets() { return g_guest_copy_targets.load(std::memory_order_relaxed); }
@@ -6865,6 +6913,10 @@ void host_gpu_report() {
         for (std::size_t k = 0; k < by_count.size() && k < 16; ++k) {
             host_log("gpu:   %8llu %s", static_cast<unsigned long long>(by_count[k].first), by_count[k].second.c_str());
         }
+    }
+    if (host_gpu_gds_counters()) {
+        host_log("gpu: GDS counters: %llu copies out of their words and %llu writes into them on the GPU's timeline",
+                 static_cast<unsigned long long>(g_counter_copies.load()), static_cast<unsigned long long>(g_counter_fills.load()));
     }
     if (g.cmd_buffer_marker && g.marker_buf.map) {
         std::uint32_t started = 0, finished = 0;

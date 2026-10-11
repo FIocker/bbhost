@@ -282,6 +282,15 @@ std::uint64_t host_gpu_completed_submits();
 void host_gpu_explain_value(std::uint64_t va, std::uint64_t value);
 bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes);
 bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
+// GDS counters: GX moves an append/consume buffer's counter through GDS
+// around a dispatch (gnm_exec.cpp). BBHOST_GDS_COUNTERS=0 turns them off,
+// and GDS is dropped as before.
+bool host_gpu_gds_counters();
+// A copy out of or a fill of a counter word, on the GPU's timeline: the word
+// is the GPU's, as GX's GDS was, and its value is the one the dispatches
+// before this point in the stream left (D3D11's CopyStructureCount).
+bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
+bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t bytes);
 // A GX buffer copy reached as a copy token, handled as the compute copy
 // path handles a recognised copy shader: marks the destination's surfaces
 // dirty; when the source is a render target, copies its image into the
