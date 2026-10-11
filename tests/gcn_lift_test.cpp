@@ -2354,6 +2354,34 @@ void spills() {
     }
     // A lane nothing parked a scalar in: the reference shuffles, reading another pixel.
     CHECK(rejected_with(lift_words(spill([](Asm&) {}, 4)), "no v_writelane_b32 alone reaches"));
+    // Read back, v5 is written again under a varying EXEC (an execz region):
+    // GCN's value where EXEC is set, the parked word or what the lane held
+    // before elsewhere - so exact only where EXEC was set. Read there (inside
+    // the region) it lifts, and so does a value made from it under the same
+    // EXEC; exported after the region before written whole, it does not.
+    {
+        const auto reuse = [](bool export_v5_after) {
+            Asm a = start();                        // 000000
+            a.vop2(kWritelane, 5, 2, kC0 + 3);      // 000008 v_writelane_b32 v5, s2, 3
+            a.sop1(kSMov, 2, kC0);                  // 00000c s_mov_b32 s2, 0
+            a.vop2(kReadlane, 6, kV + 5, kC0 + 3);  // 000010 v_readlane_b32 s6, v5, 3
+            a.vopc(kCmpLt, kHalf, 2);               // 000014 v_cmp_lt_f32 vcc, 0.5, v2
+            a.sop1(kSAndSaveexec, 10, kVcc);        // 000018 s_and_saveexec_b64 s[10:11], vcc
+            a.branch(kExecz, 0x28);                 // 00001c s_cbranch_execz 0x28
+            a.vop1(kVMov, 5, kV + 2);               // 000020 v_mov_b32 v5, v2: over the parked lane
+            a.vop2(kVMul, 7, kV + 5, 2);            // 000024 v_mul_f32 v7, v5, v2: v5 read where it is exact
+            a.sop1(kSMov64, kExec, 10);             // 000028 s_mov_b64 exec, s[10:11]
+            if (!export_v5_after) a.vop1(kVMov, 5, kOne);  // v_mov_b32 v5, 1.0: written whole
+            a.vop2(kVMul, 3, 6, 2);                 // v_mul_f32 v3, s6, v2
+            a.exp_mrt0(3, 7, 5, 3);
+            a.endpgm();
+            return a.w;
+        };
+        const gcn::LiftResult r = lift_words(reuse(false));
+        CHECK(lifted_valid(r));
+        CHECK(proof_has(r, "1 over a VGPR whose lanes held spilled words, exact only where EXEC was set"));
+        CHECK(rejected_with(lift_words(reuse(true)), "an export reads a value the lift may hold differently from GCN in pixels of EXEC"));
+    }
     // v5 differs between lanes now: it is not this pixel's word.
     CHECK(rejected_with(lift_words(spill([](Asm& a) { a.vop1(kVMov, 7, kV + 5); })), "v5 holds a word in one lane"));
     // Written whole again it is, but the cell is gone (the reference shuffles).

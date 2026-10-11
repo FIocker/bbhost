@@ -325,6 +325,7 @@ private:
     std::vector<std::uint32_t> samples, exports;
     std::vector<std::uint32_t> divergent_samples;  // inside a divergent loop
     std::size_t buffer_loads = 0, masked_writes = 0;
+    std::size_t spill_reuses = 0;  // write_v under a varying EXEC over a VGPR whose lanes held spilled words
 
     // The reference's spill cells (the same analysis translate.cpp runs).
     const SpillCells spill = spill_cells_on() ? spill_cells(prog) : SpillCells{};
@@ -972,6 +973,23 @@ private:
                 reg[key] = old;
             }
             note += " v" + std::to_string(idx) + (e.set ? (v.kind == Kind::Float ? ":f32" : ":u32") : ":masked-off");
+            return;
+        }
+        if (poisoned.count(key)) {
+            // The VGPR's lanes hold words a v_writelane_b32 put there (a spill
+            // the program has read back), or what each lane held before: where
+            // EXEC is clear GCN keeps them, and the lift has no per-pixel value
+            // for that. The value written is GCN's where EXEC is set, and the
+            // register is exact only there (Lifter::partial): a read that needs
+            // it in another pixel - an export, a sample, a mask - rejects.
+            const Where at = meet(read, Where{true, Exact{false, e}});
+            reg[key] = v;
+            reg[key].helper_inexact = v.helper_inexact || inst_helper_inexact;
+            poisoned.erase(key);
+            partial[key] = at.at;
+            note_result(reg[key]);
+            note += " v" + std::to_string(idx) + ":exact-under-exec";
+            ++spill_reuses;
             return;
         }
         const Val old = value(key);
@@ -5031,7 +5049,10 @@ private:
                        (ranged_loads ? " (" + std::to_string(ranged_loads) + " at a run-time offset, each dword checked against the V#'s range "
                                        "as GCN checks it)"
                                      : std::string()) +
-                       "; " + std::to_string(masked_writes) + " VGPR writes under a varying EXEC become selects");
+                       "; " + std::to_string(masked_writes) + " VGPR writes under a varying EXEC become selects" +
+                       (spill_reuses ? "; " + std::to_string(spill_reuses) + " over a VGPR whose lanes held spilled words, exact only where EXEC "
+                                                                              "was set (no read relies on it elsewhere)"
+                                     : std::string()));
         if (buffer_stores) {
             head.push_back(std::to_string(buffer_stores) + " buffer stores, every one through a binding the reference writes, each dword where "
                            "it is inside the V#'s range and this invocation's EXEC bit is set, outside loops");
