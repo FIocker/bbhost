@@ -2,6 +2,7 @@
 #include "core/host_clock.h"
 #include "core/paced_file.h"
 #include "core/portable.h"
+#include "host/dispatch_guard.h"
 #include "host/foreign_hooks.h"
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
@@ -5447,6 +5448,53 @@ const bool g_store_log = std::getenv("BBHOST_STORE_LOG") != nullptr;
 std::atomic<std::uint64_t> g_store_logs{0};
 }
 
+bool hle_gnm_small_copy_source(std::uint64_t va, std::uint64_t* src);  // gnm_exec.cpp
+
+namespace {
+// An indirect dispatch whose arguments ask for more than 65,535 thread groups
+// in a dimension is skipped (host/dispatch_guard.h), said once a shader.
+// BBHOST_INDIRECT_GUARD=0 runs it.
+const bool g_indirect_guard = [] {
+    const char* e = std::getenv("BBHOST_INDIRECT_GUARD");
+    return !(e && e[0] == '0');
+}();
+std::atomic<std::uint64_t> g_indirect_skipped{0};
+std::set<std::string> g_indirect_skipped_shaders;  // under g.mu
+
+// The arguments of an indirect dispatch as the GPU will read them: the
+// command processor's copies into them are done by now (on the CPU, as it
+// walks the stream), and a CP write still pending is laid over memory.
+// False, after saying so once a shader, when they ask past the limit.
+bool indirect_dispatch_fits(const GpuDispatch& d, const std::string& name) {
+    std::uint32_t groups[3] = {};
+    if (!hle_kernel_va_mapped(d.indirect_va, sizeof(groups))) return true;  // the dispatch's own path refuses it
+    read_guest_locked(d.indirect_va, sizeof(groups), groups);
+    if (dispatch_guard::groups_fit(groups)) return true;
+    const std::uint64_t n = g_indirect_skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (g_indirect_skipped_shaders.insert(name).second) {
+        char from[160];
+        std::uint64_t src = 0;
+        if (hle_gnm_small_copy_source(d.indirect_va, &src)) {
+            std::uint32_t now = 0;
+            if (hle_kernel_va_mapped(src, sizeof(now))) read_guest_locked(src, sizeof(now), &now);
+            std::snprintf(from, sizeof(from), "the command processor copied them from 0x%llx (an append buffer's counter, holding %u, 0x%08x)",
+                          static_cast<unsigned long long>(src), now, now);
+        } else {
+            std::snprintf(from, sizeof(from), "no copy of the command processor's wrote them");
+        }
+        host_log("gpu: an indirect dispatch of %s asks for %ux%ux%u thread groups, past D3D11's %u a dimension, which this engine's "
+                 "PC renderer keeps to: skipped, as is every such dispatch of it from now on (BBHOST_INDIRECT_GUARD=0 runs them). Its "
+                 "arguments at 0x%llx: %s",
+                 name.c_str(), groups[0], groups[1], groups[2], dispatch_guard::kMaxGroups, static_cast<unsigned long long>(d.indirect_va),
+                 from);
+    } else if (n % 1000 == 0) {
+        host_log("gpu: %llu indirect dispatches skipped for asking past %u thread groups a dimension", static_cast<unsigned long long>(n),
+                 dispatch_guard::kMaxGroups);
+    }
+    return false;
+}
+}  // namespace
+
 bool host_gpu_dispatch(const GpuDispatch& d) {
     DispatchStamp stamp;
     GpuPhaseTimer timer(kPhaseLock);
@@ -5474,6 +5522,9 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         g_dispatch_shaders.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard<std::mutex> lk(g_dispatch_census_mu);
         ++g_dispatch_census[name];
+    }
+    if (d.indirect_va && g_indirect_guard && !indirect_dispatch_fits(d, name)) {
+        return true;  // nothing recorded: no native renderer of this engine asks for it
     }
     const auto t_pt = std::chrono::steady_clock::now();
     const bool pt_ok = rebuild_page_tables();

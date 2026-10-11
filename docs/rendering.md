@@ -32,6 +32,12 @@ dispatches go through an emulated register file, by decision for now: they
 are tightly interleaved with the constant engine's memory traffic, and most
 of them are fills and copies that never run a shader, which bbhost recognises
 and performs directly.
+An indirect dispatch whose arguments ask for more than 65,535 thread groups in
+a dimension - D3D11's limit, which this engine's PC renderer keeps to - is
+skipped: in bbhost such a count is an append buffer's counter that nothing
+wrote, since the counters GX keeps in GDS around each dispatch are not carried
+out yet. The log names the shader and the counter once; `BBHOST_INDIRECT_GUARD=0`
+runs them.
 
 **Recording.** The command processor leaves the Vulkan calls to a thread of
 its own, `bb-record`. Each draw goes into a packet, and most of its other
