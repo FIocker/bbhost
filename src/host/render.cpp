@@ -839,6 +839,7 @@ const std::uint64_t g_order_target = [] { const char* e = std::getenv("BBHOST_OR
 std::atomic<int> g_order_logs{0};
 
 }  // namespace
+std::uint64_t render_tess_draws() { return g_tess_draws.load(std::memory_order_relaxed); }
 // The ring of recent draws (gpu_internal.h).
 DrawRec g_draw_recs[kDrawRecs];
 std::uint64_t g_draw_rec_next = 0;

@@ -292,6 +292,11 @@ struct Gpu {
         VkDescriptorPool pool = VK_NULL_HANDLE;
         bool in_flight = false;
         std::uint64_t serial = 0;  // Gpu::flushes when this slot was submitted
+        // What the submission holds, for the line a wait for it that runs long
+        // writes (fence_wait_locked): the draws, dispatches and tessellated
+        // draws recorded since the submission before, and the flip.
+        std::uint64_t held_draws = 0, held_dispatches = 0, held_tess = 0, held_flip = 0;
+        bool said_stuck = false;  // that line was written for this submission
         std::vector<DevBuffer> garbage;
         std::vector<DevBuffer> staging_chunks;  // the upload staging chunks this slot's uploads are in, each once (Gpu::staging_users)
         std::vector<DevBuffer> scratch_chunks;  // the same for the device-local untile scratch (Gpu::scratch_users)
@@ -574,8 +579,11 @@ void submit_locked();      // submits the current command buffer; waits only for
 // flight retire, oldest first); nothing for one not submitted yet.
 void retire_through_locked(std::uint64_t serial);
 // Waits until submission `serial` has run, retiring nothing: for a recording
-// in progress, which slot cleanup in its middle could disturb.
+// in progress, which slot cleanup in its middle could disturb. A GPU taken
+// for stuck meanwhile (fence_wait_locked) ends the wait; nothing recorded
+// after that goes to the GPU (submit_locked).
 void wait_submission_locked(std::uint64_t serial);
+std::uint64_t render_tess_draws();  // the tessellated draws so far (render.cpp)
 // Copies guest memory as the work being recorded now will see it: the CP writes
 // still queued in unfinished submissions applied on top (Gpu::pending_writes).
 void read_guest_locked(std::uint64_t va, std::size_t bytes, void* out);

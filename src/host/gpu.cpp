@@ -5,6 +5,7 @@
 #include "host/foreign_hooks.h"
 #include "host/gpu_internal.h"
 #include "host/shader_patch.h"
+#include "host/shaders/gpu_stall.spv.h"
 #include "host/translation_cache.h"
 
 #include "gcn/container.h"
@@ -3871,6 +3872,216 @@ void staging_let_go_locked(const DevBuffer& b) {
 }
 }  // namespace
 
+namespace {
+
+// How long one wait for a submission's fence goes before the GPU is said to be
+// still busy with it, and how long in all before the GPU is taken for stuck.
+// BBHOST_GPU_WAIT_STEP_MS and BBHOST_GPU_WAIT_LIMIT_S shorten them for tests.
+std::uint64_t fence_step_ns() {
+    static const std::uint64_t ns = [] {
+        const char* e = std::getenv("BBHOST_GPU_WAIT_STEP_MS");
+        const std::uint64_t ms = e && *e ? std::strtoull(e, nullptr, 10) : 10000;
+        return std::max<std::uint64_t>(ms, 100) * 1000000ull;
+    }();
+    return ns;
+}
+double fence_limit_s() {
+    static const double s = [] {
+        const char* e = std::getenv("BBHOST_GPU_WAIT_LIMIT_S");
+        return e && *e ? std::max(1.0, std::atof(e)) : 60.0;
+    }();
+    return s;
+}
+
+// The first time a wait for slot k's submission runs past a step: what it
+// holds, what stays held until it finishes, and the hang report with the
+// GPU's progress markers where they can be read without a lost device.
+void say_stuck_locked(int k, double secs) {
+    const Gpu::Slot& sl = g.slots[k];
+    std::size_t writes = 0;
+    for (const auto& [va, span] : g.pending_writes) writes += span.serial >= sl.serial ? 1 : 0;
+    host_log("gpu: submission %llu (slot %d, recorded at flip %llu) is still running after %.1f s: %llu draws, %llu of them "
+             "tessellated, %llu dispatches. Until it finishes nothing it may still be reading is reset, freed or handed on - "
+             "its fence and descriptor pool, %zu buffers, %zu staging and %zu scratch chunks, %zu image-heap ranges, %zu images "
+             "and %zu views - and %zu CP writes it and the submissions after it carry wait; after %.0f s in all the GPU is taken "
+             "for stuck",
+             static_cast<unsigned long long>(sl.serial), k, static_cast<unsigned long long>(sl.held_flip), secs,
+             static_cast<unsigned long long>(sl.held_draws), static_cast<unsigned long long>(sl.held_tess),
+             static_cast<unsigned long long>(sl.held_dispatches), sl.garbage.size(), sl.staging_chunks.size(),
+             sl.scratch_chunks.size(), sl.dead_ranges.size(), sl.dead_images.size(), sl.dead_views.size(), writes,
+             fence_limit_s());
+    host_gpu_hang_report();
+    if (g.cmd_buffer_marker) report_checkpoints();  // AMD buffer markers: a buffer the GPU writes, readable at any time
+}
+
+// Waits for slot k's fence: true once it has signalled. A submission the GPU
+// has not finished after a step is said once (say_stuck_locked) and waited
+// for on - it may still be reading its descriptors, its memory and the
+// staging, scratch and image-heap ranges it holds, and the game takes the CP
+// writes it carries for the GPU being done, so none of that may be reset or
+// handed to other work before the fence signals. After ten seconds the wait
+// used to give up, reset the fence and the descriptor pool, free the rest
+// and count the submission done while the GPU still ran it, so the
+// recordings after it could write over what it read - a GPU that is slow
+// once can then stay slow (an integration run in the Forbidden Woods went on
+// at a frame every 90-110 s). One not finished within the limit is the GPU
+// stuck: device_lost_locked, so bbhost ends with the report instead of going
+// on; after that, or a real loss, nothing is waited for again. `waited_us`:
+// the time spent here.
+bool fence_wait_locked(int k, std::uint64_t& waited_us) {
+    Gpu::Slot& sl = g.slots[k];
+    waited_us = 0;
+    if (g_device_lost.load(std::memory_order_acquire)) return false;
+    const auto t0 = std::chrono::steady_clock::now();
+    g.wait_started_ns.store(static_cast<std::uint64_t>(t0.time_since_epoch().count()), std::memory_order_relaxed);
+    g.waiting_slot.store(k, std::memory_order_relaxed);
+    VkResult r = VK_TIMEOUT;
+    double secs = 0.0;
+    bool slow = false;
+    for (;;) {
+        r = vkWaitForFences(g.device, 1, &sl.fence, VK_TRUE, fence_step_ns());
+        secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (r != VK_TIMEOUT) break;
+        slow = true;
+        if (!sl.said_stuck) {
+            sl.said_stuck = true;
+            say_stuck_locked(k, secs);
+        } else {
+            host_log("gpu: submission %llu is still running after %.0f s", static_cast<unsigned long long>(sl.serial), secs);
+        }
+        if (secs >= fence_limit_s()) break;
+    }
+    g.waiting_slot.store(-1, std::memory_order_relaxed);
+    waited_us = static_cast<std::uint64_t>(secs * 1e6);
+    if (r == VK_SUCCESS) {
+        if (slow) {
+            host_log("gpu: submission %llu finished after %.1f s; what it held is let go now",
+                     static_cast<unsigned long long>(sl.serial), secs);
+        }
+        return true;
+    }
+    if (r == VK_TIMEOUT) {
+        host_log("gpu: submission %llu has not finished after %.0f s: the GPU is taken for stuck, and bbhost stops",
+                 static_cast<unsigned long long>(sl.serial), secs);
+        device_lost_locked("a submission the GPU had not finished within the limit");
+        return false;
+    }
+    host_log("gpu: waiting for submission %d failed (%d)%s", k, r, r == VK_ERROR_DEVICE_LOST ? "; device lost, GPU execution disabled" : "");
+    device_lost_locked(r == VK_ERROR_DEVICE_LOST ? "a wait for a submission" : "a failed wait for a submission");
+    return false;
+}
+
+// BBHOST_TEST_GPU_STALL: the submission the job went into, waited for once it is in (stall_test_wait_locked).
+std::uint64_t g_stall_serial = 0;
+bool g_stall_pending = false;
+
+// BBHOST_TEST_GPU_STALL=<flip>:<ms>: the first submission from that flip on
+// carries a GPU job (shaders/gpu_stall.comp) that runs until the host lets it
+// go <ms> later - 0: never, the job then ends by itself once its pieces are
+// done - so a wait for its fence meets a GPU that is still busy:
+// fence_wait_locked's steps, what stays held, the resume and the stop, tested
+// without a real hang. The job is BBHOST_TEST_GPU_STALL_PIECES pieces (2000)
+// of at most BBHOST_TEST_GPU_STALL_TURNS turns (4096) each, about 8 ms a piece
+// on an RTX 4070, so the driver can switch the GPU to other work in between,
+// and the command buffer stays small: one of 200,000 commands held
+// vkQueueSubmit until the GPU had worked through most of it.
+void stall_test_record_locked() {
+    struct Cfg {
+        std::uint64_t flip = 0, ms = 0, pieces = 2000, turns = 4096;
+        bool on = false;
+    };
+    static const Cfg cfg = [] {
+        Cfg c;
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL"); e && *e) {
+            char* end = nullptr;
+            c.flip = std::strtoull(e, &end, 10);
+            c.ms = end && *end == ':' ? std::strtoull(end + 1, nullptr, 10) : 0;
+            c.on = true;
+        }
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL_PIECES"); e && *e) c.pieces = std::max<std::uint64_t>(1, std::strtoull(e, nullptr, 10));
+        if (const char* e = std::getenv("BBHOST_TEST_GPU_STALL_TURNS"); e && *e) c.turns = std::strtoull(e, nullptr, 10);
+        return c;
+    }();
+    static bool done = false;
+    if (!cfg.on || done || hle_video_flip_count() < cfg.flip) return;
+    done = true;
+    static VkPipelineLayout layout = VK_NULL_HANDLE;
+    static VkPipeline pipeline = VK_NULL_HANDLE;
+    static DevBuffer flag;
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = sizeof(k_gpu_stall_spv);
+    smi.pCode = k_gpu_stall_spv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &range;
+    bool ok = vkCreateShaderModule(g.device, &smi, nullptr, &module) == VK_SUCCESS &&
+              vkCreatePipelineLayout(g.device, &pli, nullptr, &layout) == VK_SUCCESS;
+    if (ok) {
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = module;
+        ci.stage.pName = "main";
+        ci.layout = layout;
+        ok = vkCreateComputePipelines(g.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipeline) == VK_SUCCESS;
+    }
+    if (module) vkDestroyShaderModule(g.device, module, nullptr);
+    if (!ok || !create_dev_buffer(flag, 64, true) || !flag.map) {
+        host_log("gpu: test: the GPU job of BBHOST_TEST_GPU_STALL could not be made");
+        return;
+    }
+    volatile std::uint32_t* w = static_cast<volatile std::uint32_t*>(flag.map);
+    for (int i = 0; i < 4; ++i) w[i] = 0;
+    struct Push {
+        std::uint64_t flag;
+        std::uint32_t max_turns, pad;
+    } push{flag.address, static_cast<std::uint32_t>(std::min<std::uint64_t>(cfg.turns, 0xffffffffu)), 0};
+    g_stall_serial = g.flushes;  // this recording's submission
+    g_stall_pending = true;
+    rec().bind_pipeline(VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    rec().push_constants(layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    for (std::uint64_t p = 0; p < cfg.pieces; ++p) {
+        rec().dispatch(1, 1, 1);
+        if (p + 1 < cfg.pieces) {
+            rec().pipeline_barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+    }
+    char when[48];
+    if (cfg.ms) std::snprintf(when, sizeof(when), "%llu ms later", static_cast<unsigned long long>(cfg.ms));
+    else std::snprintf(when, sizeof(when), "never");
+    host_log("gpu: test: submission %llu (flip %llu) carries a GPU job of %llu pieces of up to %llu turns that runs until the host "
+             "lets it go: %s (BBHOST_TEST_GPU_STALL)",
+             static_cast<unsigned long long>(g.flushes), static_cast<unsigned long long>(hle_video_flip_count()),
+             static_cast<unsigned long long>(cfg.pieces), static_cast<unsigned long long>(cfg.turns), when);
+    if (cfg.ms) {
+        std::thread([ms = cfg.ms, w] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            const std::uint32_t pieces = w[2], turns = w[1];
+            w[0] = 1;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            host_log("gpu: test: the GPU job is let go %llu ms after it was recorded, %u pieces and %u turns in",
+                     static_cast<unsigned long long>(ms), pieces, turns);
+        }).detach();
+    }
+}
+
+// BBHOST_TEST_GPU_STALL: once the job's submission is in, the command processor
+// waits for it, as it does when it needs that slot again or flushes. The game
+// itself would first wait for its labels, and the job would never meet a wait.
+void stall_test_wait_locked() {
+    if (!g_stall_pending || g.flushes <= g_stall_serial) return;
+    g_stall_pending = false;
+    host_log("gpu: test: the command processor waits for submission %llu", static_cast<unsigned long long>(g_stall_serial));
+    retire_through_locked(g_stall_serial);
+}
+
+}  // namespace
+
 void retire_slot_locked(int k) {
     Gpu::Slot& sl = g.slots[k];
     if (!sl.in_flight) return;
@@ -3895,18 +4106,16 @@ void retire_slot_locked(int k) {
         busy_retired_locked(sl, false);
         return;
     }
-    const auto t0 = std::chrono::steady_clock::now();
-    g.wait_started_ns.store(static_cast<std::uint64_t>(t0.time_since_epoch().count()), std::memory_order_relaxed);
-    g.waiting_slot.store(k, std::memory_order_relaxed);
-    const VkResult r = vkWaitForFences(g.device, 1, &sl.fence, VK_TRUE, 10000000000ull);
-    g.waiting_slot.store(-1, std::memory_order_relaxed);
-    const auto fence_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+    std::uint64_t fence_us = 0;
+    const bool done = fence_wait_locked(k, fence_us);
     g.gpu_us.fetch_add(fence_us);
-    bump(g_stream_stats.fence_ns, static_cast<std::uint64_t>(fence_us) * 1000);
-    if (r != VK_SUCCESS) {
-        host_log("gpu: waiting for submission %d failed (%d)%s", k, r,
-                 r == VK_ERROR_DEVICE_LOST ? "; device lost, GPU execution disabled" : "");
-        if (r == VK_ERROR_DEVICE_LOST) device_lost_locked("a wait for a submission");
+    bump(g_stream_stats.fence_ns, fence_us * 1000);
+    if (!done) {
+        // The GPU is lost, or taken for stuck: what the submission holds stays
+        // as it is (the GPU may still read it), nothing more goes to the GPU
+        // (submit_locked), and bbhost ends.
+        sl.in_flight = false;
+        return;
     }
     vkResetFences(g.device, 1, &sl.fence);
     vkResetDescriptorPool(g.device, sl.pool, 0);
@@ -3950,7 +4159,7 @@ void retire_slot_locked(int k) {
         it = it->second.serial < g.completed_submits ? g.pending_writes.erase(it) : std::next(it);
     }
     collect_profile_locked(sl);
-    busy_retired_locked(sl, r == VK_SUCCESS);
+    busy_retired_locked(sl, true);
     glitch_slot_done_locked(sl);
     textures_retired(k);
 }
@@ -4823,6 +5032,7 @@ void submit_locked() {
     flush_deferred_writes_locked();  // (its transfer batch puts deferred copy-backs in place first)
     transfer_flush_locked();
     render_end_pass_locked();
+    stall_test_record_locked();  // BBHOST_TEST_GPU_STALL
     copy_versions_flush_locked();
     // A render target a shortage put in host memory goes back into video
     // memory once there is room: its copy recorded here, after everything
@@ -4867,6 +5077,20 @@ void submit_locked() {
     }
     Gpu::Slot& cur = g.slots[g.slot];
     cur.serial = g.flushes;
+    {
+        // What it holds, for the line a wait for it that runs long writes.
+        static std::uint64_t last_draws = 0, last_dispatches = 0, last_tess = 0;
+        const std::uint64_t draws = g.draws.load(std::memory_order_relaxed), dispatches = g.dispatches.load(std::memory_order_relaxed);
+        const std::uint64_t tess = render_tess_draws();
+        cur.held_draws = draws - last_draws;
+        cur.held_dispatches = dispatches - last_dispatches;
+        cur.held_tess = tess - last_tess;
+        cur.held_flip = hle_video_flip_count();
+        cur.said_stuck = false;
+        last_draws = draws;
+        last_dispatches = dispatches;
+        last_tess = tess;
+    }
     textures_before_submit();  // the staging spans its copies read are filled
     // BBHOST_TEST_DEVICE_LOST=<flip>: from that flip on, act as if the device
     // were lost (it is not; the GPU only gets no more work) - the reports, the
@@ -4877,6 +5101,14 @@ void submit_locked() {
     }();
     if (test_lost && g.ok && hle_video_flip_count() >= test_lost) device_lost_locked("BBHOST_TEST_DEVICE_LOST");
     take_submit_failure_locked();
+    if (g_device_lost.load(std::memory_order_acquire)) {
+        // Lost, or taken for stuck (fence_wait_locked): nothing more goes to
+        // the GPU. Work queued behind a submission it never finished would
+        // reuse what that one may still read. The recording is dropped; bbhost
+        // is ending.
+        g.queued = 0;
+        return;
+    }
     if (streamed) {
         stream::EndSubmit es{};
         es.ncmds = si.commandBufferCount;
@@ -4927,6 +5159,7 @@ void submit_locked() {
     ++g.flushes;
     g.slot = (g.slot + 1) % g.slot_count;
     retire_slot_locked(g.slot);
+    stall_test_wait_locked();  // BBHOST_TEST_GPU_STALL
     g.cmd_ = g.slots[g.slot].cmd;
     g.fence = g.slots[g.slot].fence;
     g.desc_pool = g.slots[g.slot].pool;
@@ -4941,12 +5174,17 @@ void flush_locked() {
 
 void wait_submission_locked(std::uint64_t serial) {
     if (g.completed_submits > serial || serial >= g.flushes) return;
-    Gpu::Slot& sl = g.slots[serial % static_cast<std::uint64_t>(g.slot_count)];
+    const int k = static_cast<int>(serial % static_cast<std::uint64_t>(g.slot_count));
+    Gpu::Slot& sl = g.slots[k];
     if (!sl.in_flight || sl.serial != serial) return;  // retired, and its slot taken again
     stream_wait_submitted(serial);                      // its fence has gone to the queue
-    const auto t0 = std::chrono::steady_clock::now();
-    vkWaitForFences(g.device, 1, &sl.fence, VK_TRUE, 10000000000ull);
-    g.gpu_us.fetch_add(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+    // Until it has run (a step's wait used to give up after ten seconds, and
+    // the caller reuse what the GPU might still read - the tessellation
+    // ring's regions), or the GPU is taken for stuck, after which nothing
+    // recorded goes to it.
+    std::uint64_t us = 0;
+    fence_wait_locked(k, us);
+    g.gpu_us.fetch_add(us);
 }
 
 void retire_through_locked(std::uint64_t serial) {
