@@ -79,7 +79,7 @@ sessions. What runs on native code and what is still emulated:
 | Draws | native: each draw is built from the engine's graphics objects; the command buffer only marks its place in the stream |
 | Post-processing (YEBIS) | native: every stage's resources built by bbhost |
 | Tessellation | native: the host GPU's own tessellation stages, all three stages lifted; the game's mesh hulls draw as one native pipeline, without the PS4's on-chip ring |
-| Shaders | decompiled ("lifted") from GCN to typed, structured SPIR-V when the game creates them: every pixel and vertex shader draw at the test places, tessellation included (3,206 of 3,209 pixel shader programs, all vertex shader programs). Compute shaders and the few programs the lifter refuses are still translated by bbhost's GCN compiler |
+| Shaders | decompiled ("lifted") from GCN to typed, structured SPIR-V when the game creates them: every shader the game ships except compute (3,206 of 3,209 pixel shader programs, all vertex and tessellation programs; 100% of draws at the 12 measured places, see [docs/rendering.md](docs/rendering.md#shader-lifting)). Compute shaders and the few programs the lifter refuses are still translated by bbhost's GCN compiler |
 | Frame pacing | native: the game's frame-time manager runs as bbhost source; 30, 60, 90, 120 or uncapped, with the game's per-frame steps following real time |
 | Compute dispatches, labels, fences | still emulated: run through bbhost's command processor, which walks the game's PM4 command buffers; GPU particle counters are kept natively, as per-buffer counters |
 | Texture memory | the game's tiled textures are detiled on the GPU; changes are tracked by watching the game's writes |

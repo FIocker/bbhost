@@ -97,8 +97,30 @@ path at all:
 | Other compute dispatches | emulated register state, the game's shaders |
 | Clears and target copies | partly recognised from packets |
 | Labels and fences | emulated, on the command processor |
-| Shaders | translated or decompiled to SPIR-V |
+| Shaders | decompiled (lifted) to SPIR-V; compute and a few refused programs translated (see below) |
 | Resource identity | the game's memory addresses, plus write tracking |
+
+## Shader lifting
+
+Every shader the game creates goes through the lifter. One it refuses is translated instead, so nothing is lost. The program counts below cover every shader the game ships. The draw shares were measured at the twelve places `tools/area_check.py` visits; elsewhere they are expected, not measured.
+
+| Shader stage | Programs lifted | Draws lifted (12 places) | Left |
+|---|---|---|---|
+| Pixel | 3,206 of 3,209 | 100% | FXAA3HQ, which needs a whole-wave proof; two debug shaders whose result depends on how the PS4 packs pixels into waves (no exact PC form). None is drawn at the 12 places. |
+| Vertex | all 10,116 | 100% | - |
+| Tessellation: local, hull, domain | all; the 141 mesh hull sets as native pipelines | 100% | - |
+| Compute | 0 | - (dispatches) | not started: every compute shader is translated |
+
+A draw whose setup the lifter hasn't seen still falls back to the translator. The exit report counts those by reason, and `BBHOST_LIFT_TESS` and the other switches turn the lifted paths off for comparison.
+
+| Step | State |
+|---|---|
+| Pixel and vertex shaders lifted | done |
+| Tessellation lifted, mesh hulls native | done |
+| Compute shaders lifted | next |
+| HLSL: the lifted SPIR-V printed as HLSL and compiled with DXC to SPIR-V for Vulkan; checked byte-exact against the direct path before players switch | planned, after compute |
+| Shaders as editable source, generated on the player's machine from their own game files (never shipped) | after HLSL |
+| D3D12 (Shader Model 6) from the same HLSL, if ever wanted; D3D11 is not planned, since it lacks the quad operations 703 programs use | later, optional |
 
 ## What comes next
 
@@ -108,8 +130,7 @@ path at all:
   by guest address and write tracking.
 - Clears and copies from their GX calls rather than from packets, after which
   the PM4 command processor only orders work.
-- More shaders decompiled rather than translated, as a step towards shaders as
-  editable source.
+- Compute shaders lifted, then HLSL (the table above).
 
 ## Tools
 
