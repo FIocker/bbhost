@@ -539,13 +539,46 @@ gcn::TranslateResult translate_cached(const gcn::Program& prog, const gcn::Trans
     return t;
 }
 
+namespace {
+template <typename Lift>
+gcn::LiftResult lift_through_cache(const Key& key, const Lift& lift);
+}  // namespace
+
 gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference) {
     const auto lift = [&] {
         return vertex ? gcn::lift_vertex_shader(prog, o, reference) : gcn::lift_pixel_shader(prog, o, reference);
     };
     if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) return lift();
+    return lift_through_cache(key_for(prog, o, vertex ? TranslationUse::kLiftVertex : TranslationUse::kLiftPixel), lift);
+}
+
+gcn::LiftResult lift_tess_cached(TranslationUse use, const gcn::Program& prog, const gcn::TranslateOptions& o, const gcn::TranslateResult& reference,
+                                 const gcn::TessLift& tess) {
+    const auto lift = [&] {
+        return use == TranslationUse::kLiftLs     ? gcn::lift_ls_shader(prog, o, reference, tess)
+               : use == TranslationUse::kLiftHull ? gcn::lift_hull_shader(prog, o, reference, tess)
+                                                  : gcn::lift_domain_shader(prog, o, reference, tess);
+    };
+    if (!g_tc.ready.load(std::memory_order_acquire) || !g_tc.on) return lift();
+    KeyHasher h;
+    h.str(g_tc.switches);
+    h.u32(static_cast<std::uint32_t>(use));
+    hash_program(h, prog);
+    hash_options(h, o);
+    if (o.fetch) hash_program(h, *o.fetch);
+    h.u32(tess.attr_vec4s);
+    h.flag(tess.window);
+    h.flag(tess.own_params);
+    for (const std::uint32_t v : {tess.control_points, tess.ls_stride, tess.cp_stride, tess.patch_constants, tess.params_binding}) h.u32(v);
+    h.str(tess.constants_path);
+    for (const std::uint32_t v : tess.constants) h.u32(v);
+    return lift_through_cache(Key{h.a, h.b}, lift);
+}
+
+namespace {
+template <typename Lift>
+gcn::LiftResult lift_through_cache(const Key& key, const Lift& lift) {
     const auto t0 = std::chrono::steady_clock::now();
-    const Key key = key_for(prog, o, vertex ? TranslationUse::kLiftVertex : TranslationUse::kLiftPixel);
     gcn::LiftResult l;
     if (lookup(key, [&](Reader& r) { return read_lift(r, l); })) {
         const std::uint64_t us = us_since(t0);
@@ -567,6 +600,7 @@ gcn::LiftResult lift_cached(bool vertex, const gcn::Program& prog, const gcn::Tr
     store(key, w);
     return l;
 }
+}  // namespace
 
 void translation_cache_load(const std::string& path) {
     // Once: a second device start keeps the first's slots, which lookups read

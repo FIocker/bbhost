@@ -76,4 +76,84 @@ LiftResult lift_pixel_shader(const Program& program, const TranslateOptions& opt
 // exported with EXEC known set, samples at level 0.
 LiftResult lift_vertex_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference);
 
+// The stages of a tessellated draw on the host's tessellator, with the LDS the
+// GCN stages pass control points through as stage inputs and outputs.
+//
+// Attributes (TranslateOptions::tess_lds_attributes): one control point a
+// patch. Each 16 bytes of it are a uvec4 slot of `control_point` at location
+// 0 - an LDS byte address `a` is slot (a / 16) % attr_vec4s, component
+// (a / 4) % 4, as the translator maps it - written by the LS as the vertex
+// stage's output and read by the domain shader as the evaluation stage's
+// input (`control_point[patch vertex][slot]`).
+//
+// The reference is the translation with the same options and cb_no_fallback:
+// the lifted module declares its descriptor bindings and stage interface, so
+// it runs where the reference ran. Every LDS address is computed as the
+// program computes it; one the lift knows is a slot of its own (constant), any
+// other is indexed at run time by the same arithmetic.
+struct TessLift {
+    std::uint32_t attr_vec4s = 16;  // TranslateOptions::tess_attr_vec4s
+    // Window (TranslateOptions::tess_window): the game's own hull, a patch of
+    // `control_points` whose LDS the host lays out as one window - the input
+    // control points (ls_stride bytes each), the output ones (cp_stride bytes
+    // each), the patch constants (patch_constants x 16 bytes) - and gives the
+    // stages tessellation constants that say so (`constants`). On stage I/O:
+    //   the LS writes its control point, `control_point` uvec4[ls_stride / 16]
+    //   at location 0 (lift_ls_shader with attr_vec4s = ls_stride / 16);
+    //   the hull (lift_hull_shader) reads the patch's as control_point[n][..],
+    //   writes its own output control point to control_point_out[n][cp_stride
+    //   / 16] at location 0 and the patch constants to patch_constant[npc] at
+    //   location cp_stride / 16, and its factors to the tessellation levels;
+    //   the domain shader reads those as its inputs.
+    // An LDS address the lift knows (the constants folded, the control point
+    // the invocation's own) is a slot of its own; a read it does not know is
+    // decoded at run time, region by region, as the window lays it out (0 past
+    // the patch constants); a write it does not know is rejected.
+    bool window = false;
+    std::uint32_t control_points = 1, ls_stride = 0, cp_stride = 0, patch_constants = 0;
+    // The tessellation constants the reference reads and the binding it reads
+    // them through (BufferBinding::path.str(); empty: none). Loads from that
+    // binding fold to these words; the host makes the binding hold them.
+    std::string constants_path;
+    std::uint32_t constants[12] = {};
+    // The stage's own params block (StageParams, its user data in member 2)
+    // at `params_binding` of its descriptor set (TranslateOptions::
+    // descriptor_set), when it does not share the evaluation stage's - a
+    // window's pipeline gives the LS and the hull a set of their own. False:
+    // kBindingParams, with the user data where the reference reads it.
+    bool own_params = false;
+    std::uint32_t params_binding = 0;
+};
+// The LS as the pipeline's vertex stage (TessRole::LsVertex) on Vulkan vertex
+// input: its LDS writes are the control point's slots.
+LiftResult lift_ls_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference, const TessLift& tess);
+// The domain shader as the evaluation stage (TessRole::DomainTes): v0/v1 the
+// tessellation coordinate, v2 and v3 the patch (0: each invocation reads only
+// its own patch's control point), its LDS reads the control point's slots,
+// its exports a vertex shader's.
+LiftResult lift_domain_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference, const TessLift& tess);
+// The hull shader of a quad patch of one control point whose factors are
+// constants (the game's particles): straight-line code that stores four outer
+// and two inner factors, each a VGPR last written with an inline constant or
+// a literal, and otherwise only computes and writes LDS - its patch
+// constants, which the evaluation stage of this model never reads (it reads
+// the control point the LS wrote, passed on unchanged). Its lift is the
+// control stage those factors make (gcn::make_tess_constant_tcs, which the
+// caller builds with VGT_HOS_MIN/MAX's clamp): the factors and the proof.
+struct HullLift {
+    std::vector<float> factors;  // as stored, in order: four outer, two inner (before VGT_HOS_MIN/MAX clamp them)
+    std::vector<std::string> rejections, proof;
+    bool ok() const { return rejections.empty() && factors.size() == 6; }
+};
+HullLift lift_constant_hull(const Program& program);
+// The game's own hull shader as the control stage (TessRole::HullTcs with
+// tess_window; TessLift::window): one invocation an output control point -
+// v1 its index << 8, the patch alone in its window - its LDS traffic the
+// window's stage I/O, its first factor stores the tessellation levels in the
+// order the hardware reads them (four outer and two inner for a quad patch,
+// three and one for a triangle), s_barrier a control barrier in uniform
+// control flow, and its writes under EXEC made only where the invocation's
+// EXEC bit is set.
+LiftResult lift_hull_shader(const Program& program, const TranslateOptions& options, const TranslateResult& reference, const TessLift& tess);
+
 }  // namespace gcn
