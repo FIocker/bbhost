@@ -360,6 +360,16 @@ struct TranslateOptions {
     // where they care - not all of them do.
     bool tess_patch_cull = false;
     bool tess_patch_cull_all = false;  // a check: leave every patch out
+    // ds_append / ds_consume with GDS set count in the guest word the dispatch
+    // binds for each GDS dword (StageParams::gds_counter): GX keeps an
+    // append/consume buffer's counter in the word past its records and only
+    // moves it through GDS around the dispatch, so that word is the counter -
+    // a D3D11 UAV's hidden counter. Each subgroup adds or takes its active
+    // lanes in one atomic and every lane gets the value from before, as GCN
+    // gives a wave (the shader adds its own v_mbcnt rank). Off (the host's
+    // BBHOST_GDS_COUNTERS=0), GDS is taken for LDS and each lane is handed its
+    // rank on top, as before.
+    bool gds_counters = true;
 };
 
 struct TranslateResult {
@@ -397,6 +407,9 @@ struct TranslateResult {
     // typed lift (gcn/lift.h) has no cross-lane
     // operation at all: the renderer clears it for one.
     std::uint32_t wave64_needs = kWave64NotPixel;
+    // TranslateOptions::gds_counters: the program's ds_append / ds_consume
+    // sites with GDS set - a dispatch of it binds their words.
+    std::uint32_t gds_counters = 0;
     bool ok() const { return errors.empty(); }
 };
 
@@ -429,17 +442,26 @@ struct StageParams {
     // TranslateOptions::tess_lds_bound: the bytes from lds_address the stage
     // may touch (0: none - every read is 0).
     std::uint32_t lds_bytes;
-    std::uint32_t pad[2];
+    // TranslateOptions::gds_counters: the GDS dword gds_counter[0] stands for.
+    std::uint32_t gds_base;
+    std::uint32_t pad;
     std::uint32_t cb_bias_dw[16];  // buffers[n]: dword index of the V# base inside its bound range
     // buffers[n] read by index (BufferBinding::indexed): the V#'s stride in
     // bytes; read at a run-time offset (BufferBinding::ranged): the V#'s range
     // in dwords, rounded up (0 for a null or empty V#).
     std::uint32_t cb_stride[16];
     std::uint32_t cb_w3[16];       // the same: the V#'s word 3 (data and number format, DST_SEL)
-    // TranslateOptions::vertex_formats_from_params: vertex_format_descriptor
-    // per vertex-input location. TessRole::LsCompute (no vertex input) reads
-    // [0..4] as the draw's control points instead (kTess*).
-    std::uint32_t vertex_formats[16];
+    union {
+        // TranslateOptions::vertex_formats_from_params: vertex_format_descriptor
+        // per vertex-input location. TessRole::LsCompute (no vertex input) reads
+        // [0..4] as the draw's control points instead (kTess*).
+        std::uint32_t vertex_formats[16];
+        // TranslateOptions::gds_counters, a compute dispatch (no vertex input):
+        // the guest address of the word each of GDS dwords gds_base.. counts
+        // in, 0 for none - its ds_append / ds_consume then do nothing and
+        // return 0.
+        std::uint64_t gds_counter[8];
+    };
     // TessRole::Domain: the row of the domain shader's projection that gives
     // clip w, the patch stride and base its constants hold, and the near plane
     // - what the prologue needs to leave out a patch whose centre is at or
@@ -454,6 +476,8 @@ struct StageParams {
     std::uint32_t sampler_index[16];
 };
 static_assert(offsetof(StageParams, image_index) == 384 && sizeof(StageParams) == 512, "the params block's layout is the shaders'");
+static_assert(offsetof(StageParams, gds_base) == 88 && offsetof(StageParams, gds_counter) == 288, "the params block's layout is the shaders'");
+constexpr std::uint32_t kGdsCounters = 8;  // StageParams::gds_counter
 // TessRole::LsCompute: StageParams::vertex_formats as the draw's control points.
 constexpr int kTessIndexLo = 0, kTessIndexHi = 1;  // index buffer guest address (0: none)
 constexpr int kTessCount = 2;                      // control points

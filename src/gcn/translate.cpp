@@ -127,6 +127,9 @@ struct Translator {
     Id lds_limit = 0;
     Id lds_patch_ok = 0;  // bool: the window's patch lies inside lds_bytes (0: not checked)
     bool params_head_v4 = false;
+    // TranslateOptions::gds_counters: the params block's member holding
+    // StageParams::gds_counter (0: the program counts nothing in GDS).
+    std::uint32_t gds_member = 0;
     Id p_in_v4f, p_in_v4u, p_in_u32, p_in_f32, p_in_v3u, p_in_bool, p_out_v4f, p_out_f32, p_uc_sampler;
     Id t_fn_main;
 
@@ -2997,7 +3000,13 @@ struct Translator {
             break;
         }
         case 61: case 62: {  // ds_consume / ds_append: counter at M0 base + offset
-            const Id base = iadd(ld(v_m0), cu(off));
+            if (in.gds && opt.gds_counters) {
+                gds_counter(in, off);
+                break;
+            }
+            // Off, the whole of M0 was taken for the address (GX's 0x200020 a
+            // dword far past any LDS) and each lane given its rank on top.
+            const Id base = opt.gds_counters ? iadd(iand(ld(v_m0), cu(0xffff)), cu(off)) : iadd(ld(v_m0), cu(off));
             const Id active = exec_cond();
             Id blo, bhi;
             ballot(active, blo, bhi);
@@ -3020,12 +3029,51 @@ struct Translator {
                 m.store(result, r);
             });
             const Id broadcast = m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), ld(result)});
-            write_v(in.dst, in.op == 62 ? iadd(broadcast, rank) : isub(broadcast, iadd(rank, c_one_u)));
+            if (opt.gds_counters) {
+                write_v(in.dst, broadcast);  // GCN hands every lane the value from before; the shader adds its rank
+            } else {
+                write_v(in.dst, in.op == 62 ? iadd(broadcast, rank) : isub(broadcast, iadd(rank, c_one_u)));
+            }
             break;
         }
         default:
             error(std::string("unsupported ") + mnemonic(in));
         }
+    }
+
+    // ds_append / ds_consume in GDS (TranslateOptions::gds_counters): the
+    // counter is the guest word the dispatch bound for the GDS dword at
+    // M0[15:0] + offset (M0[31:16] is the range's size). GCN adds or takes a
+    // wave's active lanes at once and gives every lane the value from before;
+    // here each subgroup does that with one atomic in the word, and the
+    // shader's own v_mbcnt (over the same subgroup's lanes) makes each lane's
+    // index unique. A dword with no word bound does nothing and returns 0.
+    void gds_counter(const Inst& in, std::uint32_t off) {
+        if (!gds_member) {
+            error(std::string(mnemonic(in)) + " in GDS outside a compute program: no counter to bind");
+            return;
+        }
+        ++res.gds_counters;
+        const Id active = exec_cond();
+        Id blo, bhi;
+        ballot(active, blo, bhi);
+        const Id total = iadd(popcnt(blo), popcnt(bhi));
+        const Id addr = iadd(iand(ld(v_m0), cu(0xffff)), cu(off));
+        const Id base = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(3), cu(2)}));  // StageParams::gds_base
+        const Id slot = isub(shr(addr, cu(2)), base);
+        const Id inside = ult(slot, cu(kGdsCounters));
+        const Id at = shl(sel(inside, slot, c_zero_u), c_one_u);  // the address's low dword in the uvec4[4]
+        const Id lo = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(gds_member), shr(at, cu(2)), iand(at, cu(3))}));
+        const Id hi = m.load(t_u32, m.access_chain(p_uni_u32, ubo_var, {cu(gds_member), shr(at, cu(2)), iand(iadd(at, c_one_u), cu(3))}));
+        const Id bound = band(inside, ine(ior(lo, hi), c_zero_u));
+        const Id result = m.local_variable(p_fn_u32, c_zero_u);
+        const Id first = m.emit(spv::OpGroupNonUniformElect, t_bool, {cu(spv::ScopeSubgroup)});
+        if_then(band(first, bound), [&] {
+            const Id delta = in.op == 62 ? total : isub(c_zero_u, total);
+            const Id r = m.emit(spv::OpAtomicIAdd, t_u32, {guest_ptr(make_u64(lo, hi)), cu(spv::ScopeDevice), cu(spv::MsNone), delta});
+            m.store(result, r);
+        });
+        write_v(in.dst, m.emit(spv::OpGroupNonUniformBroadcastFirst, t_u32, {cu(spv::ScopeSubgroup), ld(result)}));
     }
 
     // ---- images
@@ -3604,6 +3652,21 @@ struct Translator {
         // the dword after cb_valid): member 3 becomes the uvec4 of both, the
         // same 16 bytes at the same offset.
         params_head_v4 = opt.tess_role != TranslateOptions::TessRole::None && opt.tess_lds_bound;
+        // TranslateOptions::gds_counters: a compute program's counters are the
+        // words StageParams::gds_counter names - member 7, where a vertex
+        // stage keeps its formats - from the GDS dword gds_base (member 3 as
+        // the uvec4 the tessellation stages also read it as).
+        if (opt.gds_counters && opt.stage == Stage::Compute && opt.tess_role == TranslateOptions::TessRole::None && !vertex_w3 &&
+            !patch_cull) {
+            for (const Inst& in : prog.insts) {
+                if (in.enc == Enc::DS && in.gds && (in.op == 61 || in.op == 62)) {
+                    gds_member = static_cast<std::uint32_t>(members.size());
+                    members.push_back(t_bias_arr);
+                    params_head_v4 = true;
+                    break;
+                }
+            }
+        }
         if (params_head_v4) members[3] = t_v4u;
         // TranslateOptions::bindless: StageParams::image_index and
         // sampler_index follow whatever the stage declares, at their own offsets.
@@ -3623,6 +3686,7 @@ struct Translator {
         m.member_decorate(t_ubo, 5, spv::DecOffset, {160});
         m.member_decorate(t_ubo, 6, spv::DecOffset, {224});
         if (vertex_w3 || patch_cull) m.member_decorate(t_ubo, 7, spv::DecOffset, {288});
+        if (gds_member) m.member_decorate(t_ubo, gds_member, spv::DecOffset, {static_cast<std::uint32_t>(offsetof(StageParams, gds_counter))});
         if (patch_cull) {
             m.member_decorate(t_ubo, 8, spv::DecOffset, {352});
             m.member_decorate(t_ubo, 9, spv::DecOffset, {368});

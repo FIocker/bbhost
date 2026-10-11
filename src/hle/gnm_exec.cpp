@@ -151,6 +151,7 @@ thread_local std::uint64_t t_indirect_base = 0;
 // The packet being executed (header address, opcode), for BBHOST_GX_TRACE.
 thread_local std::uint64_t t_packet_va = 0;
 thread_local std::uint32_t t_packet_op = 0;
+thread_local const std::uint32_t* t_next_packet = nullptr;  // the packet after the one being executed
 
 std::atomic<std::uint64_t> g_draw_failed{0};
 std::atomic<std::uint64_t> g_indirect_zero_cpu{0};  // GX indirect draws whose count read 0 on the CPU, drawn for the GPU to decide
@@ -166,6 +167,8 @@ void indirect_log(const char* kind, std::uint64_t args, const std::uint32_t* a, 
     host_log("gnm exec: %s args at 0x%llx: %u %u %u %u %u", kind, static_cast<unsigned long long>(args), a[0], a[1],
              count > 2 ? a[2] : 0u, count > 3 ? a[3] : 0u, count > 4 ? a[4] : 0u);
 }
+
+void bind_gds_counters(GpuDispatch& d);
 
 void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t indirect_va = 0) {
     GpuDispatch d;
@@ -196,6 +199,7 @@ void run_dispatch(const char* kind, std::uint32_t x, std::uint32_t y, std::uint3
     hle_gx_trace_dispatch(t_packet_op, t_packet_va, x, sh[0x20C]);
     if ((!x || !y || !z) && !indirect_va) return;
     if (!d.threads[0]) return;
+    bind_gds_counters(d);
     if (!host_gpu_dispatch(d)) {
         g_dispatch_failed.fetch_add(1);
         static std::atomic<int> logs{0};
@@ -999,15 +1003,19 @@ void lookahead_tokens(const std::uint32_t* p) {
 // UAV's - into GDS dword 8 + slot before (gx_commit_compute_stage), DMA_DATA
 // from GDS back into the word after (gx_dispatch_post). Its
 // CopyStructureCount is a DMA_DATA from the word into indirect arguments
-// (0x2568be0). That word is the counter. A store out of GDS puts what the
-// dword holds into the word on the GPU's timeline - an initial count written
-// there, another word's count copied; the word it was loaded from, which
-// holds it already, is left as it is - and every copy out of a counter word
-// (or write into one) goes on the GPU's timeline too, where the word's value
-// is: done on the CPU as the command processor walks, it read memory the
-// GPU had not written yet. Dropped, as these were, a new particle system's
-// counter kept whatever the reused memory held, and its CopyStructureCount
-// handed the next indirect dispatch 3,176,062,614 workgroups (float bits).
+// (0x2568be0). That word is the counter. A dispatch counts in it
+// (GpuDispatch::gds, bind_gds_counters): its initial count is written into
+// the word on the GPU's timeline before the dispatch, and the store after it
+// is then the word's own. A store out of GDS with no dispatch counting in
+// between puts what the dword holds into the word on the GPU's timeline - an
+// initial count written there, another word's count copied; the word it was
+// loaded from, which holds it already, is left as it is - and every copy out
+// of a counter word (or write into one) goes on the GPU's timeline too, where
+// the word's value is: done on the CPU as the command processor walks, it
+// read memory the GPU had not written yet. Dropped, as these were, a new
+// particle system's counter kept whatever the reused memory held, and its
+// CopyStructureCount handed the next indirect dispatch 3,176,062,614
+// workgroups (float bits).
 constexpr std::uint32_t kGdsDwords = 64;  // GDS bytes 0..0xff are followed; GX moves its counters through 0x20..0x3f
 struct GdsHeld {
     enum Kind : std::uint8_t { kUnknown, kWord, kValue };
@@ -1016,7 +1024,8 @@ struct GdsHeld {
     std::uint32_t value = 0;  // kValue: a count loaded into it
 };
 thread_local GdsHeld t_gds[kGdsDwords];
-std::atomic<std::uint64_t> g_gds_loads{0}, g_gds_stores_folded{0}, g_gds_stores_moved{0}, g_counter_reads{0}, g_counter_writes{0};
+std::atomic<std::uint64_t> g_gds_loads{0}, g_gds_stores_folded{0}, g_gds_stores_moved{0}, g_counter_reads{0}, g_counter_writes{0},
+    g_gds_dispatches{0}, g_gds_found_after{0};
 // The counter words seen, so that a copy out of one (or a write into one) goes
 // on the GPU's timeline. Few: one per append/consume buffer.
 std::mutex g_counter_words_mu;
@@ -1037,6 +1046,99 @@ bool covers_counter_word(std::uint64_t va, std::size_t bytes) {
 
 void gds_log_once(std::atomic<int>& n, const char* fmt, unsigned long long a, unsigned long long b = 0) {
     if (n.fetch_add(1, std::memory_order_relaxed) < 4) host_log(fmt, a, b);
+}
+
+// The stores back out of GDS that follow a dispatch (gx_dispatch_post), up to
+// the next dispatch, draw or load into GDS: each GDS dword's word.
+void gds_stores_after(const std::uint32_t* p, std::uint64_t (&home)[kGdsDwords]) {
+    const auto* end = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(t_cb_hi));
+    for (int packets = 0; p && packets < 64 && p < end; ++packets) {
+        const std::uint32_t hdr = p[0];
+        if ((hdr >> 30) == 2) {
+            ++p;
+            continue;
+        }
+        if ((hdr >> 30) != 3) return;
+        const std::uint32_t op = (hdr >> 8) & 0xff;
+        const std::size_t cnt = ((hdr >> 16) & 0x3fff) + 1;
+        if (p + 1 + cnt > end) return;
+        const std::uint32_t* b = p + 1;
+        switch (op) {
+            case kDmaData: {
+                if (cnt < 6) break;
+                const unsigned src_sel = (b[0] >> 29) & 3, dst_sel = (b[0] >> 20) & 3;
+                if (dst_sel == 1) return;  // the next dispatch's loads
+                if (src_sel != 1 || (dst_sel != 0 && dst_sel != 3)) break;
+                const std::uint32_t at = b[1] / 4, n = (b[5] & 0x1fffffu) / 4;
+                const std::uint64_t dst = gpu_va(b[3], b[4]);
+                for (std::uint32_t k = 0; k < n && at + k < kGdsDwords; ++k) home[at + k] = dst + 4ull * k;
+                break;
+            }
+            case kDispatchDirect: case kDispatchIndirect: case kDrawIndex2: case kDrawIndexAuto: case kDrawIndexOffset2:
+            case kDrawIndirect: case kDrawIndexIndirect: case kIndirectBuffer: case kIndirectBufferConst:
+                return;
+            case kNop:
+                if (cnt >= 3 && (b[0] == kGxNativeMagic || b[0] == kGxDispatchMagic || b[0] == kGxYebisMagic || b[0] == kGxScaleformMagic))
+                    return;
+                break;
+            default:
+                break;
+        }
+        p += 1 + cnt;
+    }
+}
+
+// The counter each GDS dword the dispatch may count in stands for: the word
+// it is stored back to after the dispatch, else the word it was loaded from;
+// started from a set count, another word's, or what the word holds.
+void bind_gds_counters(GpuDispatch& d) {
+    if (!host_gpu_gds_counters()) return;
+    std::uint64_t home[kGdsDwords] = {};
+    gds_stores_after(t_next_packet, home);
+    int lo = -1, hi = -1;
+    for (int k = 0; k < static_cast<int>(kGdsDwords); ++k) {
+        if (t_gds[k].kind != GdsHeld::kUnknown || home[k]) {
+            if (lo < 0) lo = k;
+            hi = k;
+        }
+    }
+    if (lo < 0) return;
+    static std::atomic<int> wide{0}, valueless{0}, unloaded{0};
+    if (hi - lo >= static_cast<int>(GpuDispatch::kGdsCounters)) {
+        gds_log_once(wide, "gnm exec: a dispatch moves counters through GDS dwords %llu..%llu, more than one binds: the first 8 count",
+                     static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi));
+        hi = lo + static_cast<int>(GpuDispatch::kGdsCounters) - 1;
+    }
+    d.gds_base = static_cast<std::uint32_t>(lo);
+    bool any = false;
+    for (int k = lo; k <= hi; ++k) {
+        GdsHeld& h = t_gds[k];
+        GpuDispatch::GdsCounter& c = d.gds[k - lo];
+        if (home[k]) g_gds_found_after.fetch_add(1, std::memory_order_relaxed);
+        c.word = home[k] ? home[k] : h.kind == GdsHeld::kWord ? h.word : 0;
+        if (!c.word) {
+            if (h.kind == GdsHeld::kValue) {
+                gds_log_once(valueless, "gnm exec: GDS dword %llu holds a count of %llu with no word after the dispatch to keep it in: it counts nothing",
+                             static_cast<unsigned long long>(k), h.value);
+            }
+            continue;
+        }
+        if (h.kind == GdsHeld::kValue) {
+            c.start = GpuDispatch::kGdsSet;
+            c.value = h.value;
+        } else if (h.kind == GdsHeld::kWord && h.word != c.word) {
+            c.start = GpuDispatch::kGdsCopy;
+            c.from = h.word;
+        } else if (h.kind == GdsHeld::kUnknown) {
+            gds_log_once(unloaded, "gnm exec: GDS dword %llu counts with nothing loaded into it: from what its word 0x%llx holds",
+                         static_cast<unsigned long long>(k), static_cast<unsigned long long>(c.word));
+        }
+        note_counter_word(c.word);
+        h.kind = GdsHeld::kWord;  // from here the dword holds this word's count: the store after folds
+        h.word = c.word;
+        any = true;
+    }
+    if (any) g_gds_dispatches.fetch_add(1, std::memory_order_relaxed);
 }
 
 // DMA_DATA into or out of GDS.
@@ -1111,6 +1213,7 @@ void gds_dma(const std::uint32_t* b, unsigned src_sel, unsigned dst_sel, std::si
 void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int depth) {
     t_packet_va = reinterpret_cast<std::uintptr_t>(b) - 4;
     t_packet_op = op;
+    t_next_packet = b + n;
     if (g_cp_census) census_packet(op, b, n);
     switch (op) {
         case kEventWriteEop:
@@ -1733,15 +1836,25 @@ void execute_packet(std::uint32_t op, const std::uint32_t* b, std::size_t n, int
                     g_dispatches.fetch_add(1);
                     GpuDispatch dd = *dp;
                     if (dd.indirect_va) {
-                        // As the packet path does: the counts from memory size the work.
                         if (!hle_kernel_va_mapped(dd.indirect_va, 12)) break;
                         const auto* a = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(dd.indirect_va));
                         dd.dim[0] = a[0];
                         dd.dim[1] = a[1];
                         dd.dim[2] = a[2];
-                        if (!a[0] || !a[1] || !a[2]) break;
+                        // What memory holds now is not what the GPU will read
+                        // when the counts come from the GPU (a counter copied
+                        // into them earlier in this stream): the dispatch stays
+                        // indirect and the GPU decides, as the packet path does.
+                        if (host_gpu_gds_counters()) {
+                            for (std::uint32_t& v : dd.dim) v = v ? v : 1;
+                        } else if (!a[0] || !a[1] || !a[2]) {
+                            break;
+                        }
                     }
-                    if (dd.dim[0] && dd.dim[1] && dd.dim[2] && dd.threads[0] && !host_gpu_dispatch(dd)) g_dispatch_failed.fetch_add(1);
+                    if (dd.dim[0] && dd.dim[1] && dd.dim[2] && dd.threads[0]) {
+                        bind_gds_counters(dd);
+                        if (!host_gpu_dispatch(dd)) g_dispatch_failed.fetch_add(1);
+                    }
                 }
             }
             // A Scaleform HAL draw's token.
@@ -2809,8 +2922,10 @@ void hle_gnm_exec_histogram() {
             std::lock_guard<std::mutex> lk(g_counter_words_mu);
             words = g_counter_words.size();
         }
-        host_log("gnm: GDS counters: %llu loads into GDS, %llu stores back into the word loaded (left as they are) and %llu into "
-                 "another word on the GPU's timeline, %zu counter words; %llu copies out of and %llu writes into them on the GPU's timeline",
+        host_log("gnm: GDS counters: %llu dispatches counted in words (%llu of their words named by the stores after them), %llu loads "
+                 "into GDS, %llu stores back into the word loaded or counted in (left as they are) and %llu into another word on the GPU's "
+                 "timeline, %zu counter words; %llu copies out of and %llu writes into them on the GPU's timeline",
+                 static_cast<unsigned long long>(g_gds_dispatches.load()), static_cast<unsigned long long>(g_gds_found_after.load()),
                  static_cast<unsigned long long>(g_gds_loads.load()), static_cast<unsigned long long>(g_gds_stores_folded.load()),
                  static_cast<unsigned long long>(g_gds_stores_moved.load()), words, static_cast<unsigned long long>(g_counter_reads.load()),
                  static_cast<unsigned long long>(g_counter_writes.load()));

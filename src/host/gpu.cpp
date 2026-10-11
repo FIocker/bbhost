@@ -2788,6 +2788,7 @@ gcn::TranslateOptions compute_options(std::uint32_t rsrc1, std::uint32_t rsrc2, 
                                       const std::vector<std::pair<std::uint32_t, bool>>& dims, const std::vector<bool>& modes) {
     gcn::TranslateOptions o;
     o.stage = gcn::Stage::Compute;
+    o.gds_counters = host_gpu_gds_counters();
     o.rsrc1 = rsrc1;
     o.rsrc2 = rsrc2;
     o.image_dims = dims;
@@ -5478,6 +5479,17 @@ std::atomic<std::uint64_t> g_unresolved_stores{0};
 // BBHOST_STORE_LOG=1: the first 400 buffer ranges compute stores are taken to write.
 const bool g_store_log = std::getenv("BBHOST_STORE_LOG") != nullptr;
 std::atomic<std::uint64_t> g_store_logs{0};
+// GDS counters (GpuDispatch::gds): dispatches that counted in at least one
+// bound word, ones whose program counts in GDS with none bound, and the
+// starts written or copied into a word first.
+std::atomic<std::uint64_t> g_gds_dispatches{0}, g_gds_unbound{0}, g_gds_sets{0}, g_gds_copies{0}, g_gds_start_failed{0};
+// BBHOST_GDS_TRACE=1: the first 64 dispatches that count in GDS, with their words.
+const bool g_gds_trace = [] {
+    const char* e = std::getenv("BBHOST_GDS_TRACE");
+    return e && e[0] == '1';
+}();
+std::atomic<int> g_gds_traced{0};
+bool counter_start_locked(const GpuDispatch::GdsCounter& c);
 }
 
 bool hle_gnm_small_copy_source(std::uint64_t va, std::uint64_t* src);  // gnm_exec.cpp
@@ -5710,17 +5722,103 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
         };
         for (const gcn::BufferBinding& b : pl.meta.buffers) import_path(b.path, b.pointer, std::max<std::uint64_t>(b.max_dw * 4ull, 16));
         for (const gcn::ResourcePath& p : pl.meta.store_buffers) import_path(p, false, 16);
+        if (pl.meta.gds_counters) {
+            for (const GpuDispatch::GdsCounter& c : d.gds) {
+                if (c.word) import_windows(c.word, 4);
+                if (c.start == GpuDispatch::kGdsCopy && c.from) import_windows(c.from, 4);
+            }
+        }
     }
     if (g.queued + 1 >= kMaxQueued * kStageSlots) {
         submit_locked();
     }
     begin_recording_locked();
+    // The counters' starts go first, on the GPU's timeline: a set count (an
+    // initial count of 0 for the buffer the dispatch appends to) written into
+    // the word, a count from another word copied in.
+    bool gds_bound = false;
+    if (pl.meta.gds_counters) {
+        for (const GpuDispatch::GdsCounter& c : d.gds) {
+            if (!c.word) continue;
+            gds_bound = true;
+            if (c.start == GpuDispatch::kGdsKeep) continue;
+            if (counter_start_locked(c)) {
+                (c.start == GpuDispatch::kGdsSet ? g_gds_sets : g_gds_copies).fetch_add(1, std::memory_order_relaxed);
+            } else if (g_gds_start_failed.fetch_add(1, std::memory_order_relaxed) < 4) {
+                host_log("gpu: dispatch %s: the start of the GDS counter at 0x%llx (%s) could not be recorded: it counts on from what it holds",
+                         pl.name.c_str(), static_cast<unsigned long long>(c.word), c.start == GpuDispatch::kGdsSet ? "a set count" : "a copy");
+            }
+        }
+        if (gds_bound) {
+            g_gds_dispatches.fetch_add(1, std::memory_order_relaxed);
+            // The dispatch counts in the word while it runs, where GCN counted
+            // in GDS and left the word as it was until the store after: a V#
+            // of the program's over a counter word would see the count move.
+            // GX reads the live count from the indirect arguments instead;
+            // said once per program if one ever does.
+            if (!pl.gds_overlap_checked) {
+                pl.gds_overlap_checked = true;
+                const auto covers = [&](const gcn::ResourcePath& path) -> std::uint64_t {
+                    std::uint32_t v[4]{};
+                    if (!resolve_resource(path, d.user_data, 4, v)) return 0;
+                    const std::uint64_t base = v[0] | (static_cast<std::uint64_t>(v[1] & 0xff) << 32);
+                    const std::uint32_t stride = (v[1] >> 16) & 0x3fff;
+                    const std::uint64_t bytes = stride ? std::uint64_t{v[2]} * stride : v[2];
+                    for (const GpuDispatch::GdsCounter& c : d.gds) {
+                        if (c.word && c.word >= base && c.word < base + bytes) return c.word;
+                    }
+                    return 0;
+                };
+                for (const gcn::BufferBinding& b : pl.meta.buffers) {
+                    if (const std::uint64_t w = b.pointer ? 0 : covers(b.path)) {
+                        host_log("gpu: dispatch %s reads %s, which holds the GDS counter word 0x%llx it counts in: it sees the count move",
+                                 pl.name.c_str(), b.path.str().c_str(), static_cast<unsigned long long>(w));
+                    }
+                }
+                for (const gcn::ResourcePath& path : pl.meta.store_buffers) {
+                    if (const std::uint64_t w = covers(path)) {
+                        host_log("gpu: dispatch %s stores through %s, which holds the GDS counter word 0x%llx it counts in", pl.name.c_str(),
+                                 path.str().c_str(), static_cast<unsigned long long>(w));
+                    }
+                }
+            }
+        } else if (g_gds_unbound.fetch_add(1, std::memory_order_relaxed) < 8) {
+            host_log("gpu: dispatch %s counts in GDS (%u site(s)) and the command buffer bound no counter for it: its ds_append / ds_consume "
+                     "return 0 and count nothing",
+                     pl.name.c_str(), pl.meta.gds_counters);
+        }
+        if (g_gds_trace && g_gds_traced.fetch_add(1, std::memory_order_relaxed) < 64) {
+            std::string words;
+            for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k) {
+                const GpuDispatch::GdsCounter& c = d.gds[k];
+                if (!c.word) continue;
+                char t[160];
+                std::uint32_t now = 0;
+                if (hle_kernel_va_mapped(c.word, 4)) std::memcpy(&now, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(c.word)), 4);
+                std::snprintf(t, sizeof(t), " [GDS 0x%x] 0x%llx (holds %u on the CPU) %s", (d.gds_base + k) * 4, static_cast<unsigned long long>(c.word), now,
+                              c.start == GpuDispatch::kGdsKeep ? "kept" : c.start == GpuDispatch::kGdsSet ? "set to" : "copied from");
+                words += t;
+                if (c.start == GpuDispatch::kGdsSet) words += " " + std::to_string(c.value);
+                if (c.start == GpuDispatch::kGdsCopy) {
+                    std::snprintf(t, sizeof(t), " 0x%llx", static_cast<unsigned long long>(c.from));
+                    words += t;
+                }
+            }
+            host_log("gpu: GDS dispatch %s %ux%ux%u%s%s at flip %llu:%s", pl.name.c_str(), d.dim[0], d.dim[1], d.dim[2], d.indirect_va ? " indirect at " : "",
+                     d.indirect_va ? std::to_string(d.indirect_va).c_str() : "", static_cast<unsigned long long>(hle_video_flip_count()),
+                     words.empty() ? " none bound" : words.c_str());
+        }
+    }
     transfer_flush_locked();
     render_end_pass_locked();
     copy_versions_flush_locked();  // a compute shader reads memory without looking at them
     gcn::StageParams params{};
     params.l1_table = g.l1.address;
     std::memcpy(params.user_sgpr, d.user_data, sizeof(params.user_sgpr));
+    if (gds_bound) {
+        params.gds_base = d.gds_base;
+        for (std::uint32_t k = 0; k < GpuDispatch::kGdsCounters; ++k) params.gds_counter[k] = d.gds[k].word;
+    }
     VkDescriptorBufferInfo ubi{};
     alloc_params_slot_locked(params, ubi);
     VkDescriptorSet set = alloc_set_locked();
@@ -5844,6 +5942,11 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
                          static_cast<unsigned long long>(tsharp_base(tw)), pl.name.c_str(), d.dim[0], d.dim[1], d.dim[2], b.storage ? "WRITES" : "reads",
                          tw[0], tw[1], tw[2], tw[3], static_cast<unsigned long long>(hle_video_flip_count()), bufs.c_str());
             }
+        }
+    }
+    if (gds_bound) {
+        for (const GpuDispatch::GdsCounter& c : d.gds) {
+            if (c.word) shadow_written_locked(c.word, 4, true);
         }
     }
     VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -6552,6 +6655,32 @@ bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes) 
     return true;
 }
 
+namespace {
+
+// A GDS counter's start before the dispatch that counts in it
+// (GpuDispatch::gds): a set count filled into the word, or another word's
+// copied in, in the open transfer batch.
+bool counter_start_locked(const GpuDispatch::GdsCounter& c) {
+    Located dst;
+    if (!locate_range(c.word, 4, dst)) return false;
+    Located src;
+    if (c.start == GpuDispatch::kGdsCopy && !locate_range(c.from, 4, src)) return false;
+    transfer_begin_locked();
+    if (c.start == GpuDispatch::kGdsSet) {
+        transfer_order_locked(VK_NULL_HANDLE, 0, dst.buffer, dst.offset, 4, true);
+        rec().fill_buffer(dst.buffer, dst.offset, 4, c.value);
+    } else {
+        transfer_order_locked(src.buffer, src.offset, dst.buffer, dst.offset, 4, true);
+        VkBufferCopy region{src.offset, dst.offset, 4};
+        rec().copy_buffer(src.buffer, dst.buffer, 1, &region);
+    }
+    transfer_end_locked();
+    shadow_written_locked(c.word, 4, true);
+    return true;
+}
+
+}  // namespace
+
 std::atomic<std::uint64_t> g_counter_copies{0}, g_counter_fills{0};
 
 bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes) {
@@ -6915,8 +7044,12 @@ void host_gpu_report() {
         }
     }
     if (host_gpu_gds_counters()) {
-        host_log("gpu: GDS counters: %llu copies out of their words and %llu writes into them on the GPU's timeline",
-                 static_cast<unsigned long long>(g_counter_copies.load()), static_cast<unsigned long long>(g_counter_fills.load()));
+        host_log("gpu: GDS counters: %llu dispatches counted in bound words, %llu counted in GDS with none bound; %llu counts set and %llu copied "
+                 "in first (%llu could not be); %llu counter copies and %llu fills from the command processor",
+                 static_cast<unsigned long long>(g_gds_dispatches.load()), static_cast<unsigned long long>(g_gds_unbound.load()),
+                 static_cast<unsigned long long>(g_gds_sets.load()), static_cast<unsigned long long>(g_gds_copies.load()),
+                 static_cast<unsigned long long>(g_gds_start_failed.load()), static_cast<unsigned long long>(g_counter_copies.load()),
+                 static_cast<unsigned long long>(g_counter_fills.load()));
     }
     if (g.cmd_buffer_marker && g.marker_buf.map) {
         std::uint32_t started = 0, finished = 0;

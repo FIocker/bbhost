@@ -107,7 +107,8 @@ struct Fixture {
 
     void init_guest() {
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = kGuestBytes;
-        bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         check(vkCreateBuffer(device, &bi, nullptr, &guest));
         VkMemoryRequirements req{}; vkGetBufferMemoryRequirements(device, guest, &req);
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO}; flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
@@ -165,6 +166,239 @@ struct Fixture {
         std::memcpy(r.data(), static_cast<char*>(mapped) + 2048, sizeof(r));
         return r;
     }
+    // ---- GDS counters (TranslateOptions::gds_counters) ----
+    // Programs in machine words (the decoder fills the fields), run as
+    // `groups` workgroups of `threads` against counter words in guest memory:
+    // each lane that counts adds 1 to the element its index names (marks, a
+    // 32-bit V# in s[4:7]), so an index two lanes got, or one no lane got,
+    // shows. M0 comes from s12, as GX's particle passes take it (0x200020:
+    // GDS bytes 0x20.., 0x20 of them).
+    static constexpr std::uint64_t kCounterA = 0x1'0000'0f00ull, kCounterB = 0x1'0000'0f04ull, kArgs = 0x1'0000'0f10ull,
+                                   kMarks = 0x1'0000'1000ull;
+    static constexpr std::uint32_t kMaxMarks = 4096;
+    std::uint32_t& guest_u32(std::uint64_t va) { return *reinterpret_cast<std::uint32_t*>(guest_map + (va & 0xffff)); }
+    std::uint32_t mark(std::uint32_t k) { return guest_u32(kMarks + 4ull * k); }
+    // Which lanes count: all, those whose local id is below `limit`, or the odd ones.
+    enum class Lanes { kAll, kBelow, kOdd };
+    // ds_append (or ds_consume) at GDS offset `off`, the lane's index made as
+    // the game's passes make it - v_mbcnt added (append), or subtracted with 1
+    // more (consume) - then marks[index] += 1.
+    static std::vector<std::uint32_t> counter_program(bool append, std::uint32_t off, Lanes lanes, std::uint32_t limit = 0) {
+        std::vector<std::uint32_t> w = {0xBEFC030Cu};  // s_mov_b32 m0, s12
+        if (lanes == Lanes::kBelow) {
+            w.push_back(0x7DA800FFu);  // v_cmpx_gt_u32 vcc, limit, v0
+            w.push_back(limit);
+        } else if (lanes == Lanes::kOdd) {
+            w.push_back(0x360A0081u);  // v_and_b32 v5, 1, v0
+            w.push_back(0x7DA40A81u);  // v_cmpx_eq_u32 vcc, 1, v5
+        }
+        w.push_back((append ? 0xD8FA0000u : 0xD8F60000u) | off);  // ds_append / ds_consume v1, v0 offset:off gds
+        w.push_back(1u << 24);
+        w.push_back(0xD2480003u);  // v_mbcnt_hi_u32_b32 v3, exec_hi, 0
+        w.push_back(0x0001007Fu);
+        w.push_back(0x4604067Eu);  // v_mbcnt_lo_u32_b32 v2, exec_lo, v3
+        if (append) {
+            w.push_back(0x4A020501u);  // v_add_i32 v1, v1, v2
+        } else {
+            w.push_back(0x4C020501u);  // v_sub_i32 v1, v1, v2
+            w.push_back(0x4E020281u);  // v_subrev_i32 v1, 1, v1
+        }
+        w.push_back(0x7E0C0281u);  // v_mov_b32 v6, 1
+        w.push_back(0xE0C82000u);  // buffer_atomic_add v6, v1, s[4:7], 0 idxen
+        w.push_back(0x80010601u);
+        w.push_back(0xBF810000u);  // s_endpgm
+        return w;
+    }
+    struct CounterPipeline {
+        VkShaderModule module{};
+        VkPipeline pipeline{};
+        gcn::TranslateResult result;
+    };
+    CounterPipeline counter_pipeline(const std::vector<std::uint32_t>& words, std::uint32_t threads, bool gds_counters = true) {
+        const gcn::Program prog = gcn::decode(words.data(), words.size());
+        if (!prog.errors.empty()) throw std::runtime_error("counter program: " + prog.errors[0].what);
+        gcn::TranslateOptions o;
+        o.stage = gcn::Stage::Compute;
+        o.rsrc2 = 13 << 1;
+        o.cs_threads[0] = threads;
+        o.gds_counters = gds_counters;
+        CounterPipeline cp;
+        cp.result = gcn::translate(prog, o);
+        if (!cp.result.ok()) throw std::runtime_error(cp.result.errors[0]);
+        spvtools::SpirvTools validator(SPV_ENV_VULKAN_1_2);
+        validator.SetMessageConsumer([](auto, auto, const auto&, const char* msg) { std::fprintf(stderr, "%s\n", msg); });
+        if (!validator.Validate(cp.result.spirv)) throw std::runtime_error("invalid SPIR-V");
+        VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        mi.codeSize = cp.result.spirv.size() * 4;
+        mi.pCode = cp.result.spirv.data();
+        check(vkCreateShaderModule(device, &mi, nullptr, &cp.module));
+        VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        ci.layout = pipeline_layout;
+        ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        ci.stage.module = cp.module;
+        ci.stage.pName = "main";
+        check(vkCreateComputePipelines(device, {}, 1, &ci, nullptr, &cp.pipeline));
+        return cp;
+    }
+    void destroy(CounterPipeline& cp) {
+        vkDestroyPipeline(device, cp.pipeline, nullptr);
+        vkDestroyShaderModule(device, cp.module, nullptr);
+    }
+    // The params a dispatch of these takes: M0's user SGPR, the marks V#, and
+    // the counter words for GDS dwords 8.. (byte 0x20 on).
+    void counter_params(std::uint64_t word0, std::uint64_t word1) {
+        auto* params = static_cast<gcn::StageParams*>(mapped);
+        std::memset(params->user_sgpr, 0, sizeof(params->user_sgpr));
+        params->user_sgpr[4] = static_cast<std::uint32_t>(kMarks);
+        params->user_sgpr[5] = static_cast<std::uint32_t>(kMarks >> 32) | 4u << 16;  // stride 4
+        params->user_sgpr[6] = kMaxMarks;
+        params->user_sgpr[7] = 4u << 15 | 4u << 12 | 0xfac;  // 32 uint, X Y Z W
+        params->user_sgpr[12] = 0x200020;
+        params->gds_base = 8;
+        std::memset(params->gds_counter, 0, sizeof(params->gds_counter));
+        params->gds_counter[0] = word0;
+        params->gds_counter[1] = word1;
+        std::memset(guest_map + (kMarks & 0xffff), 0, kMaxMarks * 4);
+    }
+    void record_counter_dispatch(const CounterPipeline& cp, std::uint32_t groups, bool indirect = false) {
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cp.pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &set, 0, nullptr);
+        if (indirect) {
+            vkCmdDispatchIndirect(cmd, guest, kArgs & 0xffff);
+        } else {
+            vkCmdDispatch(cmd, groups, 1, 1);
+        }
+    }
+    // Every element in [lo, hi) marked once and nothing else: what a counter
+    // that hands out each index of its range exactly once leaves.
+    bool marks_once(std::uint32_t lo, std::uint32_t hi, std::string& why) {
+        for (std::uint32_t k = 0; k < kMaxMarks; ++k) {
+            const std::uint32_t want = k >= lo && k < hi ? 1 : 0;
+            if (mark(k) != want) {
+                why = "element " + std::to_string(k) + " marked " + std::to_string(mark(k)) + " times, expected " + std::to_string(want);
+                return false;
+            }
+        }
+        return true;
+    }
+    // `threads` x `groups` lanes (those `lanes` lets count) append to counter
+    // A at GDS byte 0x20 + off from `start`: A ends at start + the lanes that
+    // counted, each index in between went to one lane, B is untouched.
+    bool run_gds_append(std::uint32_t threads, std::uint32_t groups, Lanes lanes, std::uint32_t limit, std::uint32_t off, std::uint32_t start,
+                        const char* what) {
+        const std::uint32_t total = threads * groups;
+        std::uint32_t counting = 0;
+        for (std::uint32_t t = 0; t < threads; ++t) counting += lanes == Lanes::kAll || (lanes == Lanes::kBelow && t < limit) || (lanes == Lanes::kOdd && (t & 1));
+        counting *= groups;
+        CounterPipeline cp = counter_pipeline(counter_program(true, off, lanes, limit), threads);
+        // off 0 counts in gds_counter[0], off 4 in [1]: A goes where off names, B in the other.
+        counter_params(off == 0 ? kCounterA : kCounterB, off == 0 ? kCounterB : kCounterA);
+        guest_u32(kCounterA) = start;
+        guest_u32(kCounterB) = 777;
+        begin();
+        barrier(VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        record_counter_dispatch(cp, groups);
+        barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        submit();
+        std::string why;
+        bool ok = cp.result.gds_counters == 1 && guest_u32(kCounterA) == start + counting && guest_u32(kCounterB) == 777 &&
+                  marks_once(start, start + counting, why);
+        if (cp.result.gds_counters != 1) why = std::to_string(cp.result.gds_counters) + " GDS counter sites, expected 1";
+        std::printf("%s ds_append gds offset:%u, %u threads x %u groups (%u counting) from %u, %s: counter %u (expected %u), other %u%s%s\n",
+                    ok ? "PASS" : "FAIL", off, threads, groups, counting, start, what, guest_u32(kCounterA), start + counting, guest_u32(kCounterB),
+                    why.empty() ? "" : "; ", why.c_str());
+        destroy(cp);
+        (void)total;
+        return ok;
+    }
+    // Lanes below `n` of `threads` x `groups` consume from counter A holding
+    // `start`: A ends at start - those lanes, and the indices they read
+    // (from the top down) are each read once.
+    bool run_gds_consume(std::uint32_t threads, std::uint32_t groups, std::uint32_t n, std::uint32_t start, const char* what) {
+        const std::uint32_t counting = std::min(threads, n) * groups;
+        CounterPipeline cp = counter_pipeline(counter_program(false, 0, Lanes::kBelow, n), threads);
+        counter_params(kCounterA, kCounterB);
+        guest_u32(kCounterA) = start;
+        guest_u32(kCounterB) = 777;
+        begin();
+        barrier(VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        record_counter_dispatch(cp, groups);
+        barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        submit();
+        std::string why;
+        const bool ok = guest_u32(kCounterA) == start - counting && guest_u32(kCounterB) == 777 && marks_once(start - counting, start, why);
+        std::printf("%s ds_consume gds, %u threads x %u groups (%u counting) from %u, %s: counter %u (expected %u)%s%s\n", ok ? "PASS" : "FAIL",
+                    threads, groups, counting, start, what, guest_u32(kCounterA), start - counting, why.empty() ? "" : "; ", why.c_str());
+        destroy(cp);
+        return ok;
+    }
+    // No word bound for the dword (gds_counter 0): nothing counts, the
+    // program still runs, and every lane gets 0 back (its index is its rank).
+    bool run_gds_unbound() {
+        CounterPipeline cp = counter_pipeline(counter_program(true, 8, Lanes::kAll), 32);  // GDS byte 0x28: gds_counter[2], left 0
+        counter_params(kCounterA, kCounterB);
+        guest_u32(kCounterA) = 5;
+        guest_u32(kCounterB) = 6;
+        begin();
+        barrier(VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        record_counter_dispatch(cp, 1);
+        barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        submit();
+        std::uint32_t marked = 0;
+        for (std::uint32_t k = 0; k < kMaxMarks; ++k) marked += mark(k);
+        const bool ok = guest_u32(kCounterA) == 5 && guest_u32(kCounterB) == 6 && marked == 32 && mark(0) >= 1;
+        std::printf("%s ds_append gds with no word bound: counters %u %u (expected 5 6), %u lanes marked from index 0 (expected 32)\n",
+                    ok ? "PASS" : "FAIL", guest_u32(kCounterA), guest_u32(kCounterB), marked);
+        destroy(cp);
+        return ok;
+    }
+    // CopyStructureCount as the host does it: lanes below `limit` of `groups`
+    // workgroups of 64 append to A, a copy of A into the X of a dispatch's
+    // indirect arguments on the GPU's timeline (after the dispatch, before
+    // the next), then that many workgroups of one lane consume from A. A ends
+    // at 0, each index once: the second dispatch ran the count the first one
+    // left, not the count memory held when it was recorded (0).
+    bool run_counter_to_args(std::uint32_t groups, std::uint32_t limit) {
+        const std::uint32_t n = groups * std::min(limit, 64u);
+        CounterPipeline producer = counter_pipeline(counter_program(true, 0, Lanes::kBelow, limit), 64);
+        CounterPipeline consumer = counter_pipeline(counter_program(false, 0, Lanes::kAll), 1);
+        counter_params(kCounterA, kCounterB);
+        guest_u32(kCounterA) = 0;
+        guest_u32(kArgs) = 0;  // what the CPU sees when the dispatches are recorded
+        guest_u32(kArgs + 4) = 1;
+        guest_u32(kArgs + 8) = 1;
+        begin();
+        barrier(VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        record_counter_dispatch(producer, groups);
+        barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);  // the host's transfer-batch barriers
+        VkBufferCopy region{kCounterA & 0xffff, kArgs & 0xffff, 4};
+        vkCmdCopyBuffer(cmd, guest, guest, 1, &region);
+        barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT);
+        // The consumer's marks start where the producer's are: clear them on the GPU's timeline too.
+        vkCmdFillBuffer(cmd, guest, kMarks & 0xffff, kMaxMarks * 4, 0);
+        barrier(VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+        record_counter_dispatch(consumer, 0, true);
+        barrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        submit();
+        std::string why;
+        const bool ok = guest_u32(kArgs) == n && guest_u32(kCounterA) == 0 && marks_once(0, n, why);
+        std::printf("%s counter into indirect arguments on the GPU's timeline: %u appended, arguments X %u, counter after the consumers %u "
+                    "(expected 0)%s%s\n",
+                    ok ? "PASS" : "FAIL", n, guest_u32(kArgs), guest_u32(kCounterA), why.empty() ? "" : "; ", why.c_str());
+        destroy(producer);
+        destroy(consumer);
+        return ok;
+    }
+    // Off (BBHOST_GDS_COUNTERS=0) the program is the old one: no counter sites.
+    bool run_gds_off() {
+        CounterPipeline cp = counter_pipeline(counter_program(true, 4, Lanes::kAll), 64, false);
+        const bool ok = cp.result.gds_counters == 0;
+        std::printf("%s ds_append gds with gds_counters off: %u counter sites (expected 0)\n", ok ? "PASS" : "FAIL", cp.result.gds_counters);
+        destroy(cp);
+        return ok;
+    }
+
     static gcn::Inst vmov(int reg, std::uint32_t bits) {
         gcn::Inst in; in.enc = gcn::Enc::VOP1; in.op = 1; in.dst = static_cast<std::uint16_t>(reg);
         in.src0 = gcn::kLiteral; in.has_literal = true; in.literal = bits; return in;
@@ -775,5 +1009,21 @@ int main() try {
     ok &= f.run_bound_store(2, 0, false, 16, 2, "records times the stride, straddling");
     ok &= f.run_bound_store(2, 99, true, 0, 64, "a constant offset");
     ok &= f.run_bound_store(0, 8, false, 0, 64, "walked");
+    // GDS counters: one subgroup, several in a workgroup, several workgroups;
+    // EXEC partly off; M0's base plus the offset picking the word; consume's
+    // values from before; an unbound dword; the counter into indirect
+    // arguments on the GPU's timeline.
+    ok &= f.run_gds_append(32, 1, Fixture::Lanes::kAll, 0, 4, 0, "one subgroup");
+    ok &= f.run_gds_append(256, 1, Fixture::Lanes::kAll, 0, 4, 10, "several subgroups");
+    ok &= f.run_gds_append(256, 8, Fixture::Lanes::kAll, 0, 4, 3, "several workgroups");
+    ok &= f.run_gds_append(64, 4, Fixture::Lanes::kOdd, 0, 4, 1, "the odd lanes only");
+    ok &= f.run_gds_append(128, 2, Fixture::Lanes::kBelow, 45, 4, 0, "the first 45 lanes of each group");
+    ok &= f.run_gds_append(64, 2, Fixture::Lanes::kAll, 0, 0, 100, "offset 0: the first word");
+    ok &= f.run_gds_consume(256, 1, 256, 300, "every lane");
+    ok &= f.run_gds_consume(64, 4, 37, 200, "37 lanes of each group");
+    ok &= f.run_gds_unbound();
+    ok &= f.run_counter_to_args(1, 37);
+    ok &= f.run_counter_to_args(16, 64);
+    ok &= f.run_gds_off();
     return ok ? 0 : 1;
 } catch (const std::exception& e) { std::fprintf(stderr,"%s\n",e.what()); return 1; }

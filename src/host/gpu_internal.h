@@ -176,6 +176,7 @@ struct ComputePipeline {
     bool buffer_to_image = false;  // MUBUF load + MIMG store
     int img_src_sgpr = -1;       // the source V#'s user SGPR, for buffer_to_image
     bool untraced_stores_logged = false;
+    bool gds_overlap_checked = false;     // GDS counters: whether a V# of the program covers a counter word, looked at once
 };
 
 // Guest VA -> (VkBuffer, offset) for index buffers.

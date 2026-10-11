@@ -23,6 +23,24 @@ struct GpuDispatch {
     // and the clear values belong to that fill, not to the draw that later
     // binds the target (a draw from a token reads no register).
     std::uint32_t depth_clear = 0, stencil_clear = 0;
+    // The counters its ds_append / ds_consume in GDS count in (gcn::
+    // TranslateOptions::gds_counters): for GDS dwords gds_base.., the guest
+    // word each one is (0: none) and what it starts the dispatch from. GX
+    // keeps an append/consume buffer's counter in the word past its records
+    // and moves it into GDS before the dispatch and back after (DMA_DATA,
+    // gx_commit_compute_stage / gx_dispatch_post) - the initial count of a
+    // D3D11 UAV, kept or set. The dispatch counts in the word itself; a set
+    // count is written into it first, a count from another word copied in.
+    enum GdsStart : std::uint8_t { kGdsKeep, kGdsSet, kGdsCopy };
+    struct GdsCounter {
+        std::uint64_t word = 0;
+        std::uint64_t from = 0;    // kGdsCopy
+        std::uint32_t value = 0;   // kGdsSet
+        GdsStart start = kGdsKeep;
+    };
+    static constexpr std::uint32_t kGdsCounters = 8;  // gcn::kGdsCounters
+    std::uint32_t gds_base = 0;
+    GdsCounter gds[kGdsCounters] = {};
 };
 
 // Everything a draw is decoded from, in register encodings. The PM4 path
@@ -282,9 +300,8 @@ std::uint64_t host_gpu_completed_submits();
 void host_gpu_explain_value(std::uint64_t va, std::uint64_t value);
 bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes);
 bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
-// GDS counters: GX moves an append/consume buffer's counter through GDS
-// around a dispatch (gnm_exec.cpp). BBHOST_GDS_COUNTERS=0 turns them off,
-// and GDS is dropped as before.
+// GDS counters (gcn::TranslateOptions::gds_counters; BBHOST_GDS_COUNTERS=0
+// turns them off, and GDS is dropped as before).
 bool host_gpu_gds_counters();
 // A copy out of or a fill of a counter word, on the GPU's timeline: the word
 // is the GPU's, as GX's GDS was, and its value is the one the dispatches
