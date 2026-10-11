@@ -599,7 +599,17 @@ GUEST_ABI short* hle_getpctype() { return g_ctype + 1; }
 GUEST_ABI short* hle_getptolower() { return g_tolower + 1; }
 GUEST_ABI short* hle_getptoupper() { return g_toupper + 1; }
 
-GUEST_ABI double hle_stod(const char* s, char** end, long) { return std::strtod(s, end); }
+template <typename Float, typename Char>
+Float guest_float_result(bb::libc::FloatParse<Float, Char> r, Char** end) {
+    if (end) *end = const_cast<Char*>(r.end);
+    if (r.range_error) set_guest_errno_bsd(34);
+    return r.value;
+}
+// Inspected game callers pass adjustment zero. Native extended arithmetic
+// and nonzero decimal adjustments remain separate compatibility work.
+GUEST_ABI double hle_stod(const char* s, char** end, std::int64_t) {
+    return guest_float_result(bb::libc::parse_float<double>(s), end);
+}
 GUEST_ABI std::int64_t hle_stoll(const char* s, char** end, int base) { return hle_strtol(s, end, base); }
 GUEST_ABI std::uint64_t hle_stoul(const char* s, char** end, int base) { return hle_strtoumax(s, end, base); }
 GUEST_ABI std::uint64_t hle_stoull(const char* s, char** end, int base) { return hle_strtoumax(s, end, base); }
@@ -883,9 +893,11 @@ GUEST_ABI int hle_swscanf_body(const Gwchar* s, const Gwchar* fmt, SysvVaList* a
     }
     return sysv_vsscanf(ns.c_str(), nf.c_str(), ap);
 }
-GUEST_ABI double hle_wstod(const Gwchar* s, Gwchar** end, std::int64_t) { return bb::libc::wide_stod(s, end); }
+GUEST_ABI double hle_wstod(const Gwchar* s, Gwchar** end, std::int64_t) {
+    return guest_float_result(bb::libc::parse_wide_float<double>(s), end);
+}
 GUEST_ABI float hle_wstof(const Gwchar* s, Gwchar** end, std::int64_t) {
-    return static_cast<float>(hle_wstod(s, end, 0));
+    return guest_float_result(bb::libc::parse_wide_float<float>(s), end);
 }
 
 GUEST_ABI void hle_ios_init() {}

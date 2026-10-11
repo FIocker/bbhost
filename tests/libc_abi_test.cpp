@@ -128,5 +128,23 @@ int main() {
     CHECK(wide_stod(wide_space, &float_end) == 0 && float_end == wide_space);
     // Native _WStof also rounds this vector to 1.0. Host strtof would differ.
     CHECK(static_cast<float>(wide_stod(u"1.0000000596046448", nullptr)) == 1.0f);
+    struct FloatRange { const char* text; bool range; };
+    const FloatRange ranges[] = {{"1e999", true}, {"-1e999", true}, {"1e-999", true},
+        {"0e999", false}, {"-0e-999", false}, {"inf", false}, {"nan", false},
+        {"1e-40", false}, {"0x1p-2000", false}, {"0x1p1024", false}, {"nope", false}};
+    for (const auto& v : ranges) {
+        errno = 73;
+        const auto d = parse_float<double>(v.text);
+        const auto f = parse_float<float>(v.text);
+        const std::u16string w(v.text, v.text + std::strlen(v.text));
+        const auto wd = parse_wide_float<double>(w.c_str());
+        const auto wf = parse_wide_float<float>(w.c_str());
+        CHECK(d.range_error == v.range && f.range_error == v.range);
+        CHECK(wd.range_error == v.range && wf.range_error == v.range && errno == 73);
+        CHECK(d.end - v.text == wd.end - w.c_str());
+        CHECK(f.end - v.text == wf.end - w.c_str());
+    }
+    CHECK(!parse_float<double>("1e-308").range_error);
+    CHECK(parse_float<float>("1e-308").range_error);
     std::puts("libc ABI tests passed");
 }

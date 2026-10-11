@@ -232,8 +232,32 @@ int main() {
         const char16_t wide[] = {static_cast<char16_t>(c), u'1', u'2', 0};
         compare_wide(wide, 10);
     }
+    const auto native_stod = lib.function<double(*)(const char*, char**, std::int64_t)>("c41UEHVtiEA");
     const auto native_wstod = lib.function<double(*)(const char16_t*, char16_t**, std::int64_t)>("4nRn+exUJAM");
     const auto native_wstof = lib.function<float(*)(const char16_t*, char16_t**, std::int64_t)>("GUuiOcxL-r0");
+    for (const char* text : {"1e999", "-1e999", "1e-999", "-1e-999", "0e999", "-0e-999",
+                            "inf", "nan", "1e-40", "1e-308", "1e-324", "0x1p-2000", "0x1p1024", "nope"}) {
+        const std::u16string wide(text, text + std::strlen(text));
+        char* narrow_end;
+        char16_t* wide_end;
+        oracle_errno = 73;
+        const auto d = native_stod(text, &narrow_end, 0);
+        const auto hd = parse_float<double>(text);
+        CHECK(oracle_errno == (hd.range_error ? 34 : 73) && narrow_end == hd.end);
+        oracle_errno = 73;
+        const auto wd = native_wstod(wide.c_str(), &wide_end, 0);
+        const auto hwd = parse_wide_float<double>(wide.c_str());
+        CHECK(oracle_errno == (hwd.range_error ? 34 : 73) && wide_end == hwd.end);
+        oracle_errno = 73;
+        const auto wf = native_wstof(wide.c_str(), &wide_end, 0);
+        const auto hwf = parse_wide_float<float>(wide.c_str());
+        CHECK(oracle_errno == (hwf.range_error ? 34 : 73) && wide_end == hwf.end);
+        // Range/endpoint contract only: native subnormal rounding is NOT
+        // certified by these checks. Preserve the already documented gap.
+        CHECK(std::isinf(d) == std::isinf(hd.value) && (d == 0) == (hd.value == 0));
+        CHECK(std::isinf(wd) == std::isinf(hwd.value) && (wd == 0) == (hwd.value == 0));
+        CHECK(std::isinf(wf) == std::isinf(hwf.value) && (wf == 0) == (hwf.value == 0));
+    }
     for (const auto& text : {std::u16string(100, u'0') + u"2.5!", std::u16string(u"1.0000000596046448")}) {
         char16_t *native_end, *host_end;
         const double native = native_wstod(text.c_str(), &native_end, 0);
