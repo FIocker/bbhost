@@ -197,16 +197,20 @@ GUEST_ABI std::uint64_t hle_strtoumax(const char* s, char** end, int base) {
 // The printf family walks the guest's own va_list (hle/sysv_va.h): the
 // v-entries get the guest's pointer, the variadic ones are asm shims
 // (SYSV_VA_ENTRY, after this namespace) that build one from the registers.
-GUEST_ABI int hle_vprintf(const char* fmt, SysvVaList* ap) { return sysv_vfprintf(stdout, fmt, ap); }
+GUEST_ABI int hle_vprintf(const char* fmt, SysvVaList* ap) { return bb::libc::print_file(stdout, fmt, ap); }
 GUEST_ABI int hle_vsnprintf(char* b, std::uint64_t n, const char* fmt, SysvVaList* ap) {
     return sysv_vsnprintf(b, n, fmt, ap);
 }
 GUEST_ABI int hle_vsprintf(char* b, const char* fmt, SysvVaList* ap) {
     return sysv_vsnprintf(b, ~std::size_t(0), fmt, ap);
 }
-GUEST_ABI int hle_vfprintf(FILE* f, const char* fmt, SysvVaList* ap) { return sysv_vfprintf(f ? f : stdout, fmt, ap); }
-GUEST_ABI int hle_puts(const char* s) { return std::puts(s); }
-GUEST_ABI int hle_putchar(int c) { return std::putchar(c); }
+GUEST_ABI int hle_vfprintf(FILE* f, const char* fmt, SysvVaList* ap) { return bb::libc::print_file(f ? f : stdout, fmt, ap); }
+GUEST_ABI int hle_puts(const char* s) {
+    return bb::libc::file_result(stdout, [&] { return std::puts(s); }, bb::libc::write_access);
+}
+GUEST_ABI int hle_putchar(int c) {
+    return bb::libc::file_result(stdout, [&] { return std::putchar(c); }, bb::libc::write_access);
+}
 GUEST_ABI void hle_perror(const char* s) { bb::libc::print_error(stderr, s); }
 
 GUEST_ABI FILE* hle_fopen(const char* path, const char* mode) {
@@ -902,7 +906,7 @@ GUEST_ABI void hle_locinfo_dtor(void*) {}
 }  // namespace
 
 // The variadic entries: asm shims over bodies that take the guest va_list.
-extern "C" GUEST_ABI int hle_va_printf_body(const char* fmt, SysvVaList* ap) { return sysv_vfprintf(stdout, fmt, ap); }
+extern "C" GUEST_ABI int hle_va_printf_body(const char* fmt, SysvVaList* ap) { return hle_vprintf(fmt, ap); }
 extern "C" GUEST_ABI int hle_va_snprintf_body(char* b, std::uint64_t n, const char* fmt, SysvVaList* ap) {
     return sysv_vsnprintf(b, n, fmt, ap);
 }
@@ -910,9 +914,11 @@ extern "C" GUEST_ABI int hle_va_sprintf_body(char* b, const char* fmt, SysvVaLis
     return sysv_vsnprintf(b, ~std::size_t(0), fmt, ap);
 }
 extern "C" GUEST_ABI int hle_va_fprintf_body(FILE* f, const char* fmt, SysvVaList* ap) {
-    return sysv_vfprintf(f ? f : stdout, fmt, ap);
+    return hle_vfprintf(f, fmt, ap);
 }
-extern "C" GUEST_ABI int hle_va_fscanf_body(FILE* f, const char* fmt, SysvVaList* ap) { return sysv_vfscanf(f, fmt, ap); }
+extern "C" GUEST_ABI int hle_va_fscanf_body(FILE* f, const char* fmt, SysvVaList* ap) {
+    return bb::libc::scan_file(f, fmt, ap);
+}
 extern "C" GUEST_ABI int hle_va_sscanf_body(const char* s, const char* fmt, SysvVaList* ap) {
     return sysv_vsscanf(s, fmt, ap);
 }

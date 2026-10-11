@@ -27,7 +27,7 @@ run() {
   fi
 }
 run libc_abi_test tests/libc_abi_test.cpp
-run libc_stdio_test tests/libc_stdio_test.cpp
+run libc_stdio_test tests/libc_stdio_test.cpp src/hle/sysv_va.cpp
 run libc_errno_test tests/libc_errno_test.cpp
 run libc_wide_test tests/libc_wide_test.cpp src/hle/sysv_va.cpp
 run sysv_va_test tests/sysv_va_test.cpp src/hle/sysv_va.cpp

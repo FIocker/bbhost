@@ -8,6 +8,7 @@
 
 #include "hle/common.h"
 #include "hle/libc_errno.h"
+#include "hle/sysv_va.h"
 
 namespace bb::libc {
 
@@ -82,6 +83,24 @@ template <typename Fn> inline auto file_result(FILE* file, Fn&& call, unsigned a
     // commonly set EBADF here; propagate only for an allowed direction.
     if (error && std::ferror(file) && (file_access(file) & access)) set_guest_errno_host(error);
     return result;
+}
+
+inline int print_file(FILE* file, const char* format, SysvVaList* ap) {
+    return file_result(file, [&] { return sysv_vfprintf(file, format, ap); }, write_access);
+}
+inline int scan_file(FILE* file, const char* format, SysvVaList* ap) {
+    return file_result(file, [&] {
+        const int result = sysv_vfscanf(file, format, ap);
+        // glibc's scanf can reject a write-only stream before its getc
+        // path, leaving ferror clear. Native fscanf reads through fgetc,
+        // whose direction rejection sets ferror without changing errno.
+        if (result == EOF && errno == EBADF && !std::ferror(file)) {
+            const int error = errno;
+            (void)std::fgetc(file);
+            errno = error;
+        }
+        return result;
+    }, read_access);
 }
 
 inline void print_error(FILE* file, const char* prefix) {
