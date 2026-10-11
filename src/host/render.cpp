@@ -386,6 +386,8 @@ const int g_vertex_input = [] {
 std::atomic<std::uint64_t> g_vertex_input_draws{0}, g_vertex_input_kept{0}, g_vertex_tables_read{0};
 std::atomic<std::uint64_t> g_vertex_tables_with_input{0};  // vertex-input draws whose vertex shader still reads the table
 std::atomic<std::uint64_t> g_vertex_staged_records{0};  // plan_vertex_input: records copied into device memory for their draw
+std::atomic<std::uint64_t> g_vertex_window_records{0};  // plan_vertex_input: records read from the draw's window copy
+std::atomic<std::uint64_t> g_vertex_input_no_gx_draws{0}, g_vertex_input_no_gx_kept{0};  // BBHOST_VERTEX_INPUT_NO_GX
 // BBHOST_GX_SKIP_TABLES (on unless 0): GX draws leave out of the
 // host ring the user-data tables and blocks their no-fallback variant does not
 // read (table_slots_read), once that variant exists. A draw that ends up on the
@@ -7478,6 +7480,10 @@ void render_report() {
                  static_cast<unsigned long long>(g_vertex_tables_with_input.load()), static_cast<unsigned long long>(g_vertex_tables_read.load()));
         host_log("render: vertex records the buffer shadow keeps in host memory, copied into device memory for their draw %llu",
                  static_cast<unsigned long long>(g_vertex_staged_records.load()));
+        host_log("render: draws without GX geometry with vertex input from their fetch shader's table %llu, fetch shader kept %llu; "
+                 "vertex records read from the draw's window copy %llu",
+                 static_cast<unsigned long long>(g_vertex_input_no_gx_draws.load()), static_cast<unsigned long long>(g_vertex_input_no_gx_kept.load()),
+                 static_cast<unsigned long long>(g_vertex_window_records.load()));
     }
     if (const std::uint64_t n = g_set_reused.load() + g_set_built.load()) {
         host_log("render: stage descriptor sets %llu, taken from the stage's previous draw %llu (%.1f%%), written %llu; "
@@ -9091,6 +9097,15 @@ const bool g_vertex_stage = [] {
     const char* e = std::getenv("BBHOST_VERTEX_STAGE");
     return !(e && e[0] == '0');
 }();
+// BBHOST_VERTEX_INPUT_NO_GX (on unless 0): a draw that carries no GX geometry -
+// YEBIS's post passes, the wrapper's own Scaleform, gamma and present draws -
+// takes vertex input from its fetch shader's table the same way
+// (vertex_table_from_memory), where it used to keep the fetch shader inlined
+// and so its vertex shader translated.
+const bool g_vertex_input_no_gx = [] {
+    const char* e = std::getenv("BBHOST_VERTEX_INPUT_NO_GX");
+    return !(e && e[0] == '0');
+}();
 bool vertex_table_from_memory(const std::vector<std::uint32_t>& fetch_words, std::uint64_t fetch_hash, const std::uint32_t* vs_user,
                               const GxDrawObjects& o, GxDrawObjects& out) {
     struct Loads {
@@ -9229,7 +9244,14 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
         Located loc;
         const int version = copy_version_lookup_locked(va, need, &loc);
         if (version == kCopyVersionStraddles) copy_versions_put_in_place_locked(kCvStraddle);
-        if (version != kCopyVersionInside) loc = locate(va, need);
+        // In one of the draw's CPU-written windows (YEBIS, host_gpu_draw_window):
+        // the copy taken as the draw records, never the ring slot, which the
+        // CPU may rewrite for a draw sixteen on before this one runs.
+        bool windowed = false;
+        if (version != kCopyVersionInside) {
+            windowed = !t_draw_windows.empty() && draw_window_locked(va, need, loc);
+            if (!windowed) loc = locate(va, need);
+        }
         if (g_import_audit) audit_range(va, need, kUseMirror);
         if (!loc.buffer || loc.avail < need) {
             t_vertex_input_refusal = kVsWhyPlacement;
@@ -9249,7 +9271,9 @@ bool plan_vertex_input(const std::vector<std::uint32_t>& fetch_words, std::uint6
             RecordShadow& ns = shadows[n_shadows++];
             ns.w = w;
             ns.whole = {};
-            if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
+            if (windowed) {
+                bump(g_vertex_window_records);
+            } else if (loc.offset >= fe.offset && loc.avail + fe.offset >= record_bytes) {
                 ns.whole = {loc.buffer, loc.offset - fe.offset, record_bytes};
                 shadow_locate_locked(record_va, record_bytes, ns.whole);
                 if (ns.whole.buffer == loc.buffer) {  // stays in host memory
@@ -11957,6 +11981,7 @@ static bool draw_impl(const GpuDraw& d) {
     std::uint64_t vertex_table = 0;  // render mode: the draw's vertex table in the host ring
     static thread_local VertexInputPlan vertex_input;
     bool use_vertex_input = false;  // BBHOST_VERTEX_INPUT: vertex_input replaces the fetch shader
+    bool no_gx_attempt = false;     // a draw without GX geometry asked its fetch shader's table (BBHOST_VERTEX_INPUT_NO_GX)
     if (gx_geometry_compare) compare_gx_geometry(d, *gx_geometry);
     {
         if (vs_cp->fetch_sgpr == -2) {
@@ -11998,6 +12023,21 @@ static bool draw_impl(const GpuDraw& d) {
                 }
                 use_vertex_input = plan_vertex_input(fetch->words, fetch_hash, *geometry, vertex_input, layout);
                 bump(use_vertex_input ? g_vertex_input_draws : g_vertex_input_kept);
+            } else if (g_vertex_input && g_vertex_input_no_gx && !s.tess_hw && !s.domain_level) {
+                // No GX geometry (YEBIS, Scaleform, gamma, present): the records
+                // come from the table the fetch shader loads them from, as for
+                // a GX draw whose table the game binds itself.
+                static thread_local GxDrawObjects bare, own_table;
+                bare = GxDrawObjects{};
+                bare.fetch_va = s.fetch_va;
+                bare.vtx_ud = 0xff;
+                if (vertex_table_from_memory(fetch->words, fetch_hash, s.vs_user, bare, own_table)) {
+                    use_vertex_input = plan_vertex_input(fetch->words, fetch_hash, own_table, vertex_input, nullptr);
+                } else {
+                    t_vertex_input_refusal = kVsWhyShape;
+                }
+                no_gx_attempt = true;
+                bump(use_vertex_input ? g_vertex_input_no_gx_draws : g_vertex_input_no_gx_kept);
             }
             if (gx_geometry && d.gx_render && !use_vertex_input) {
                 RenderCostTimer timer(kRenderCostVertexTable);
@@ -13847,8 +13887,8 @@ static bool draw_impl(const GpuDraw& d) {
         const int why = s.tess_hw                          ? kVsWhyTessHw
                         : s.domain_level                   ? kVsWhyDomain
                         : fetch_words.empty()              ? kVsWhyNoFetch
-                        : !(gx_geometry && d.gx_render)    ? kVsWhyNoGx
                         : !g_vertex_input                  ? kVsWhyInputOff
+                        : !(gx_geometry && d.gx_render) && !no_gx_attempt ? kVsWhyNoGx
                                                            : t_vertex_input_refusal;
         bump(g.draws_vs_why[why]);
         ++g_vs_other[vs_name][static_cast<std::size_t>(why)];
