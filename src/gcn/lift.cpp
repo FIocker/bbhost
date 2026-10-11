@@ -3066,7 +3066,7 @@ private:
     // on GCN; here every lane of the quad is active (whole-quad mode, EXEC set),
     // so the swizzle is a permutation within the quad, which Vulkan's quad
     // operations name by the same index GCN's lanes have.
-    std::size_t swizzles = 0;
+    std::size_t swizzles = 0, block_swizzles = 0;  // block_swizzles: inside a whole-quad block over a varying EXEC
     Id quad_right = 0, quad_bottom = 0;  // this invocation's column and row in its quad
     void quad_caps() {
         m.capability(spv::CapGroupNonUniform);
@@ -3136,15 +3136,22 @@ private:
         }
         // Every lane of the quad active on GCN: EXEC known set, and in whole-quad
         // mode (not the coverage a pixel shader starts with, where the helper
-        // lanes are inactive and read as 0).
-        const Val e = exec_lane();
-        if (!(e.constant && e.set)) {
-            reject("ds_swizzle_b32 where EXEC is not known set: a lane outside EXEC reads as 0 on GCN");
-            return;
-        }
-        if (e.helper_inexact) {
-            reject("ds_swizzle_b32 outside whole-quad mode: the quad's helper lanes are inactive on GCN and read as 0");
-            return;
+        // lanes are inactive and read as 0). Or inside a whole-quad block over
+        // a varying EXEC M (begin_whole_quad): GCN runs every lane of each quad
+        // holding an M pixel, so there each lane reads its own quad's, as the
+        // lift's quad operation does - the block runs in uniform control flow -
+        // and the result is GCN's in M's quads where the source is in all of
+        // them (whole_quad_write checks; GCN writes no other quad).
+        if (!wqm.active) {
+            const Val e = exec_lane();
+            if (!(e.constant && e.set)) {
+                reject("ds_swizzle_b32 where EXEC is not known set: a lane outside EXEC reads as 0 on GCN");
+                return;
+            }
+            if (e.helper_inexact) {
+                reject("ds_swizzle_b32 outside whole-quad mode: the quad's helper lanes are inactive on GCN and read as 0");
+                return;
+            }
         }
         if (std::any_of(kill_proofs.begin(), kill_proofs.end(), [](const KillProof& k) { return k.per_pixel; })) {
             reject("ds_swizzle_b32 after a kill region where the lift may differ from GCN in pixels it kills: their quad reads them");
@@ -3168,6 +3175,7 @@ private:
             return;
         }
         ++swizzles;
+        if (wqm.active) ++block_swizzles;
         const bool identity = sel[0] == 0 && sel[1] == 1 && sel[2] == 2 && sel[3] == 3;
         // Each lane reads one of its quad: the result holds GCN's value in a quad
         // where the source does in the whole quad (`partial`), and nowhere the
@@ -5137,9 +5145,11 @@ private:
                            "specialization constant, else the params block's - with the translator's expression for each kind");
         }
         if (swizzles) {
-            head.push_back(std::to_string(swizzles) + " ds_swizzle_b32 within a quad as quad operations in uniform control flow: each under EXEC "
-                           "known set in whole-quad mode, of a value the quad's helper lanes computed as on GCN, and no kill region where "
-                           "pixels may differ before it");
+            const std::string where = block_swizzles ? "known set in whole-quad mode or (" + std::to_string(block_swizzles) +
+                                                           " of them) in a whole-quad block over a varying EXEC, of a source GCN's in the block's quads"
+                                                     : std::string("known set in whole-quad mode");
+            head.push_back(std::to_string(swizzles) + " ds_swizzle_b32 within a quad as quad operations in uniform control flow: each under EXEC " +
+                           where + ", of a value the quad's helper lanes computed as on GCN, and no kill region where pixels may differ before it");
         }
         if (descriptor_loads) {
             head.push_back(std::to_string(descriptor_loads) + " scalar loads the reference walks the page table for hold descriptors only: "

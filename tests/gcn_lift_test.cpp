@@ -580,6 +580,59 @@ void packed_exports() {
     }
 }
 
+// ds_swizzle_b32 in a whole-quad block over a region's EXEC M (GXSsr's
+// derivatives): GCN runs every lane of each quad holding an M pixel, so each
+// lane reads its own quad's lane - lane 1 here, in M or not - as the lift's
+// quad operation in uniform control flow does. Run over a quad whose lanes 2
+// and 3 are in M and lane 1 is not: they take lane 1's attr0 minus their own.
+// A source written in a block over another mask holds GCN's value only in
+// that mask's quads, which the lifter cannot show cover M's: refused.
+void swizzles_in_blocks() {
+    const auto program = [](bool from_other_block) {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);                                                   // v2 = attr0.x in every lane
+        push(w, {vop1(kVMov, 4, 240) /* v4 = 0.5 */, vop1(kVMov, 5, kV + 2) /* v5 = v2 */});
+        if (from_other_block) {
+            push(w, {vop1(kVMov, 6, 255), 0x41700000u /* v6 = 15.0 */, vopc(kVCmpGtF32, 2, kV + 6) /* vcc = 15 > v2 */,
+                     sop1(kAndSaveexecB64, 8, kVcc), sopp(8, 4) /* s_cbranch_execz +4 */, sop1(kMovB64, kVcc, kExec),
+                     sop1(kWqmB64, kExec, kExec), vop2(3, 5, 2, kOne) /* v_add_f32 v5, 1.0, v2 */, sop1(kMovB64, kExec, kVcc),
+                     sop1(kMovB64, kExec, 8)});
+        }
+        push(w, {vop1(kVMov, 6, 255), 0x41c80000u /* v6 = 25.0 */, vopc(kVCmpGtF32, 6, kV + 2) /* vcc = v2 > 25 */,
+                 sop1(kAndSaveexecB64, 4, kVcc), sopp(8, 8) /* s_cbranch_execz +8 */, sop1(kMovB64, kVcc, kExec),
+                 sop1(kWqmB64, kExec, kExec)});
+        swizzle(w, 3, 5, 0x8055);                                          // lane 1's v5
+        push(w, {sopp(12, 0xc07f) /* s_waitcnt lgkmcnt(0) */, vop2(kVSub, 3, 2, kV + 3) /* v3 = v3 - v2 */, sop1(kMovB64, kExec, kVcc),
+                 vop1(kVMov, 4, kV + 3), sop1(kMovB64, kExec, 4), sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 4, 4, 4, 4);
+        w.push_back(kEndpgm);
+        return w;
+    };
+    const Lifted l = lift_words(program(false));
+    for (const std::string& why : l.lift.rejections) std::fprintf(stderr, "swizzle in a whole-quad block rejected: %s\n", why.c_str());
+    CHECK(l.ref.ok() && l.lift.ok());
+    if (l.lift.ok()) {
+        CHECK(spirv_valid(l.lift.spirv));
+        bool proof = false;
+        for (const std::string& p : l.lift.proof) proof |= p.find("(1 of them) in a whole-quad block over a varying EXEC") != std::string::npos;
+        CHECK(proof);
+        const std::array<float, 4> attr = {10.0f, 21.0f, 32.0f, 43.0f};
+        const std::array<float, 4> want = {0.5f, 0.5f, 21.0f - 32.0f, 21.0f - 43.0f};
+        for (const auto [x0, y0] : {std::pair{0.0f, 0.0f}, std::pair{7.0f, 3.0f}}) {
+            const QuadRun r = run_quad(l.lift.spirv, x0, y0, attr);
+            if (!r.ok) std::fprintf(stderr, "swizzle in a whole-quad block: %s\n", r.error.c_str());
+            CHECK(r.ok);
+            for (std::size_t k = 0; k < 4 && r.ok; ++k) {
+                if (r.out[k] != want[k]) {
+                    std::fprintf(stderr, "swizzle in a whole-quad block: lane %zu wrote %g, expected %g\n", k, r.out[k], want[k]);
+                    ++g_failures;
+                }
+            }
+        }
+    }
+    CHECK(rejected_with(lift_words(program(true)).lift, "a whole-quad block computes v3 from a value the lift may hold differently"));
+}
+
 // ds_swizzle_b32 and loops. Every pixel runs a uniform loop's iterations, so a
 // swizzle there sees its quad; in a loop pixels leave at different iterations
 // it would not. A value that comes back to a loop's header with helper lanes
@@ -3530,6 +3583,7 @@ int main(int argc, char** argv) {
     cndmask_modifiers();
     packed_exports();
     synthetic_swizzles();
+    swizzles_in_blocks();
     swizzles_and_loops();
     lane_ops::run();
     lod::cases();
