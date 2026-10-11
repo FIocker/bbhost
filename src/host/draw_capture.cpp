@@ -239,6 +239,7 @@ public:
     std::vector<std::pair<std::string, std::vector<std::uint8_t>>> host_blobs;
     bool done = false;
     bool quiet = false;  // rejected before anything worth reporting
+    std::vector<std::uint32_t> indirect_args;  // an indirect draw's arguments as read (captured as a direct draw)
 
     void blob(const std::string& name, const std::uint8_t* data, std::size_t bytes) {
         host_blobs.emplace_back(name, std::vector<std::uint8_t>(data, data + bytes));
@@ -353,10 +354,19 @@ void CaptureSessionDeleter::operator()(CaptureSession* s) const {
     delete s;
 }
 
-bool capture_candidate(const std::string& pipeline, std::uint32_t count, std::uint64_t flip, bool lean_ready) {
+bool capture_candidate(const std::string& pipeline, std::uint32_t count, std::uint64_t flip, bool lean_ready, std::uint64_t indirect_va) {
     const Config& c = config();
     if (!(c.enabled && g_captured < c.count && g_rejected < kMaxRejections && flip >= c.min_flip && count >= c.min_count)) {
         return false;
+    }
+    // An indirect draw whose arguments count nothing as guest memory holds
+    // them now (a particle emitter with nothing alive) is passed over before
+    // the settle a candidate costs; capture_begin_locked reads them again
+    // after it.
+    if (indirect_va) {
+        std::uint32_t a[2] = {};
+        if (hle_kernel_va_mapped(indirect_va, sizeof(a))) std::memcpy(a, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(indirect_va)), sizeof(a));
+        if (a[0] == 0 || a[1] == 0) return false;
     }
     if (c.armed && g_armed <= 0) return false;
     if (c.each) {
@@ -397,8 +407,44 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
         return CapturePtr();
     };
 
-    // What the first supported draws must not do.
-    if (d.indirect_va) return reject("indirect draw: its arguments are GPU data");
+    // An indirect draw's arguments, read now - everything recorded before the
+    // draw has run (capture_settle_locked), so they hold the counts the GPU
+    // computed - and captured as the direct draw they make: Vulkan's layouts,
+    // which the renderer passes to vkCmdDraw(Indexed)Indirect as they are.
+    if (d.indirect_va) {
+        std::uint32_t a[5] = {};
+        const std::size_t words = d.index_va ? 5 : 4;
+        if (!hle_kernel_va_mapped(d.indirect_va, words * 4)) return reject("indirect draw: its arguments are not mapped");
+        if (copy_version_lookup_locked(d.indirect_va, words * 4, nullptr) != kCopyVersionNone) {
+            return reject("indirect draw: its arguments are still in a copy-back's copy");
+        }
+        std::memcpy(a, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(d.indirect_va)), words * 4);
+        if (a[words - 1] != 0) return reject("indirect draw with a first instance");
+        // Particle emitters with nothing alive draw zero vertices: such a
+        // draw runs no shader, and its replay would compare nothing. Not a
+        // candidate, so not one of the run's rejections either.
+        if (a[0] == 0 || a[1] == 0) {
+            s.quiet = true;
+            static bool said = false;
+            if (!said) {
+                said = true;
+                host_log("capture: %s draw %llu (flip %llu) skipped: an indirect draw that draws nothing (no vertices or instances); "
+                         "later ones are skipped silently", d.pipeline.c_str(), static_cast<unsigned long long>(d.draw_index),
+                         static_cast<unsigned long long>(d.flip));
+            }
+            return CapturePtr();
+        }
+        d.count = a[0];
+        d.instances = a[1];
+        if (d.index_va) {
+            d.index_va += static_cast<std::uint64_t>(a[2]) * (d.index_type == 1 ? 4 : 2);
+            d.base_vertex = static_cast<std::int32_t>(a[3]);
+        } else {
+            d.base_vertex = static_cast<std::int32_t>(a[2]);
+        }
+        s.indirect_args.assign(a, a + words);
+        d.indirect_va = 0;
+    }
     for (int t = 0; t < 8; ++t) {
         if (d.color[t] && !d.color[t]->initialised) return reject("colour target " + std::to_string(t) + " has undefined contents");
     }
@@ -616,6 +662,11 @@ CapturePtr capture_begin_locked(CaptureDraw&& in) {
     draw.set("instance_count", d.instances);
     draw.set("base_vertex", d.base_vertex);
     draw.set("indexed", d.index_va != 0);
+    if (!s.indirect_args.empty()) {
+        json::Value args = json::Value::make_array();
+        for (const std::uint32_t w : s.indirect_args) args.push(w);
+        draw.set("indirect_args", args);  // provenance: replayed as the direct draw above
+    }
     std::uint64_t last_vertex = d.count ? d.count - 1 : 0;  // the highest vertex read, before base_vertex
     if (d.index_va) {
         const std::size_t bytes = static_cast<std::size_t>(d.count) * (d.index_type ? 4 : 2);

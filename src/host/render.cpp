@@ -12277,7 +12277,7 @@ static bool draw_impl(const GpuDraw& d) {
     draw_stamp.to(kRenderCostPrefetch);
     // BBHOST_CAPTURE_DRAW (draw_capture.h): run everything recorded so far
     // before this draw's sets exist, so memory and images hold its inputs.
-    const bool capture = capture_candidate(pl.name, d.index_count, hle_video_flip_count(), pl.lean_variant && !pl.lean_variant->failed);
+    const bool capture = capture_candidate(pl.name, d.index_count, hle_video_flip_count(), pl.lean_variant && !pl.lean_variant->failed, d.indirect_va);
     if (capture) capture_settle_locked();
     // BBHOST_WATCH_PS_IMAGE=<pipeline prefix>:<image index>: for every draw of
     // that pipeline, resolve the image's T# and hash the memory behind it, and

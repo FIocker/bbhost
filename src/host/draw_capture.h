@@ -87,7 +87,8 @@ using CapturePtr = std::unique_ptr<CaptureSession, CaptureSessionDeleter>;
 
 // True when BBHOST_CAPTURE_DRAW selects this draw and captures remain.
 // `lean_ready`: the pipeline's no-fallback variant is built, so the draw will most likely bind it (the `*` mode needs it).
-bool capture_candidate(const std::string& pipeline, std::uint32_t count, std::uint64_t flip, bool lean_ready);
+// `indirect_va`: an indirect draw's arguments; one whose arguments count nothing now is not a candidate.
+bool capture_candidate(const std::string& pipeline, std::uint32_t count, std::uint64_t flip, bool lean_ready, std::uint64_t indirect_va = 0);
 // For a candidate, before its descriptor sets exist: runs everything recorded
 // so far, so guest memory and images hold what this draw will consume.
 void capture_settle_locked();
