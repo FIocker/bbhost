@@ -4094,6 +4094,74 @@ void stall_test_wait_locked() {
 
 }  // namespace
 
+namespace {
+const bool g_indirect_stats = [] {
+    const char* e = std::getenv("BBHOST_INDIRECT_STATS");
+    return e && e[0] == '1';
+}();
+struct IndirectRec {
+    std::uint64_t serial, va;
+    std::uint8_t kind;
+    bool counting;
+};
+std::vector<IndirectRec> g_indirect_recs;  // under g.mu
+struct IndirectAgg {
+    std::uint64_t dispatches = 0, counting = 0, nonzero = 0, groups = 0, max_groups = 0, over_limit = 0;
+    std::uint64_t draws = 0, drawn = 0, elements = 0, max_elements = 0;
+    std::uint64_t first_flip = 0;
+};
+IndirectAgg g_indirect_agg;
+
+// The arguments of the indirect work submission `serial` held, read now that
+// it is done; once a second (60 flips) what they came to.
+void indirect_stats_retired_locked(std::uint64_t serial) {
+    if (!g_indirect_stats || g_indirect_recs.empty()) return;
+    IndirectAgg& a = g_indirect_agg;
+    std::size_t keep = 0;
+    for (const IndirectRec& r : g_indirect_recs) {
+        if (r.serial > serial) {
+            g_indirect_recs[keep++] = r;
+            continue;
+        }
+        std::uint32_t v[5] = {};
+        if (!hle_kernel_va_mapped(r.va, r.kind == 2 ? 20 : r.kind == 1 ? 16 : 12)) continue;
+        std::memcpy(v, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(r.va)), r.kind == 2 ? 20 : r.kind == 1 ? 16 : 12);
+        if (r.kind == 0) {
+            ++a.dispatches;
+            a.counting += r.counting ? 1 : 0;
+            const std::uint64_t groups = static_cast<std::uint64_t>(v[0]) * v[1] * v[2];
+            a.nonzero += groups ? 1 : 0;
+            a.groups += groups;
+            a.max_groups = std::max(a.max_groups, groups);
+            a.over_limit += v[0] > 65535 || v[1] > 65535 || v[2] > 65535 ? 1 : 0;
+        } else {
+            ++a.draws;
+            const std::uint64_t elements = static_cast<std::uint64_t>(v[0]) * v[1];
+            a.drawn += elements ? 1 : 0;
+            a.elements += elements;
+            a.max_elements = std::max(a.max_elements, elements);
+        }
+    }
+    g_indirect_recs.resize(keep);
+    const std::uint64_t flip = hle_video_flip_count();
+    if (!a.first_flip) a.first_flip = flip ? flip : 1;
+    if (flip < a.first_flip + 60) return;
+    host_log("gpu: indirect at flips %llu..%llu: %llu dispatches (%llu counting in GDS), %llu with work, %llu workgroups (most %llu, %llu over "
+             "65535 in a dimension); %llu draws, %llu drawing, %llu elements (most %llu)",
+             static_cast<unsigned long long>(a.first_flip), static_cast<unsigned long long>(flip), static_cast<unsigned long long>(a.dispatches),
+             static_cast<unsigned long long>(a.counting), static_cast<unsigned long long>(a.nonzero), static_cast<unsigned long long>(a.groups),
+             static_cast<unsigned long long>(a.max_groups), static_cast<unsigned long long>(a.over_limit), static_cast<unsigned long long>(a.draws),
+             static_cast<unsigned long long>(a.drawn), static_cast<unsigned long long>(a.elements), static_cast<unsigned long long>(a.max_elements));
+    a = IndirectAgg{};
+    a.first_flip = flip + 1;
+}
+}  // namespace
+
+void note_indirect_locked(std::uint64_t args_va, int kind, bool counting) {
+    if (!g_indirect_stats || !args_va || g_indirect_recs.size() >= (1u << 20)) return;
+    g_indirect_recs.push_back({g.flushes, args_va, static_cast<std::uint8_t>(kind), counting});
+}
+
 void retire_slot_locked(int k) {
     Gpu::Slot& sl = g.slots[k];
     if (!sl.in_flight) return;
@@ -4130,6 +4198,7 @@ void retire_slot_locked(int k) {
         return;
     }
     vkResetFences(g.device, 1, &sl.fence);
+    indirect_stats_retired_locked(sl.serial);
     vkResetDescriptorPool(g.device, sl.pool, 0);
     sl.spare_sets.clear();
     for (DevBuffer& b : sl.garbage) {
@@ -5854,6 +5923,7 @@ bool host_gpu_dispatch(const GpuDispatch& d) {
             return false;
         }
         if (!g_render_min) rec().dispatch_indirect(loc.buffer, loc.offset);
+        note_indirect_locked(d.indirect_va, 0, pl.meta.gds_counters != 0);
     } else {
         if (!g_render_min) rec().dispatch(d.dim[0], d.dim[1], d.dim[2]);
     }

@@ -753,6 +753,12 @@ void shadow_locate_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 // GPU writes earlier in this recording, or no room left in the staging chunks.
 bool shadow_stage_locked(std::uint64_t va, std::uint64_t bytes, Located& loc);
 void shadow_written_locked(std::uint64_t va, std::uint64_t bytes, bool by_gpu);
+// BBHOST_INDIRECT_STATS=1: an indirect dispatch (kind 0) or draw (1, 2
+// indexed) recorded now, whose arguments are read once its submission is
+// done - the counts GPU work wrote there (the particles' counter copies). Once
+// a second the log says what they held. `counting`: a dispatch whose program
+// counts in GDS.
+void note_indirect_locked(std::uint64_t args_va, int kind, bool counting);
 // Diagnostic: describes what the mirror holds for a range and whether a page it
 // is still serving has been written since this recording's check of it.
 void shadow_probe_locked(std::uint64_t va, std::uint64_t bytes, char* out, std::size_t n);

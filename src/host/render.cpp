@@ -14776,6 +14776,7 @@ static bool draw_impl(const GpuDraw& d) {
             return false;
         }
         note_arena_read(kArenaIndirect, d.indirect_va, d.index_va ? 20 : 16);
+        note_indirect_locked(d.indirect_va, d.index_va ? 2 : 1, false);
         DrawCall call;
         call.kind = d.index_va ? DrawCall::kIndexedIndirect : DrawCall::kIndirect;
         call.buffer = loc.buffer;
