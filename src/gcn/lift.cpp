@@ -666,6 +666,13 @@ private:
     bool same_where_clear(const Val& now, const Val& before, const Val& skip) const {
         if (same_lane(now, before)) return true;
         if (implies(now, skip) && implies(before, skip)) return true;
+        // A mask the lift knows set where it runs (a divergent loop's mask in
+        // its body) that lost the lanes of `skip` (the exit idiom in a region
+        // on the lanes leaving): set, as it was, wherever `skip` is clear.
+        if (!now.constant && !skip.constant && ((before.constant && before.set) || (!before.constant && assumed.count(before.id)))) {
+            const auto n = negation_of.find(now.id);
+            if (n != negation_of.end() && n->second == skip.id) return true;
+        }
         if (now.constant || before.constant) return false;
         const auto it = conjuncts.find(now.id);
         if (it == conjuncts.end() || !it->second.count(before.id)) return false;
@@ -3926,7 +3933,9 @@ private:
         std::uint32_t header = 0, latch = 0, exit = 0;
         std::size_t header_index = 0, latch_index = 0;
         int mask = -1;                // divergent: the loop mask's SGPR pair
-        std::uint32_t mask_exit = 0;  // divergent: the s_cbranch_scc0 that tests it
+        std::uint32_t mask_exit = 0;  // divergent: the (first) s_cbranch_scc0 that tests it
+        std::set<std::uint32_t> mask_exits;  // divergent: every s_cbranch_scc0 of the exit idiom on the mask
+        std::uint32_t dead = 0;       // the start of unreachable instructions between the back edge and `exit` (0: none)
         // While lifting
         Id preheader = 0, header_label = 0, continue_label = 0, merge_label = 0;
         struct Phi {
@@ -3949,8 +3958,10 @@ private:
             std::map<int, Exact> partial;
             bool per_pixel = false;
             std::set<int> in_mask;
+            std::map<int, Id> words;  // a loop of several exits: each float register's bits, made on this exit's edge
         };
         std::vector<Exit> exits;
+        std::size_t exit_branches = 0;  // the branches that leave it for its exit (find_loops)
         std::map<int, Exact> partial0;  // where the phis' VGPRs hold GCN's value at the header: where they did on entry
         std::map<Id, Id> to_float0, to_word0;
         std::vector<Id> assumed;  // divergent: what the body knows is set
@@ -4022,7 +4033,10 @@ private:
                        " is written with lanes beyond it: the lanes that left would join the loop again");
                 return false;
             }
-            if (l != open_loops.back() || arms.size() != l->arms0 || open_regions.size() != l->regions0) {
+            // Inside a region only by the exit idiom (s_andn2_b64 L, L, exec right
+            // before one of the loop's divergent exits): the lanes leaving there.
+            const bool exit_idiom = open_regions.size() > l->regions0 && l->mask_exits.count(cur + 4) != 0;
+            if (l != open_loops.back() || arms.size() != l->arms0 || (open_regions.size() != l->regions0 && !exit_idiom)) {
                 reject("the loop mask " + key_name(key) + " of the loop at " + hex_offset(l->header) +
                        " is written inside an if, a region or an inner loop of its body");
                 return false;
@@ -4109,6 +4123,18 @@ private:
             }
         }
         if (!nested) return;
+        // A loop's exit may follow instructions nothing reaches: the back edge
+        // is an unconditional s_branch, and no branch lands between it and the
+        // exit (the compiler leaves the copies of a dead path there). Every exit
+        // of the loop must then land past them, at the same place.
+        std::set<std::uint32_t> targets;
+        for (const Inst& in : prog.insts) {
+            if (is_branch(in)) targets.insert(in.offset + 4 + static_cast<std::uint32_t>(in.imm) * 4);
+        }
+        const auto unreached = [&](std::uint32_t from, std::uint32_t to) {
+            const auto it = targets.lower_bound(from);
+            return it == targets.end() || *it >= to;
+        };
         // Every other branch stays inside its innermost loop, or leaves it for its exit.
         for (const Inst& in : prog.insts) {
             if (!is_branch(in)) continue;
@@ -4117,6 +4143,15 @@ private:
             if ((from && in.offset == from->latch) || target <= in.offset) continue;  // a back edge, or rejected above
             cur = in.offset;
             if (from && target == from->exit) {
+                loop_exits.insert(in.offset);
+                continue;
+            }
+            if (from && target > from->exit && !from->dead && unreached(from->exit, target) &&
+                std::none_of(loop_exits.begin(), loop_exits.end(), [&](std::uint32_t e) { return innermost_loop(e) == from; }) &&
+                std::none_of(loops.begin(), loops.end(), [&](const Loop& o) { return &o != from && o.header >= from->exit && o.header < target; })) {
+                Loop& l = loops[static_cast<std::size_t>(from - loops.data())];
+                l.dead = l.exit;
+                l.exit = target;
                 loop_exits.insert(in.offset);
                 continue;
             }
@@ -4131,26 +4166,32 @@ private:
     // Ifs and regions nest with loops: inside the body, around the whole loop, or apart.
     void check_loop_nesting() {
         for (Loop& l : loops) {
+            l.exit_branches = static_cast<std::size_t>(
+                std::count_if(loop_exits.begin(), loop_exits.end(), [&](std::uint32_t e) { return innermost_loop(e) == &l; }));
             // The divergent exit idiom, at the loop's top level: s_andn2_b64 L,
             // L, exec right before an s_cbranch_scc0 to the exit. (Inside an if
             // arm the same pair is the uniform loop's way out: L is EXEC there,
             // so no lane is left and the branch is always taken.)
+            // The same pair inside s_cbranch_execz regions of the loop's top level
+            // (no if around it in the body) is a divergent exit too: EXEC there
+            // is the lanes that leave, which the pair takes out of L. Every such
+            // exit must take lanes out of the same mask.
             for (std::size_t i = l.header_index + 1; i < l.latch_index; ++i) {
                 const Inst& br = prog.insts[i];
                 const Inst& andn2 = prog.insts[i - 1];
                 if (!(br.enc == Enc::SOPP && br.op == 4 && loop_exits.count(br.offset) && innermost_loop(br.offset) == &l)) continue;
                 if (!(andn2.enc == Enc::SOP2 && andn2.op == 21 && andn2.dst < 103 && andn2.src0 == andn2.dst && andn2.src1 == kExecLo)) continue;
                 const auto inside = [&](std::uint32_t x0, std::uint32_t x1) { return x0 >= l.header && x0 < br.offset && br.offset < x1; };
-                if (std::any_of(constructs.begin(), constructs.end(), [&](const Construct& c) { return inside(c.branch, c.join); }) ||
-                    std::any_of(regions.begin(), regions.end(), [&](const Region& r) { return inside(r.branch, r.end); })) {
-                    continue;
-                }
-                if (l.mask >= 0) {
+                if (std::any_of(constructs.begin(), constructs.end(), [&](const Construct& c) { return inside(c.branch, c.join); })) continue;
+                if (l.mask >= 0 && andn2.dst != l.mask) {
                     cur = br.offset;
-                    reject("two divergent exits from the loop at " + hex_offset(l.header));
+                    reject("two divergent exits from the loop at " + hex_offset(l.header) + " on different masks");
                 }
-                l.mask = andn2.dst;
-                l.mask_exit = br.offset;
+                if (l.mask < 0) {
+                    l.mask = andn2.dst;
+                    l.mask_exit = br.offset;
+                }
+                l.mask_exits.insert(br.offset);
             }
             const auto fits = [&](std::uint32_t x0, std::uint32_t x1) {
                 return x1 <= l.header || x0 >= l.exit || (x0 >= l.header && x1 <= l.latch) || (x0 < l.header && x1 >= l.exit);
@@ -4197,6 +4238,7 @@ private:
     }
     // The keys of `keys` some path from instruction `from` reads before writing
     // (vector and memory instructions read EXEC).
+    mutable std::uint32_t unmodelled_at = 0;  // read_first: the instruction it could not model
     std::set<int> read_first(std::size_t from, const std::set<int>& keys, bool& unmodelled) const {
         std::set<int> found;
         unmodelled = false;
@@ -4214,6 +4256,7 @@ private:
             std::set<int> rd, wr;
             if (!scalar_rw(prog.insts[i], rd, wr)) {
                 unmodelled = true;
+                unmodelled_at = prog.insts[i].offset;
                 return found;
             }
             exec_reader(prog.insts[i], rd);
@@ -4253,7 +4296,9 @@ private:
         bool unmodelled = false;
         const std::set<int> exposed = read_first(l.header_index, l.writes, unmodelled);
         if (unmodelled) {
-            reject("cannot show what the loop at " + hex_offset(l.header) + " reads before writing");
+            const Inst* u = inst_at(unmodelled_at);
+            reject("cannot show what the loop at " + hex_offset(l.header) + " reads before writing: " +
+                   (u && mnemonic(*u) ? mnemonic(*u) : "an instruction") + " at " + hex_offset(unmodelled_at) + " is not modelled");
             return;
         }
         if (l.writes.count(kKeyScc)) {
@@ -4422,8 +4467,11 @@ private:
         }
         // GCN evaluates a branch inside an s_cbranch_execz region only in the
         // iterations where some lane enters the region; the lift runs regions
-        // unconditionally, so it would take the exit in the others too.
-        if (open_regions.size() > l.regions0) {
+        // unconditionally, so it would take the exit in the others too. Not a
+        // divergent exit: a pixel takes it only where its own EXEC bit is set
+        // in the region (its mask bit taken out), and in an iteration GCN skips
+        // the region no pixel's is, so the pixel stays as GCN keeps it.
+        if (open_regions.size() > l.regions0 && !l.mask_exits.count(in.offset)) {
             reject(std::string(mnemonic(in)) + " leaves the loop at " + hex_offset(l.header) + " from inside a region of its body (" +
                    hex_offset(open_regions.back()->start) + "), which GCN skips in iterations where no lane enters it");
             return;
@@ -4446,12 +4494,12 @@ private:
                     if (!draw_wide_exit(l, scc, in)) return;
                     leave = on_set ? scc.id : bnot(scc).id;
                 }
-            } else if (in.offset == l.mask_exit && !scc.constant) {
+            } else if (l.mask_exits.count(in.offset) && !scc.constant) {
                 per_pixel = true;
                 if (!divergent_exit(l, scc)) return;
                 leave = bnot(scc).id;
                 if (l.quad_live) leave = m.emit(spv::OpLogicalOr, t_bool, {leave, m.emit(spv::OpLogicalNot, t_bool, {l.quad_live})});
-            } else if (in.offset != l.mask_exit && in_divergent_loop()) {
+            } else if (!l.mask_exits.count(in.offset) && in_divergent_loop()) {
                 // SCC is "some lane of the mask is set", over the whole wave;
                 // the body knows the masks only for the pixel it runs.
                 reject(std::string(mnemonic(in)) + " leaves the loop at " + hex_offset(l.header) +
@@ -4500,10 +4548,6 @@ private:
                    ": only s_branch, s_cbranch_scc0/scc1 and s_cbranch_vccz/vccnz are lifted as loop exits");
             return;
         }
-        if (!l.exits.empty()) {
-            reject("a second exit from the loop at " + hex_offset(l.header) + " (one is lifted)");
-            return;
-        }
         Loop::Exit x;
         x.reg = reg;
         x.lanes = lanes;
@@ -4514,6 +4558,17 @@ private:
         x.partial = partial;
         x.per_pixel = per_pixel;
         x.in_mask = in_mask;
+        // With several exits a register may leave as a float on one and a word
+        // on another: its bits are made here, on the edge (a conversion made in
+        // a block that dominates it is reused; one made here is not kept).
+        const auto edge_words = [&] {
+            if (l.exit_branches < 2) return;
+            for (const auto& [k, v] : reg) {
+                if (v.kind != Kind::Float || v.constant) continue;
+                const auto it = to_word.find(v.id);
+                x.words[k] = it != to_word.end() ? it->second : m.emit(spv::OpBitcast, t_u32, {v.id});
+            }
+        };
         if (always) {
             // It ends the arm it is in: an if's then arm, or its else arm.
             const std::uint32_t next = in.offset + 4;
@@ -4523,6 +4578,7 @@ private:
                 return;
             }
             x.from = cur_label;
+            edge_words();
             m.emit_void(spv::OpBranch, {l.merge_label});
             block_dead = true;
         } else {
@@ -4530,6 +4586,7 @@ private:
             m.emit_void(spv::OpSelectionMerge, {cont, 0u});
             m.emit_void(spv::OpBranchConditional, {leave, brk, cont});
             x.from = m.label(brk);
+            edge_words();
             m.emit_void(spv::OpBranch, {l.merge_label});
             cur_label = m.label(cont);
         }
@@ -4554,8 +4611,8 @@ private:
     // The divergent exit test: at the loop's top level, on the mask's current
     // value, which lies within EXEC at the header.
     bool divergent_exit(const Loop& l, const Val& m_val) {
-        if (arms.size() != l.arms0 || open_regions.size() != l.regions0) {
-            reject("the divergent exit of the loop at " + hex_offset(l.header) + " is inside an if or a region of its body");
+        if (arms.size() != l.arms0) {
+            reject("the divergent exit of the loop at " + hex_offset(l.header) + " is inside an if of its body");
             return false;
         }
         const auto lm = lanes.find(l.mask);
@@ -4581,7 +4638,7 @@ private:
             reject("an if or a region is still open at the back edge of the loop at " + hex_offset(l.header));
             return;
         }
-        if (l.mask >= 0 && (l.exits.empty() || !l.exits[0].per_pixel)) {
+        if (l.mask >= 0 && std::none_of(l.exits.begin(), l.exits.end(), [](const Loop::Exit& x) { return x.per_pixel; })) {
             reject("the divergent loop at " + hex_offset(l.header) + " was not left at its exit test");
             return;
         }
@@ -4683,6 +4740,160 @@ private:
         block_dead = true;  // the merge block starts at the exit, next
     }
 
+    // Several exits join at the merge block: a value the exits leave different
+    // becomes a phi over their edges (each pixel takes one); a lane mask
+    // present on some exits only is lost, as at an if's join; the registers
+    // are exact where they are on every exit, SCC is kept only if every exit
+    // left the same, and what lies within a mask is what does on every exit.
+    // A register the exits leave as different kinds (word and float) is not
+    // joined: the conversion would have to be on each edge.
+    bool merge_exits(const Loop& l) {
+        const auto same = [](const Val& x, const Val& y) {
+            return x.kind == y.kind && x.constant == y.constant && (x.constant ? (x.kind == Kind::Lane ? x.set == y.set : x.bits == y.bits) : x.id == y.id);
+        };
+        std::set<int> lost;
+        for (const Loop::Exit& x : l.exits) lost.insert(x.poisoned.begin(), x.poisoned.end());
+        std::set<int> lane_keys;
+        for (const Loop::Exit& x : l.exits) {
+            for (const auto& [k, v] : x.lanes) lane_keys.insert(k);
+        }
+        std::map<int, Val> merged_lanes;
+        for (const int k : lane_keys) {
+            bool everywhere = true;
+            for (const Loop::Exit& x : l.exits) everywhere = everywhere && x.lanes.count(k);
+            if (!everywhere) {
+                if (k != kKeyVcc && k != kKeyExec) {
+                    lost.insert(k);
+                    lost.insert(k + 1);
+                }
+                continue;
+            }
+            const Val& first = l.exits[0].lanes.at(k);
+            bool all_same = true, inexact = false;
+            for (const Loop::Exit& x : l.exits) {
+                all_same = all_same && same(x.lanes.at(k), first);
+                inexact = inexact || x.lanes.at(k).helper_inexact;
+            }
+            if (all_same) {
+                Val v = first;
+                for (const Loop::Exit& x : l.exits) {
+                    v.wave_exact = v.wave_exact && x.lanes.at(k).wave_exact;
+                    v.helpers_clear = v.helpers_clear && x.lanes.at(k).helpers_clear;
+                    if (x.lanes.at(k).content != first.content) v = new_content(v);
+                }
+                v.helper_inexact = inexact;
+                merged_lanes[k] = v;
+                continue;
+            }
+            std::vector<std::uint32_t> ops;
+            for (const Loop::Exit& x : l.exits) {
+                const Val& v = x.lanes.at(k);
+                ops.push_back(v.constant ? m.const_bool(v.set) : v.id);
+                ops.push_back(x.from);
+            }
+            Val v = new_content(lane(m.emit(spv::OpPhi, t_bool, ops)));
+            v.helper_inexact = inexact;
+            merged_lanes[k] = v;
+        }
+        std::set<int> keys;
+        for (const Loop::Exit& x : l.exits) {
+            for (const auto& [k, v] : x.reg) keys.insert(k);
+        }
+        std::map<int, Val> merged;
+        for (const int k : keys) {
+            if (lane_keys.count(k) || (k > 0 && k < 104 && lane_keys.count(k - 1)) || lost.count(k)) continue;
+            std::vector<Val> vals;
+            for (const Loop::Exit& x : l.exits) {
+                const auto it = x.reg.find(k);
+                vals.push_back(it != x.reg.end() ? it->second : initial_value(k));
+            }
+            bool all_same = true, inexact = false, any_descriptor = false;
+            for (const Val& v : vals) {
+                all_same = all_same && same(v, vals[0]);
+                inexact = inexact || v.helper_inexact;
+                any_descriptor = any_descriptor || descriptor(v);
+            }
+            if (all_same) {
+                merged[k] = vals[0];
+                merged[k].helper_inexact = inexact;
+                continue;
+            }
+            if (any_descriptor) {  // a descriptor word on any exit: still never data
+                for (const Val& v : vals) {
+                    if (descriptor(v)) merged[k] = v;
+                }
+                continue;
+            }
+            bool all_float = true;
+            for (const Val& v : vals) all_float = all_float && (v.kind == Kind::Float || v.constant);
+            const Kind kind = all_float && vals[0].kind == Kind::Float ? Kind::Float : Kind::Word;
+            std::vector<std::uint32_t> ops;
+            for (std::size_t e = 0; e < vals.size(); ++e) {
+                const Val& v = vals[e];
+                Id op = 0;
+                if (v.constant) {
+                    op = kind == Kind::Float ? as_f(v) : as_u(v);  // a constant: no instruction on the edge
+                } else if (kind == Kind::Float || v.kind == Kind::Word) {
+                    op = v.id;
+                } else if (const auto w = l.exits[e].words.find(k); w != l.exits[e].words.end()) {
+                    op = w->second;
+                } else {
+                    reject(key_name(k) + " leaves the loop at " + hex_offset(l.header) + " as a word on one exit and a float on another");
+                    return false;
+                }
+                ops.push_back(op);
+                ops.push_back(l.exits[e].from);
+            }
+            const Id id = m.emit(spv::OpPhi, kind == Kind::Float ? t_f32 : t_u32, ops);
+            merged[k] = kind == Kind::Float ? flt(id) : word(id);
+            merged[k].helper_inexact = inexact;
+        }
+        // SCC: as every exit left it, or unknown.
+        bool scc_same = true;
+        for (const Loop::Exit& x : l.exits) {
+            scc_same = scc_same && x.scc_valid && x.scc_uniform == l.exits[0].scc_uniform && same(x.scc, l.exits[0].scc);
+        }
+        scc_mask = l.exits[0].scc;
+        scc_uniform = l.exits[0].scc_uniform;
+        scc_valid = scc_same;
+        // Exact where it is on every exit.
+        std::map<int, Exact> joined = l.exits[0].partial;
+        for (std::size_t e = 1; e < l.exits.size(); ++e) {
+            const std::map<int, Exact>& other = l.exits[e].partial;
+            std::set<int> pk;
+            for (const auto& kv : joined) pk.insert(kv.first);
+            for (const auto& kv : other) pk.insert(kv.first);
+            std::map<int, Exact> next;
+            for (const int k : pk) {
+                const auto a = joined.find(k);
+                const auto b = other.find(k);
+                const Where w = meet(a == joined.end() ? Where{} : Where{true, a->second}, b == other.end() ? Where{} : Where{true, b->second});
+                if (w.partial) next[k] = w.at;
+            }
+            joined = std::move(next);
+        }
+        std::set<int> within = l.exits[0].in_mask;
+        for (const Loop::Exit& x : l.exits) {
+            for (auto it = within.begin(); it != within.end();) it = x.in_mask.count(*it) ? std::next(it) : within.erase(it);
+        }
+        reg = std::move(merged);
+        lanes = std::move(merged_lanes);
+        poisoned = std::move(lost);
+        partial = std::move(joined);
+        in_mask = std::move(within);
+        return true;
+    }
+
+    std::string mask_exits_text(const Loop& l) const {
+        std::string t;
+        for (const std::uint32_t e : l.mask_exits) {
+            t += (t.empty() ? "" : ", ") + hex_offset(e);
+            const auto r = std::find_if(regions.begin(), regions.end(), [&](const Region& g) { return g.branch < e && e < g.end && g.branch > l.header; });
+            if (r != regions.end()) t += " (in the region at " + hex_offset(r->branch) + ")";
+        }
+        return t;
+    }
+
     // The exit's merge block, at the loop's exit.
     void close_loop() {
         Loop& l = *open_loops.back();
@@ -4693,20 +4904,24 @@ private:
             reject("the loop at " + hex_offset(l.header) + " has no exit");
             return;
         }
-        const Loop::Exit& x = l.exits[0];
         cur_label = m.label(l.merge_label);
         block_dead = false;
-        reg = x.reg;
-        lanes = x.lanes;
-        scc_mask = x.scc;
-        scc_uniform = x.scc_uniform;
-        scc_valid = x.scc_valid;
-        poisoned = x.poisoned;
-        partial = x.partial;
+        if (l.exits.size() == 1) {
+            const Loop::Exit& x = l.exits[0];
+            reg = x.reg;
+            lanes = x.lanes;
+            scc_mask = x.scc;
+            scc_uniform = x.scc_uniform;
+            scc_valid = x.scc_valid;
+            poisoned = x.poisoned;
+            partial = x.partial;
+            in_mask = x.in_mask;
+        } else if (!merge_exits(l)) {
+            return;
+        }
         to_float = l.to_float0;
         to_word = l.to_word0;
         pending.clear();
-        in_mask = x.in_mask;
         if (l.mask >= 0) {  // what it writes is dead after it (checked below); the rest is as it was
             in_mask = l.in_mask0;
             for (const int k : l.writes) in_mask.erase(k);
@@ -4732,7 +4947,7 @@ private:
         for (const auto& [k, v] : l.unchanged) kept += (kept.empty() ? "" : ", ") + key_name(k);
         res.proof.push_back(
             "loop " + hex_offset(l.header) + "-" + hex_offset(l.latch) + ": " +
-            (l.mask >= 0 ? "divergent, the per-lane exit idiom on " + key_name(l.mask) + " at " + hex_offset(l.mask_exit) +
+            (l.mask >= 0 ? "divergent, the per-lane exit idiom on " + key_name(l.mask) + " at " + mask_exits_text(l) +
                                " (EXEC and the mask keep EXEC at entry at the header and come back set; EXEC lies within the mask wherever "
                                "it writes a VGPR and at the back edge; what the loop writes is dead after it; no implicit-LOD sample inside)" +
                                (l.quad_live ? "; inside the kill region at " + hex_offset(l.quad_region) +
@@ -4746,7 +4961,13 @@ private:
                                                "that enters it)"
                                          : std::string())) +
             "; " + std::to_string(l.phis.size()) + " phis (" + std::to_string(l.vgpr_phis) + " VGPRs, " + std::to_string(l.lane_phis) + " lane masks)" +
-            (kept.empty() ? "" : "; back at the header unchanged: " + kept));
+            (kept.empty() ? "" : "; back at the header unchanged: " + kept) +
+            (l.exits.size() > 1 ? "; " + std::to_string(l.exits.size()) + " exits joined at " + hex_offset(l.exit) +
+                                      ", where a value they leave different is a phi over their edges"
+                                : std::string()) +
+            (l.dead ? "; " + hex_offset(l.dead) + "-" + hex_offset(l.exit) +
+                          " after the back edge is reached by no branch and is not lifted"
+                    : std::string()));
     }
 
     // TranslateOptions::kVsOutCntlClipVarying, as translate.cpp's prologue: the
@@ -4951,6 +5172,14 @@ private:
                     close_arm();
                 }
                 if (!res.rejections.empty()) return;
+            }
+            // Between a back edge and an exit past it: instructions nothing reaches (find_loops).
+            if (!open_loops.empty() && open_loops.back()->dead && in.offset >= open_loops.back()->dead && in.offset < open_loops.back()->exit) {
+                char line[160];
+                std::snprintf(line, sizeof(line), "%06x  %-56s", in.offset, format(in).c_str());
+                res.listing += line;
+                res.listing += " [unreached]\n";
+                continue;
             }
             // After an unconditional loop exit only the s_branch closing that then arm may follow.
             if (block_dead && !(!arms.empty() && !arms.back().in_else && in.offset == arms.back().c->else_jump)) {

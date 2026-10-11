@@ -16,6 +16,7 @@
 
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -1490,10 +1491,14 @@ struct Asm {
         w.push_back(0xf8000000u | 1u << 12 | 1u << 11 | 0xfu);
         w.push_back(v | v << 8 | v << 16 | v << 24);
     }
+    void exp_mrt0(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint32_t q) {  // exp mrt0 x, y, z, q done vm
+        w.push_back(0xf8000000u | 1u << 12 | 1u << 11 | 0xfu);
+        w.push_back(x | y << 8 | z << 16 | q << 24);
+    }
 };
 
 // Operand codes and opcodes.
-constexpr std::uint32_t kV = 256, kC0 = 128, kOne = 242, kTwo = 244, kVcc = 106, kExec = 126;
+constexpr std::uint32_t kV = 256, kC0 = 128, kOne = 242, kTwo = 244, kFour = 246, kVcc = 106, kExec = 126;
 constexpr std::uint32_t kEndpgm = 1, kBranch = 2, kScc0 = 4, kScc1 = 5, kVccz = 6, kExecz = 8;  // SOPP
 constexpr std::uint32_t kSMov = 3, kSMov64 = 4, kSWqm = 10, kSAndSaveexec = 36;                 // SOP1
 constexpr std::uint32_t kSAddU32 = 0, kSAnd64 = 15, kSXor64 = 19, kSAndn2_64 = 21, kSLshl = 30;  // SOP2
@@ -1576,6 +1581,272 @@ Asm uniform_loop(bool counter_kept = false) {
     return a;
 }
 
+// ---- one invocation of a lifted pixel shader, control flow and all ----------------------
+// Runs the module's blocks from the entry, phis by the edge taken, with attr0
+// as given and the params block's user SGPRs, and returns mrt0. It knows the
+// instructions the loop and region programs below lift to; anything else fails.
+struct CfgRun {
+    bool ok = false;
+    std::string error;
+    std::array<float, 4> out{};
+    std::size_t blocks = 0;  // blocks entered
+};
+CfgRun run_cfg(const std::vector<std::uint32_t>& spv, const std::array<float, 4>& attr0, const std::array<std::uint32_t, 16>& user = {}) {
+    CfgRun run;
+    using Vec = std::vector<std::uint32_t>;
+    std::map<std::uint32_t, Vec> val;
+    std::map<std::uint32_t, std::uint32_t> storage, location, builtin, glsl_set;
+    struct Ptr {
+        std::uint32_t var = 0;
+        std::vector<std::uint32_t> idx;
+    };
+    std::map<std::uint32_t, Ptr> ptrs;
+    std::map<std::uint32_t, Vec> memory;  // Function and Private variables
+    std::map<std::uint32_t, std::size_t> label_at;  // label -> word index of its OpLabel
+    std::size_t entry = 0;
+    const auto fail = [&](const std::string& why) {
+        run.error = why;
+        return run;
+    };
+    bool in_function = false;
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+        if (n == 0 || i + n > spv.size()) return fail("malformed module");
+        const std::uint32_t* a = &spv[i + 1];
+        switch (op) {
+        case 11: glsl_set[a[0]] = 1; break;                          // OpExtInstImport
+        case 71:                                                     // OpDecorate
+            if (a[1] == 11) builtin[a[0]] = a[2];
+            if (a[1] == 30) location[a[0]] = a[2];
+            break;
+        case 59: if (!in_function) storage[a[1]] = a[2]; else storage[a[1]] = a[2]; break;  // OpVariable
+        case 43: val[a[1]] = {a[2]}; break;                          // OpConstant (low word)
+        case 41: val[a[1]] = {1}; break;                             // OpConstantTrue
+        case 42: val[a[1]] = {0}; break;                             // OpConstantFalse
+        case 44: {                                                   // OpConstantComposite
+            Vec v;
+            for (std::uint32_t k = 3; k < n; ++k) v.push_back(val[a[k - 1]].empty() ? 0 : val[a[k - 1]][0]);
+            val[a[1]] = v;
+            break;
+        }
+        case 1: val[a[1]] = {0, 0, 0, 0}; break;                     // OpUndef
+        case 54: in_function = true; break;                          // OpFunction
+        case 248:                                                    // OpLabel
+            label_at[a[0]] = i;
+            if (!entry) entry = i;
+            break;
+        default: break;
+        }
+        i += n;
+    }
+    if (!entry) return fail("no function body");
+    const auto f = [](std::uint32_t b) { return std::bit_cast<float>(b); };
+    const auto fb = [](float x) { return std::bit_cast<std::uint32_t>(x); };
+    const auto get = [&](std::uint32_t id) -> const Vec& { return val[id]; };
+    const auto s0 = [&](std::uint32_t id) -> std::uint32_t {
+        const Vec& v = val[id];
+        return v.empty() ? 0u : v[0];
+    };
+    std::size_t pc = entry;
+    std::uint32_t prev = 0, current = spv[entry + 1];
+    for (std::size_t steps = 0; steps < 200000; ++steps) {
+        const std::uint32_t n = spv[pc] >> 16, op = spv[pc] & 0xffff;
+        const std::uint32_t* a = &spv[pc + 1];
+        std::size_t next = pc + n;
+        const auto go = [&](std::uint32_t label) {
+            const auto it = label_at.find(label);
+            if (it == label_at.end()) return false;
+            prev = current;
+            current = label;
+            next = it->second;
+            ++run.blocks;
+            return true;
+        };
+        const auto bin_f = [&](auto fn) {
+            const Vec& x = get(a[2]);
+            const Vec& y = get(a[3]);
+            Vec r(x.size());
+            for (std::size_t k = 0; k < x.size(); ++k) r[k] = fn(f(x[k]), f(k < y.size() ? y[k] : 0));
+            val[a[1]] = r;
+        };
+        const auto bin_u = [&](auto fn) {
+            const Vec& x = get(a[2]);
+            const Vec& y = get(a[3]);
+            Vec r(x.size());
+            for (std::size_t k = 0; k < x.size(); ++k) r[k] = fn(x[k], k < y.size() ? y[k] : 0);
+            val[a[1]] = r;
+        };
+        switch (op) {
+        case 248: break;                                   // OpLabel
+        case 246: case 247: break;                         // OpLoopMerge, OpSelectionMerge
+        case 245: {                                        // OpPhi
+            bool found = false;
+            for (std::uint32_t k = 2; k + 1 < n; k += 2) {
+                if (a[k + 1] == prev) {
+                    val[a[1]] = get(a[k]);
+                    found = true;
+                }
+            }
+            if (!found) return fail("a phi without the edge taken");
+            break;
+        }
+        case 249: if (!go(a[0])) return fail("a branch to no label"); break;
+        case 250: if (!go(s0(a[0]) ? a[1] : a[2])) return fail("a branch to no label"); break;
+        case 253: case 56: run.ok = true; return run;      // OpReturn
+        case 252: return fail("OpKill");
+        case 65: {                                         // OpAccessChain
+            Ptr p;
+            const auto base = ptrs.find(a[2]);
+            if (base != ptrs.end()) p = base->second;
+            else p.var = a[2];
+            for (std::uint32_t k = 3; k + 1 < n; ++k) p.idx.push_back(s0(a[k]));
+            ptrs[a[1]] = p;
+            break;
+        }
+        case 61: {                                         // OpLoad
+            std::uint32_t var = a[2];
+            std::vector<std::uint32_t> idx;
+            if (const auto it = ptrs.find(a[2]); it != ptrs.end()) {
+                var = it->second.var;
+                idx = it->second.idx;
+            }
+            const std::uint32_t sc = storage.count(var) ? storage[var] : 99;
+            if (sc == 1 && location.count(var) && location[var] == 0) {
+                Vec v = {fb(attr0[0]), fb(attr0[1]), fb(attr0[2]), fb(attr0[3])};
+                val[a[1]] = idx.empty() ? v : Vec{v[idx[0] & 3]};
+            } else if (sc == 1 && builtin.count(var) && builtin[var] == 15) {
+                val[a[1]] = {fb(0.5f), fb(0.5f), 0, fb(1.0f)};
+            } else if (sc == 2) {                          // the params block: user SGPRs are member 2
+                if (idx.size() < 3 || idx[0] != 2) return fail("a params load other than a user SGPR");
+                val[a[1]] = {user[(idx[1] * 4 + idx[2]) & 15]};
+            } else if (sc == 7 || sc == 6) {
+                Vec m = memory[var];
+                val[a[1]] = idx.empty() ? m : Vec{idx[0] < m.size() ? m[idx[0]] : 0};
+            } else {
+                return fail("a load the test does not model (storage class " + std::to_string(sc) + ")");
+            }
+            break;
+        }
+        case 62: {                                         // OpStore
+            std::uint32_t var = a[0];
+            std::vector<std::uint32_t> idx;
+            if (const auto it = ptrs.find(a[0]); it != ptrs.end()) {
+                var = it->second.var;
+                idx = it->second.idx;
+            }
+            const std::uint32_t sc = storage.count(var) ? storage[var] : 99;
+            if (sc == 3 && location.count(var) && location[var] == 0) {
+                const Vec& v = get(a[1]);
+                for (std::size_t k = 0; k < 4 && k < v.size(); ++k) run.out[k] = f(v[k]);
+            } else if (sc == 7 || sc == 6) {
+                if (idx.empty()) {
+                    memory[var] = get(a[1]);
+                } else {
+                    Vec& m = memory[var];
+                    if (m.size() <= idx[0]) m.resize(idx[0] + 1);
+                    m[idx[0]] = s0(a[1]);
+                }
+            } else if (sc != 3) {
+                return fail("a store the test does not model");
+            }
+            break;
+        }
+        case 59: if (!memory.count(a[1])) memory[a[1]] = n > 4 ? get(a[3]) : Vec{0, 0, 0, 0}; break;  // a Function variable, initialised
+        case 81: {                                         // OpCompositeExtract
+            const Vec& v = get(a[2]);
+            val[a[1]] = {a[3] < v.size() ? v[a[3]] : 0};
+            break;
+        }
+        case 80: {                                         // OpCompositeConstruct
+            Vec v;
+            for (std::uint32_t k = 2; k < n - 1; ++k) {
+                const Vec& c = get(a[k]);
+                v.insert(v.end(), c.begin(), c.end());
+            }
+            val[a[1]] = v;
+            break;
+        }
+        case 124: val[a[1]] = get(a[2]); break;            // OpBitcast
+        case 109: val[a[1]] = {static_cast<std::uint32_t>(f(s0(a[2])))}; break;                       // OpConvertFToU
+        case 110: val[a[1]] = {static_cast<std::uint32_t>(static_cast<std::int32_t>(f(s0(a[2]))))}; break;  // OpConvertFToS
+        case 111: val[a[1]] = {fb(static_cast<float>(static_cast<std::int32_t>(s0(a[2]))))}; break;    // OpConvertSToF
+        case 112: val[a[1]] = {fb(static_cast<float>(s0(a[2])))}; break;                               // OpConvertUToF
+        case 127: val[a[1]] = {fb(-f(s0(a[2])))}; break;  // OpFNegate
+        case 129: bin_f([&](float x, float y) { return fb(x + y); }); break;
+        case 131: bin_f([&](float x, float y) { return fb(x - y); }); break;
+        case 133: bin_f([&](float x, float y) { return fb(x * y); }); break;
+        case 136: bin_f([&](float x, float y) { return fb(x / y); }); break;
+        case 128: bin_u([](std::uint32_t x, std::uint32_t y) { return x + y; }); break;
+        case 130: bin_u([](std::uint32_t x, std::uint32_t y) { return x - y; }); break;
+        case 149: {                                        // OpIAddCarry: {sum, carry}
+            const std::uint64_t r = static_cast<std::uint64_t>(s0(a[2])) + s0(a[3]);
+            val[a[1]] = {static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(r >> 32)};
+            break;
+        }
+        case 150: {                                        // OpISubBorrow: {difference, borrow}
+            const std::uint32_t x = s0(a[2]), y = s0(a[3]);
+            val[a[1]] = {x - y, x < y ? 1u : 0u};
+            break;
+        }
+        case 132: bin_u([](std::uint32_t x, std::uint32_t y) { return x * y; }); break;
+        case 170: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x == y}; }); break;
+        case 171: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x != y}; }); break;
+        case 172: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x > y}; }); break;
+        case 173: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{static_cast<std::int32_t>(x) > static_cast<std::int32_t>(y)}; }); break;
+        case 174: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x >= y}; }); break;
+        case 175: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{static_cast<std::int32_t>(x) >= static_cast<std::int32_t>(y)}; }); break;
+        case 176: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x < y}; }); break;
+        case 177: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{static_cast<std::int32_t>(x) < static_cast<std::int32_t>(y)}; }); break;
+        case 178: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x <= y}; }); break;
+        case 179: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{static_cast<std::int32_t>(x) <= static_cast<std::int32_t>(y)}; }); break;
+        case 180: bin_f([](float x, float y) { return std::uint32_t{x == y}; }); break;
+        case 182: bin_f([](float x, float y) { return std::uint32_t{x != y && x == x && y == y}; }); break;
+        case 183: bin_f([](float x, float y) { return std::uint32_t{!(x == y)}; }); break;
+        case 184: bin_f([](float x, float y) { return std::uint32_t{x < y}; }); break;
+        case 185: bin_f([](float x, float y) { return std::uint32_t{!(x >= y)}; }); break;
+        case 186: bin_f([](float x, float y) { return std::uint32_t{x > y}; }); break;
+        case 187: bin_f([](float x, float y) { return std::uint32_t{!(x <= y)}; }); break;
+        case 188: bin_f([](float x, float y) { return std::uint32_t{x <= y}; }); break;
+        case 190: bin_f([](float x, float y) { return std::uint32_t{x >= y}; }); break;
+        case 164: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{(x != 0) == (y != 0)}; }); break;
+        case 165: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{(x != 0) != (y != 0)}; }); break;
+        case 166: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x || y}; }); break;
+        case 167: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x && y}; }); break;
+        case 168: val[a[1]] = {s0(a[2]) ? 0u : 1u}; break;  // OpLogicalNot
+        case 169: val[a[1]] = s0(a[2]) ? get(a[3]) : get(a[4]); break;  // OpSelect (scalar condition)
+        case 194: bin_u([](std::uint32_t x, std::uint32_t y) { return x >> (y & 31); }); break;
+        case 195: bin_u([](std::uint32_t x, std::uint32_t y) { return static_cast<std::uint32_t>(static_cast<std::int32_t>(x) >> (y & 31)); }); break;
+        case 196: bin_u([](std::uint32_t x, std::uint32_t y) { return x << (y & 31); }); break;
+        case 197: bin_u([](std::uint32_t x, std::uint32_t y) { return x | y; }); break;
+        case 198: bin_u([](std::uint32_t x, std::uint32_t y) { return x ^ y; }); break;
+        case 199: bin_u([](std::uint32_t x, std::uint32_t y) { return x & y; }); break;
+        case 200: val[a[1]] = {~s0(a[2])}; break;          // OpNot
+        case 156: val[a[1]] = {f(s0(a[2])) != f(s0(a[2])) ? 1u : 0u}; break;  // OpIsNan
+        case 12: {                                         // OpExtInst (GLSL.std.450)
+            const std::uint32_t inst = a[3];
+            const float x = f(s0(a[4]));
+            const float y = n > 6 ? f(s0(a[5])) : 0.0f;
+            const float z = n > 7 ? f(s0(a[6])) : 0.0f;
+            float r = 0.0f;
+            switch (inst) {
+            case 4: r = std::fabs(x); break;
+            case 8: r = std::floor(x); break;
+            case 37: r = std::fmin(x, y); break;
+            case 40: r = std::fmax(x, y); break;
+            case 43: r = std::fmin(std::fmax(x, y), z); break;
+            case 50: r = std::fma(x, y, z); break;
+            default: return fail("GLSL.std.450 instruction " + std::to_string(inst));
+            }
+            val[a[1]] = {fb(r)};
+            break;
+        }
+        default: return fail("unsupported opcode " + std::to_string(op));
+        }
+        pc = next;
+    }
+    return fail("did not return");
+}
+
 // The per-lane exit idiom: each pixel adds 1.0 to v3 while v5 < its own count
 // v4, inside an s_cbranch_execz region on a per-pixel condition. `variant`
 // breaks one rule each (see the cases below).
@@ -1628,11 +1899,106 @@ void loops() {
         CHECK(proof_has(r, "divergent, the per-lane exit idiom on s12"));
         CHECK(count_op(r.spirv, kOpLoopMerge) == 1);
     }
+    // The interpreter on the one-exit loop: each pixel adds 1.0 per count.
+    {
+        const gcn::LiftResult r = lift(divergent_loop());
+        for (const float count : {0.0f, 3.0f, 5.0f}) {
+            const CfgRun run = run_cfg(r.spirv, {count, 1.0f, 0, 0});
+            if (!run.ok) std::fprintf(stderr, "divergent loop: %s\n", run.error.c_str());
+            CHECK(run.ok && run.out[0] == count);
+        }
+    }
+    // Two ways out, as the ray-cast shaders leave: each inside an
+    // s_cbranch_execz region on the lanes leaving, with moves those lanes make
+    // on the way out, and an instruction no branch reaches after the back
+    // edge. Each pixel: while i < limit, acc += step and leave once acc > 4;
+    // the way out it took marks v6 (1.0 or 2.0), and the first also v7.
+    const auto two_ways_out = [](bool distinct_masks) {
+        Asm a;
+        a.interp(2, 0, 0);                         // v2 = the limit
+        a.interp(3, 0, 1);                         // v3 = the step
+        a.vop1(kVMov, 4, kC0);                     // v4 = i
+        a.vop1(kVMov, 5, kC0);                     // v5 = acc
+        a.vop1(kVMov, 6, kC0);                     // v6 = the way out
+        a.vop1(kVMov, 7, kC0);                     // v7
+        a.sop1(kSMov64, 10, kExec);                // EXEC kept for after the loop
+        a.sop1(kSMov64, 12, kExec);                // the loop mask L
+        if (distinct_masks) a.sop1(kSMov64, 16, kExec);
+        const std::uint32_t header = a.at();
+        a.vopc(kCmpGtF32, kV + 2, 4);              // vcc = limit > i: stay
+        a.sop1(kSMov64, 14, kExec);
+        a.sop2(kSAndn2_64, kExec, 14, kVcc);       // EXEC = the lanes leaving
+        a.vop1(kVMov, 6, kOne);                    // on the way out: v6 = 1.0
+        const std::size_t skip1 = a.forward(kExecz);
+        a.vop2(kVAddF32, 7, kOne, 5);              // v7 = acc + 1
+        a.sop2(kSAndn2_64, 12, 12, kExec);         // L loses them
+        const std::size_t exit1 = a.forward(kScc0);
+        a.land(skip1);
+        a.sop2(kSAnd64, kExec, 14, 12);            // EXEC = the lanes staying
+        a.vop2(kVAddF32, 5, kV + 3, 5);            // acc += step
+        a.vopc(kCmpLtF32, kFour, 5);               // vcc = 4 < acc: leave
+        a.sop1(kSAndSaveexec, 14, kVcc);           // EXEC = the lanes leaving
+        a.vop1(kVMov, 6, kTwo);                    // on the way out: v6 = 2.0
+        const std::size_t skip2 = a.forward(kExecz);
+        const std::uint32_t m2 = distinct_masks ? 16 : 12;
+        a.sop2(kSAndn2_64, m2, m2, kExec);
+        const std::size_t exit2 = a.forward(kScc0);
+        a.land(skip2);
+        a.sop2(kSAnd64, kExec, 14, 12);
+        a.vop2(kVAddF32, 4, kOne, 4);              // i += 1
+        a.branch(kBranch, header);
+        a.vop1(kVMov, 6, kC0 + 9);                 // no branch reaches it
+        a.land(exit1);
+        a.land(exit2);
+        a.sop1(kSMov64, kExec, 10);
+        a.exp_mrt0(5, 6, 4, 7);
+        a.sopp(kEndpgm);
+        return a;
+    };
+    {
+        const gcn::LiftResult r = lift(two_ways_out(false));
+        CHECK(lifted_valid(r, "a divergent loop with two ways out"));
+        CHECK(proof_has(r, "2 exits joined"));
+        CHECK(proof_has(r, "(in the region at"));
+        CHECK(proof_has(r, "after the back edge is reached by no branch and is not lifted"));
+        const auto expect = [](float limit, float step) {
+            float i = 0, acc = 0, way = 0, v7 = 0;
+            for (;;) {
+                if (!(limit > i)) {
+                    way = 1.0f;
+                    v7 = acc + 1.0f;
+                    break;
+                }
+                acc += step;
+                if (4.0f < acc) {
+                    way = 2.0f;
+                    break;
+                }
+                i += 1.0f;
+            }
+            return std::array<float, 4>{acc, way, i, v7};
+        };
+        for (const auto [limit, step] : {std::pair{3.0f, 1.0f}, std::pair{10.0f, 1.5f}, std::pair{0.0f, 1.0f}, std::pair{2.0f, 5.0f}}) {
+            const CfgRun run = run_cfg(r.spirv, {limit, step, 0, 0});
+            if (!run.ok) std::fprintf(stderr, "a divergent loop with two ways out: %s\n", run.error.c_str());
+            CHECK(run.ok);
+            const std::array<float, 4> want = expect(limit, step);
+            for (std::size_t k = 0; k < 4 && run.ok; ++k) {
+                if (run.out[k] != want[k]) {
+                    std::fprintf(stderr, "two ways out (limit %g, step %g): output %zu is %g, expected %g\n", limit, step, k, run.out[k], want[k]);
+                    ++g_failures;
+                }
+            }
+        }
+    }
+    // The second way out taking lanes out of another mask: refused.
+    CHECK(rejected_with(lift(two_ways_out(true)), "on different masks"));
     // The loop mask must start as EXEC.
     CHECK(rejected_with(lift(divergent_loop(1)), "does not start as EXEC"));
     // GCN may run more iterations than the pixel: a scalar the loop writes is dead after it.
     CHECK(rejected_with(lift(divergent_loop(2)), "written inside the divergent loop"));
-    // A second way out of the loop.
+    // A second way out of the loop: acc += x until s5 reaches s0 or 7, the
+    // exits joined at the merge; run for both ways out.
     {
         Asm b;
         b.interp(2, 0, 0);
@@ -1650,26 +2016,48 @@ void loops() {
         b.land(exit2);
         b.exp_mrt0(3);
         b.sopp(kEndpgm);
-        CHECK(rejected_with(lift(b), "a second exit from the loop"));
+        const gcn::LiftResult r = lift(b);
+        CHECK(lifted_valid(r, "a uniform loop with two exits"));
+        CHECK(proof_has(r, "2 exits joined"));
+        for (const auto [count, want] : {std::pair{3u, 3.0f * 1.5f}, std::pair{12u, 7.0f * 1.5f}}) {
+            std::array<std::uint32_t, 16> user{};
+            user[0] = count;
+            const CfgRun run = run_cfg(r.spirv, {1.5f, 0, 0, 0}, user);
+            if (!run.ok) std::fprintf(stderr, "a uniform loop with two exits: %s\n", run.error.c_str());
+            CHECK(run.ok && run.out[0] == want);
+        }
     }
-    // A branch from inside the loop past its exit.
-    {
+    // A branch from inside the loop past its exit, over an instruction no
+    // branch reaches (the copies of a dead path the compiler leaves after the
+    // back edge): the exit is there, and that instruction is not lifted. One
+    // a branch does reach is still refused.
+    const auto past_exit = [](bool reached) {
         Asm b;
         b.interp(2, 0, 0);
         b.vop1(kVMov, 3, kC0);
         b.sop1(kSMov, 5, kC0);
+        b.sopc(kSCmpEqI32, 0, kC0);                // s0 == 0: around the loop (and, reached, into the skipped instruction)
+        const std::size_t into = b.forward(kScc1);
         const std::uint32_t header = b.at();
         b.sopc(kSCmpGeI32, 5, 0);
         const std::size_t far = b.forward(kScc1);
         b.vop2(kVAddF32, 3, kV + 2, 3);
         b.sop2(kSAddU32, 5, 5, kC0 + 1);
         b.branch(kBranch, header);
+        if (reached) b.land(into);
         b.vop1(kVMov, 3, kC0);  // skipped by the exit
         b.land(far);
+        if (!reached) b.land(into);
         b.exp_mrt0(3);
         b.sopp(kEndpgm);
-        CHECK(rejected_with(lift(b), "for somewhere other than its exit"));
+        return b;
+    };
+    {
+        const gcn::LiftResult r = lift(past_exit(false));
+        CHECK(lifted_valid(r, "an exit past instructions no branch reaches"));
+        CHECK(proof_has(r, "after the back edge is reached by no branch and is not lifted"));
     }
+    CHECK(rejected_with(lift(past_exit(true)), "for somewhere other than its exit"));
     // SCC carried around the loop: read at the header before the body writes it.
     {
         Asm b;
