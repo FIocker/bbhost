@@ -16,6 +16,7 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cmath>
 #include <csetjmp>
 #include <cstdarg>
@@ -39,6 +40,9 @@
 #include <pthread.h>
 #endif
 
+static bool loading_show_due(std::uint64_t now_ns);  // below
+static void flip_holds_screen(bool was, bool on);     // below
+
 namespace {
 
 struct VideoPort {
@@ -55,6 +59,8 @@ struct VideoPort {
     // `present`: what the presenter is told of it (when it arrived, the
     // submissions its frame is in); `shown`: already presented when it
     // arrived (BBHOST_PRESENT_ON_ARRIVAL), so its vblank only completes it.
+    // `at_once`: a loading screen's or an uncapped flip, which completes as
+    // soon as the GPU has run its frame rather than on a vblank (flip_waiter).
     struct FlipReq {
         int buffer;
         std::int64_t arg;
@@ -62,6 +68,7 @@ struct VideoPort {
         std::uint64_t gpu_need;
         PresentFlip present;
         bool shown;
+        bool at_once = false;
     };
     std::deque<FlipReq> flip_queue;  // requested flips awaiting a vblank
     std::chrono::steady_clock::time_point last_complete{};
@@ -367,18 +374,51 @@ void present_flip(int buffer, std::uint64_t display_va, unsigned dw, unsigned dh
     engine_on_flip(count);
 }
 
-// Completes at most one queued flip per open port, gated by the flip rate.
-// BBHOST_FLIP_AFTER_GPU=1: a flip completes only once the GPU has run its
-// frame. The command processor queues a flip when it has *recorded* the
-// frame, and the vblank used to complete it whether or not the GPU had
-// executed any of it - while on the console a flip is the GPU reaching it,
-// so a game may take the flip for "the GPU is done with that frame's
-// buffers" and write the next frame's data over them.
+// A flip completes only once the GPU has run its frame, on every path: the
+// vblank's, a loading screen's and the uncapped one (above 60, BBHOST_UNCAP).
+// The command processor queues a flip once it has *recorded* the frame. On
+// the console a flip is the GPU reaching it, and the game takes a completed
+// flip for "the GPU is done with that frame": it writes the next frames' data
+// over what the frame read - GX's per-frame ring of constants and resource
+// tables. Completed on recording (on the vblank, and at once in a loading
+// screen), the game ran ~10 command-processor jobs ahead of the GPU after a
+// loading screen and rewrote dispatches' inputs before the GPU ran them; the
+// particle simulation (CS_VFX_StandardParticle) took the float bits it then
+// read for loop counts and held the GPU for minutes. Now a frame is shown,
+// and what it used handed back to the game, once it is rendered, and how far
+// the game runs ahead is its own swap chain's business, as on the console.
+// BBHOST_FLIP_AFTER_GPU=0: complete on recording, as before.
 const bool g_flip_after_gpu = [] {
     const char* e = std::getenv("BBHOST_FLIP_AFTER_GPU");
-    return e && e[0] == '1';
+    return !(e && e[0] == '0');
 }();
 std::atomic<std::uint64_t> g_flips_held{0};
+
+// The at-once paths' flips that waited for their frame: in all, and in the
+// loading screen under way (said when it ends).
+struct FlipHolds {
+    std::atomic<std::uint64_t> flips{0}, held{0}, held_ns{0}, longest_ns{0};
+    void note(std::uint64_t ns) {
+        held_ns.fetch_add(ns, std::memory_order_relaxed);
+        std::uint64_t m = longest_ns.load(std::memory_order_relaxed);
+        while (ns > m && !longest_ns.compare_exchange_weak(m, ns, std::memory_order_relaxed)) {
+        }
+    }
+};
+FlipHolds g_holds, g_screen_holds;
+
+// A loading screen's and the uncapped flips do not wait for a vblank, so
+// those that wait for the GPU are completed here, by a thread of its own, as
+// soon as their frame has run (the GPU is asked every half millisecond while
+// one waits): on the vblank they would have held a loading screen to one
+// flip a refresh.
+std::condition_variable g_flip_wait_cv;  // with g_vo_mu: an at-once flip waits
+void flip_waiter();
+void wake_flip_waiter() {
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(flip_waiter).detach(); });
+    g_flip_wait_cv.notify_one();
+}
 
 void vblank_tick(std::uint64_t vcount) {
     const std::uint64_t gpu_done = g_flip_after_gpu ? host_gpu_submissions_completed() : ~0ull;
@@ -395,8 +435,8 @@ void vblank_tick(std::uint64_t vcount) {
         std::lock_guard<std::mutex> lock(g_vo_mu);
         for (auto& kv : g_vo) {
             VideoPort& p = kv.second;
-            if (!p.open || p.flip_queue.empty()) {
-                continue;
+            if (!p.open || p.flip_queue.empty() || p.flip_queue.front().at_once) {
+                continue;  // an at-once flip in front is flip_waiter's
             }
             if (vcount % (static_cast<std::uint64_t>(p.flip_rate) + 1) != 0) {
                 continue;
@@ -404,7 +444,8 @@ void vblank_tick(std::uint64_t vcount) {
             if (p.flip_queue.front().gpu_need > gpu_done) {
                 const std::uint64_t n = g_flips_held.fetch_add(1, std::memory_order_relaxed);
                 if (n == 0 || n % 3600 == 0) {
-                    host_log("video: a flip waited a vblank for the GPU to run its frame (%llu vblanks so far; BBHOST_FLIP_AFTER_GPU)",
+                    host_log("video: a flip waited a vblank for the GPU to run its frame (%llu vblanks so far; "
+                             "BBHOST_FLIP_AFTER_GPU=0 completes it on recording)",
                              static_cast<unsigned long long>(n + 1));
                 }
                 continue;  // the GPU has not run the frame yet: a later vblank
@@ -424,6 +465,7 @@ void vblank_tick(std::uint64_t vcount) {
             const VideoPort::FlipReq req = p.flip_queue.front();
             p.flip_queue.pop_front();
             p.pending = static_cast<int>(p.flip_queue.size());
+            if (!p.flip_queue.empty() && p.flip_queue.front().at_once) g_flip_wait_cv.notify_one();  // its turn now
             finish_flip_locked(p, req.buffer, req.arg);
             g_flips_done.store(p.flip_count);
             pacing_note_completed(req.present.arrived_ns);
@@ -439,6 +481,63 @@ void vblank_tick(std::uint64_t vcount) {
     }
     for (const Done& d : present) {
         present_flip(d.buffer, d.va, d.w, d.h, d.count, d.mark, d.shown, d.flip);
+    }
+}
+
+// Completes the at-once flips (FlipReq::at_once) whose frame the GPU has run,
+// in order, and hands the newest of them to the presenter - a loading
+// screen's only when one is due (loading_show_due).
+void flip_waiter() {
+    host_thread_set_name("bb-flip-wait");
+    for (;;) {
+        const auto waiting = [] {
+            for (const auto& kv : g_vo) {
+                if (kv.second.open && !kv.second.flip_queue.empty() && kv.second.flip_queue.front().at_once) return true;
+            }
+            return false;
+        };
+        {
+            std::unique_lock<std::mutex> lock(g_vo_mu);
+            while (!waiting()) g_flip_wait_cv.wait_for(lock, std::chrono::milliseconds(50));
+        }
+        // What the GPU has done, asked before the port's lock (as the vblank
+        // does): the renderer's lock is never taken under it.
+        const std::uint64_t gpu_done = host_gpu_submissions_completed();
+        struct Done {
+            int buffer;
+            std::uint64_t va;
+            unsigned w, h, count;
+            std::uint64_t mark;
+            bool leave;
+            PresentFlip flip;
+        };
+        std::vector<Done> present;
+        bool still = false;
+        {
+            std::lock_guard<std::mutex> lock(g_vo_mu);
+            const std::uint64_t now = steady_ns();
+            for (auto& kv : g_vo) {
+                VideoPort& p = kv.second;
+                while (p.open && !p.flip_queue.empty() && p.flip_queue.front().at_once && p.flip_queue.front().gpu_need <= gpu_done) {
+                    const VideoPort::FlipReq req = p.flip_queue.front();
+                    p.flip_queue.pop_front();
+                    p.pending = static_cast<int>(p.flip_queue.size());
+                    finish_flip_locked(p, req.buffer, req.arg);
+                    g_flips_done.store(p.flip_count);
+                    g_holds.note(now - req.present.arrived_ns);
+                    g_screen_holds.note(now - req.present.arrived_ns);
+                    const std::uint64_t va = (req.buffer >= 0 && req.buffer < 16) ? p.buffers[req.buffer] : 0;
+                    const bool newer = !p.flip_queue.empty() && p.flip_queue.front().at_once && p.flip_queue.front().gpu_need <= gpu_done;
+                    present.push_back({req.buffer, va, p.display_w, p.display_h, static_cast<unsigned>(p.flip_count), req.mark, newer, req.present});
+                }
+                still = still || (p.open && !p.flip_queue.empty() && p.flip_queue.front().at_once);
+            }
+        }
+        for (Done& d : present) {
+            if (!d.leave) d.leave = !g_flip_uncapped.load() && !loading_show_due(steady_ns());
+            present_flip(d.buffer, d.va, d.w, d.h, d.count, d.mark, d.leave, d.flip);
+        }
+        if (still) std::this_thread::sleep_for(std::chrono::microseconds(500));
     }
 }
 
@@ -821,7 +920,7 @@ std::string hle_video_pacing_window() {
     return buf;
 }
 
-void hle_video_set_loading_uncapped(bool on) { g_flip_loading.store(on, std::memory_order_relaxed); }
+void hle_video_set_loading_uncapped(bool on) { flip_holds_screen(g_flip_loading.exchange(on, std::memory_order_relaxed), on); }
 
 // The game's pace once engine/frame_rate.cpp chose it; -1 before.
 std::atomic<int> g_game_pace{-1};
@@ -887,14 +986,32 @@ static bool loading_show_due(std::uint64_t now_ns) {
 }
 std::uint64_t hle_video_loading_unshown() { return g_loading_unshown.load(std::memory_order_relaxed); }
 
+// A loading screen's flips that waited for their frame, said when it ends.
+static void flip_holds_screen(bool was, bool on) {
+    if (!g_flip_after_gpu || was == on) return;
+    if (!on) {
+        host_log("video: the loading screen's %llu flips: %llu waited for their frame on the GPU, the longest %.1f ms, %.0f ms in all "
+                 "(%llu of %llu so far)",
+                 static_cast<unsigned long long>(g_screen_holds.flips.load()), static_cast<unsigned long long>(g_screen_holds.held.load()),
+                 g_screen_holds.longest_ns.load() / 1e6, g_screen_holds.held_ns.load() / 1e6,
+                 static_cast<unsigned long long>(g_holds.held.load()), static_cast<unsigned long long>(g_holds.flips.load()));
+    }
+    g_screen_holds.flips.store(0);
+    g_screen_holds.held.store(0);
+    g_screen_holds.held_ns.store(0);
+    g_screen_holds.longest_ns.store(0);
+}
+
 void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool recorded) {
-    // Called from the CP thread once it has recorded the frame's GPU work
-    // (not once the GPU has run it: BBHOST_FLIP_AFTER_GPU). The flip is
-    // queued and completed by the vblank tick at the game's flip rate, so the
-    // game's frame loop paces on the flip event. BBHOST_UNCAP=1 completes it
-    // at once (fast headless dumps). `recorded`: from the command processor,
-    // after the frame's commands (else a game thread's request, which may be
-    // ahead of them).
+    // Called from the CP thread once it has recorded the frame's GPU work,
+    // not once the GPU has run it: the flip completes only once it has
+    // (g_flip_after_gpu). The flip is queued and completed by the vblank tick
+    // at the game's flip rate, so the game's frame loop paces on the flip
+    // event. A loading screen's and the uncapped ones (BBHOST_UNCAP=1, fast
+    // headless dumps) complete at once - or, while their frame has not run,
+    // as soon as it has (flip_waiter). `recorded`: from the command
+    // processor, after the frame's commands (else a game thread's request,
+    // which may be ahead of them).
     const std::uint64_t mark = host_gpu_draw_mark();
     // The submissions the frame is in: the presenter submits the renderer's
     // recording only when the frame is still in it (host_gpu_submit_for_flip).
@@ -932,6 +1049,37 @@ void hle_video_finish_flip(int handle, int buffer, std::int64_t arg, bool record
         show_frame(buffer, display_va, dw, dh, flip);
         pacing_note_shown(flip.arrived_ns);
         return;
+    }
+    if (g_flip_after_gpu) {
+        // Its frame not run yet, or flips queued before it: it waits, in
+        // order, and flip_waiter completes it once the GPU has run the frame.
+        // (Asked before the port's lock, as the vblank does.)
+        const std::uint64_t gpu_done = host_gpu_submissions_completed();
+        std::lock_guard<std::mutex> lock(g_vo_mu);
+        VideoPort* p = vo_get(handle);
+        if (!p) {
+            return;
+        }
+        g_holds.flips.fetch_add(1, std::memory_order_relaxed);
+        g_screen_holds.flips.fetch_add(1, std::memory_order_relaxed);
+        if (gpu_done < gpu_need || !p->flip_queue.empty()) {
+            VideoPort::FlipReq req{buffer, arg, mark, gpu_need, flip, false};
+            req.at_once = true;
+            p->flip_queue.push_back(req);
+            p->pending = static_cast<int>(p->flip_queue.size());
+            g_screen_holds.held.fetch_add(1, std::memory_order_relaxed);
+            const std::uint64_t n = g_holds.held.fetch_add(1, std::memory_order_relaxed);
+            if (n == 0) {
+                host_log("video: a loading screen's or an uncapped flip waits for its frame on the GPU (BBHOST_FLIP_AFTER_GPU=0 "
+                         "completes it on recording)");
+            } else if (g_flip_uncapped.load() && (n + 1) % 36000 == 0) {
+                host_log("video: %llu of %llu uncapped and loading-screen flips waited for their frame, the longest %.1f ms",
+                         static_cast<unsigned long long>(n + 1), static_cast<unsigned long long>(g_holds.flips.load()),
+                         g_holds.longest_ns.load() / 1e6);
+            }
+            wake_flip_waiter();
+            return;
+        }
     }
     std::uint64_t display_va = 0;
     std::uint64_t count = 0;
