@@ -1300,10 +1300,10 @@ GUEST_ABI std::int64_t frame_manager_hook(std::uint64_t, const std::uint64_t* sa
         RealClock clock;
         g_fast_target = converted && (g_bench_uncapped || loading_fast_now());
         sprj_flipper_update(f, clock, pace_target());
+        g_fast_target = false;
         // Finish both pacing waits before sampling input or running the frame's
         // host callbacks. Their work belongs to this simulation ID as well.
         host::reflex::on_frame_begin();
-        g_fast_target = false;
     }
     np_test_tick();  // the online test hook wants the main thread, once a frame
     params_tick();   // the param repository walk (engine/params.h)

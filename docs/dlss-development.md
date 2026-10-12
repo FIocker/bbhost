@@ -2,7 +2,8 @@
 
 Optional native DLAA, DLSS Super Resolution, 2x frame generation and animated
 object motion vectors. Temporal settings require a restart. Normal Setup and
-F10 menus offer Off/2x generation; higher factors are opt-in experiments.
+F10 menus offer DLSS Off/2x/3x/4x generation without an opt-in switch.
+FSR generation offers Off/2x. Higher factors remain subject to GPU capabilities.
 
 ## Sources
 
@@ -129,11 +130,11 @@ the pacing improvement without claiming a higher real rendering rate.
 | --- | ---: | ---: | ---: |
 | Quality, 2x, selected 30 FPS | 30.0 | 60.00 | 18.82 ms |
 | Quality, 2x, selected 60 FPS | 60.0 | 119.99 | 10.82 ms |
-| Quality, experimental 3x, selected 30 FPS | 30.0 | 90.00 | 12.58 ms |
+| Quality, 3x, selected 30 FPS | 30.0 | 90.00 | 12.58 ms |
 | Native DLAA, FG off | 57.0 | 56.97 | 27.15 ms |
 | Native DLAA, 2x | 51.3 | 101.95 | 13.46 ms |
-| Native DLAA, experimental 3x | 47.3 | 141.15 | 11.14 ms |
-| Native DLAA, experimental 4x | 43.7 | 173.05 | 10.13 ms |
+| Native DLAA, 3x | 47.3 | 141.15 | 11.14 ms |
+| Native DLAA, 4x | 43.7 | 173.05 | 10.13 ms |
 
 These measured windows contain no rows missing display intervals. The 2x
 GPU trace contains no expired generated positions at either selected cap
@@ -156,24 +157,23 @@ the replacement capture retains foreground throughout the measured window.
 
 Display-change rates above 119.88 Hz can include torn scanouts. They are useful
 for finding submission stalls, but do not demonstrate complete 180/240 Hz
-output on this display. Higher factors remain experimental; no driver FPS
-limit is reapplied by the implementation.
+output on this display. The menu exposes higher factors for broader testing;
+no driver FPS limit is reapplied by the implementation.
 
-### Experimental higher factors
+### Higher factors and display limits
 
 3x at 30 source FPS reached 90 displayed FPS with a 13.44 ms p99 interval.
 4x at 30 FPS reached 115.72 displayed FPS under the driver cap, with less even
 spacing. At 60 source FPS, 3x reached 110.36 displayed FPS with a 20.54 ms p99
-interval and cadence problems. Higher factors stay behind
-`BBHOST_EXPERIMENTAL_MFG=1`, not normal validated choices. These measurements
-precede the final phase bound and do not establish cap-safe MFG.
+interval and cadence problems. These historical measurements precede the
+final phase bound and do not establish cap-safe MFG.
 Unsupported higher factors fall back to 2x.
 
 After the final phase fix, a clean 3x repeat with the game cap at 60 FPS
 measured about 55 real FPS, 115.09 displayed FPS and a 16.47 ms p99 interval.
 It improved over the earlier run but still varied from 4.95 ms at p10 to
 13.05 ms at p90, skipping many generated positions against the driver limit.
-This does not justify promoting it to the normal menu.
+This does not establish uniform pacing under an external FPS limit.
 
 Native Vulkan [Reflex](reflex.md) is now integrated, with Off/On/On + Boost
 settings and driver timestamp diagnostics. See [the current validation](reflex-validation.md)
@@ -249,12 +249,12 @@ object_motion = true
 ```
 
 Modes: `off`, `dlaa`, `quality`, `balanced`, `performance`, `ultra_performance`.
-Setup and F10 share reconstruction, Off/2x generation, object motion and
-resolution choices. Saved choices take precedence over config defaults.
-Restart after changing temporal settings. Without the experimental opt-in,
-previously saved 3x/4x choices safely select 2x. `BBHOST_DLSS_FG=0` or `2`
-overrides a run; legacy `1` means 2x. With `BBHOST_EXPERIMENTAL_MFG=1`,
-menus and overrides also allow `3` or `4` on supported hardware.
+Setup and F10 share reconstruction, DLSS Off/2x/3x/4x generation, object
+motion and resolution choices. FSR generation offers Off/2x. Saved choices
+take precedence over config defaults, including saved 3x/4x selections.
+Restart after changing temporal settings. `BBHOST_DLSS_FG=0`, `2`, `3` or `4`
+overrides a run; legacy `1` means 2x. Unsupported higher factors retain the
+existing capability fallback. No experimental opt-in switch is required.
 Keep simulation at 60 FPS for multiplayer compatibility.
 
 The resolution selector describes native rendering or reconstructed output.

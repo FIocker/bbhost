@@ -702,14 +702,14 @@ LauncherResult launcher_run(const HostConfig& cfg, const std::string& reason, bo
                 ImGui::SetTooltip("NVIDIA DLSS Frame Generation (requires RTX 40 series or newer and nvngx_dlssg.dll).");
         }
         ImGui::SetNextItemWidth(200 * scale);
-        const int max_fg_factors = fg_backend == 1 ? 2 : (host::experimental_mfg_enabled() ? 4 : 2);
+        const int max_fg_factors = fg_backend == 1 ? 2 : 4;
         ImGui::Combo("Frame generation", &frame_generation, kFgLabels, max_fg_factors);
         if (fg_backend == 1 && frame_generation > 1) frame_generation = 1;
         if (ImGui::IsItemHovered()) {
             if (fg_backend == 1)
                 ImGui::SetTooltip("Experimental FSR Frame Generation supports 2x only. Fast motion can show interpolation artifacts.");
             else
-                ImGui::SetTooltip("2x adds one generated frame. Experimental 3x/4x may have uneven pacing under FPS limits.");
+                ImGui::SetTooltip("2x, 3x and 4x add one, two or three generated frames between game frames. The active factor depends on GPU support.");
         }
         ImGui::SetNextItemWidth(200 * scale);
         ImGui::Combo("NVIDIA Reflex", &reflex_mode, kReflexLabels, 3);

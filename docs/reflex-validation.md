@@ -89,7 +89,7 @@ GPU-bound cadence is 38.06 FPS; 2x reaches 76.37 display changes/s, with a
 position expires, with no sampled reset suppression. This run includes the
 same narrow WSI guard as the final A/B table.
 
-At fixed 30 real FPS, experimental 3x reaches 90.01 display changes/s with
+At fixed 30 real FPS, 3x reaches 90.01 display changes/s with
 14.62 ms p99 intervals; 4x reaches 120.00 with 10.82 ms p99 intervals. Both have
 zero missing timing rows and sampled expired/suppressed positions. These are
 cadence checks on a 120 Hz display, not certification of interpolation quality
@@ -103,7 +103,7 @@ source throttle, 4x measures 30.01 / 119.96, p99 12.14 ms, and one expired
 position. Neither run has missing timing rows or sampled reset suppression.
 Median input-to-present is 62.45/66.62 ms respectively. Higher generated output
 does not recover input responsiveness, and GPU contention makes intervals less
-uniform than the fixed-source, lighter-workload checks. Both remain opt-in.
+uniform than the fixed-source, lighter-workload checks. These remain measurements of one display and GPU.
 
 [Aggregate measurements](data/reflex-validation-2026-10-11.csv) retain both A/B
 rounds before and after the WSI guard, heavy-load higher-factor checks,
@@ -240,9 +240,9 @@ the aggregate's invalid-report count.
 
 ## Scope
 
-2x remains the ordinary menu choice. Higher DLSS factors remain opt-in while
-the 120 Hz display, backpressure and artifact limits are assessed. FSR supports
-2x only; its optional source-v07 FSR 4 model is reconstruction, not ML frame
+DLSS Off/2x/3x/4x are selectable in both menus, without an opt-in switch.
+The retained measurements cover one 120 Hz display; backpressure and artifact
+limits still need broader hardware testing. FSR supports 2x only; its optional source-v07 FSR 4 model is reconstruction, not ML frame
 generation. Multiplayer should retain 60 FPS simulation.
 
 See [Reflex configuration and diagnostics](reflex.md),

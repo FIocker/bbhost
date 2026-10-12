@@ -45,13 +45,6 @@ inline const char* fg_backend_name(int backend) {
     return "dlss";
 }
 
-// Higher factors can have uneven temporal spacing under an external FPS cap.
-// Keep them available for pacing research without exposing them by default.
-inline bool experimental_mfg_enabled() {
-    const char* e = std::getenv("BBHOST_EXPERIMENTAL_MFG");
-    return e && e[0] == '1';
-}
-
 inline bool valid_resolution(int width, int height) {
     return width >= 256 && width <= 7680 && height >= 144 && height <= 4320;
 }

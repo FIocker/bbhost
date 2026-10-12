@@ -4315,7 +4315,7 @@ void retire_slot_locked(int k) {
     // Fences on one queue complete in submission order, so every CP write
     // recorded into this submission or an earlier one is in memory now.
     g.completed_submits = std::max(g.completed_submits, sl.serial + 1);
-    if (r == VK_SUCCESS) fsr_retire_locked(g.completed_submits);
+    fsr_retire_locked(g.completed_submits);
     for (auto it = g.pending_writes.begin(); it != g.pending_writes.end();) {
         it = it->second.serial < g.completed_submits ? g.pending_writes.erase(it) : std::next(it);
     }

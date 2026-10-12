@@ -270,7 +270,7 @@ Setting g_set[kSettingCount] = {
     {"fg_backend", "FG backend", {"DLSS", "FSR 3.1"}, 0,
      "Frame generation provider: DLSS (RTX 40 series or newer) or experimental FSR 3.1 (2x only; fast motion can show interpolation artifacts). Requires a restart.", true},
     {"frame_generation", "Frame generation", {"Off", "2x", "3x", "4x"}, 0,
-     "Adds a generated frame between game frames. FSR FG supports 2x only. Experimental 3x/4x can have uneven pacing under FPS limits. Requires a restart.", true},
+     "DLSS 2x/3x/4x adds one to three generated frames, subject to GPU support. FSR FG supports 2x only. Use 60 fps gameplay for multiplayer. Requires a restart.", true},
     {"reflex", "NVIDIA Reflex", {"Off", "On", "On + Boost"}, 1,
      "Paces frame start to reduce GPU queue latency on supported NVIDIA drivers. Boost requests higher GPU clocks. Requires a restart.", true},
 };
@@ -822,7 +822,7 @@ void rebuild_settings() {
 
 void set_index(int id, int index, bool from_file) {
     Setting& s = g_set[id];
-    // FSR has only Off/2x, even when experimental DLSS MFG is opted in.
+    // FSR has only Off/2x; DLSS exposes Off/2x/3x/4x.
     // Wrap over those two choices so Right from 2x can turn generation off.
     const int n = id == kFrameGeneration && g_set[kFgBackend].index == 1 ?
                   2 : static_cast<int>(s.values.size());
@@ -889,10 +889,6 @@ void host_options_load() {
     static bool loaded = false;
     if (loaded) return;
     loaded = true;
-    if (!host::experimental_mfg_enabled()) {
-        g_set[kFrameGeneration].values.resize(2);
-        g_set[kFrameGeneration].note = "Adds one generated frame between game frames. Use 60 fps gameplay for multiplayer. Requires a restart.";
-    }
     // bbhost.toml still sets the defaults; the options file is what the player
     // changed, and the environment switches still win over both.
     host_bindings_load_defaults();
@@ -1005,7 +1001,6 @@ void host_options_load() {
             if (key == "resolution") seed(kResolution, val);
             if (key == "frame_generation" && val == "On") val = "2x";
             if (key == "dlss_mode" && val == "DLAA") val = "Native AA";
-            if (key == "frame_generation" && !host::experimental_mfg_enabled() && (val == "3x" || val == "4x")) val = "2x";
             // The four named steps mouse_sens used to have, on the new scale.
             if (key == "mouse_sens") {
                 const char* old[] = {"Low", "Medium", "High", "Very high"};
