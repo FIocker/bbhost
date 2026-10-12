@@ -782,6 +782,27 @@ int main() {
 
     vkQueueWaitIdle(queue);
 
+    // Completed dispatches must release transient descriptor/constant objects
+    // without destroying the reusable optical-flow/interpolation context.
+    uint64_t descriptors_before = 0, constants_before = 0;
+    uint64_t descriptors_after = 0, constants_after = 0;
+    if (ffxVkFsr3_3_1_6FrameGenerationContextGetTransientCounts(
+            fgContext, &descriptors_before, &constants_before) != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK ||
+        !descriptors_before || !constants_before) {
+        std::fprintf(stderr, "FAIL: FG fixture recorded no transient descriptor/constant objects\n");
+        return 1;
+    }
+    ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(fgContext, static_cast<uint64_t>(totalFrames));
+    if (ffxVkFsr3_3_1_6FrameGenerationContextGetTransientCounts(
+            fgContext, &descriptors_after, &constants_after) != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK ||
+        descriptors_after || constants_after) {
+        std::fprintf(stderr, "FAIL: completed FG frames retain %llu descriptor sets and %llu constant buffers\n",
+                     static_cast<unsigned long long>(descriptors_after), static_cast<unsigned long long>(constants_after));
+        return 1;
+    }
+    std::printf("FG transient retirement: %llu descriptor sets and %llu constant buffers -> zero\n",
+                static_cast<unsigned long long>(descriptors_before), static_cast<unsigned long long>(constants_before));
+
     // Pixel content validation
     size_t pixelCount = static_cast<size_t>(ow) * oh;
     double sumReal = 0.0, sumFg = 0.0;
