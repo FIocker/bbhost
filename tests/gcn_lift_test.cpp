@@ -16,6 +16,7 @@
 
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -580,6 +581,59 @@ void packed_exports() {
     }
 }
 
+// ds_swizzle_b32 in a whole-quad block over a region's EXEC M (GXSsr's
+// derivatives): GCN runs every lane of each quad holding an M pixel, so each
+// lane reads its own quad's lane - lane 1 here, in M or not - as the lift's
+// quad operation in uniform control flow does. Run over a quad whose lanes 2
+// and 3 are in M and lane 1 is not: they take lane 1's attr0 minus their own.
+// A source written in a block over another mask holds GCN's value only in
+// that mask's quads, which the lifter cannot show cover M's: refused.
+void swizzles_in_blocks() {
+    const auto program = [](bool from_other_block) {
+        std::vector<std::uint32_t> w;
+        wqm_prologue(w);                                                   // v2 = attr0.x in every lane
+        push(w, {vop1(kVMov, 4, 240) /* v4 = 0.5 */, vop1(kVMov, 5, kV + 2) /* v5 = v2 */});
+        if (from_other_block) {
+            push(w, {vop1(kVMov, 6, 255), 0x41700000u /* v6 = 15.0 */, vopc(kVCmpGtF32, 2, kV + 6) /* vcc = 15 > v2 */,
+                     sop1(kAndSaveexecB64, 8, kVcc), sopp(8, 4) /* s_cbranch_execz +4 */, sop1(kMovB64, kVcc, kExec),
+                     sop1(kWqmB64, kExec, kExec), vop2(3, 5, 2, kOne) /* v_add_f32 v5, 1.0, v2 */, sop1(kMovB64, kExec, kVcc),
+                     sop1(kMovB64, kExec, 8)});
+        }
+        push(w, {vop1(kVMov, 6, 255), 0x41c80000u /* v6 = 25.0 */, vopc(kVCmpGtF32, 6, kV + 2) /* vcc = v2 > 25 */,
+                 sop1(kAndSaveexecB64, 4, kVcc), sopp(8, 8) /* s_cbranch_execz +8 */, sop1(kMovB64, kVcc, kExec),
+                 sop1(kWqmB64, kExec, kExec)});
+        swizzle(w, 3, 5, 0x8055);                                          // lane 1's v5
+        push(w, {sopp(12, 0xc07f) /* s_waitcnt lgkmcnt(0) */, vop2(kVSub, 3, 2, kV + 3) /* v3 = v3 - v2 */, sop1(kMovB64, kExec, kVcc),
+                 vop1(kVMov, 4, kV + 3), sop1(kMovB64, kExec, 4), sop1(kMovB64, kExec, 2)});
+        export_mrt0(w, 4, 4, 4, 4);
+        w.push_back(kEndpgm);
+        return w;
+    };
+    const Lifted l = lift_words(program(false));
+    for (const std::string& why : l.lift.rejections) std::fprintf(stderr, "swizzle in a whole-quad block rejected: %s\n", why.c_str());
+    CHECK(l.ref.ok() && l.lift.ok());
+    if (l.lift.ok()) {
+        CHECK(spirv_valid(l.lift.spirv));
+        bool proof = false;
+        for (const std::string& p : l.lift.proof) proof |= p.find("(1 of them) in a whole-quad block over a varying EXEC") != std::string::npos;
+        CHECK(proof);
+        const std::array<float, 4> attr = {10.0f, 21.0f, 32.0f, 43.0f};
+        const std::array<float, 4> want = {0.5f, 0.5f, 21.0f - 32.0f, 21.0f - 43.0f};
+        for (const auto [x0, y0] : {std::pair{0.0f, 0.0f}, std::pair{7.0f, 3.0f}}) {
+            const QuadRun r = run_quad(l.lift.spirv, x0, y0, attr);
+            if (!r.ok) std::fprintf(stderr, "swizzle in a whole-quad block: %s\n", r.error.c_str());
+            CHECK(r.ok);
+            for (std::size_t k = 0; k < 4 && r.ok; ++k) {
+                if (r.out[k] != want[k]) {
+                    std::fprintf(stderr, "swizzle in a whole-quad block: lane %zu wrote %g, expected %g\n", k, r.out[k], want[k]);
+                    ++g_failures;
+                }
+            }
+        }
+    }
+    CHECK(rejected_with(lift_words(program(true)).lift, "a whole-quad block computes v3 from a value the lift may hold differently"));
+}
+
 // ds_swizzle_b32 and loops. Every pixel runs a uniform loop's iterations, so a
 // swizzle there sees its quad; in a loop pixels leave at different iterations
 // it would not. A value that comes back to a loop's header with helper lanes
@@ -803,6 +857,107 @@ bool has_op(const std::vector<std::uint32_t>& spirv, std::uint32_t opcode) {
     return false;
 }
 
+// image_load(_mip) and image_get_resinfo, which take no sampler and no
+// derivatives, and a depth export: lifted as the translator writes them
+// (OpImageFetch, OpImageQuerySizeLod with OpImageQueryLevels; FragDepth with
+// DepthReplacing, and then no early fragment tests).
+void loads_and_sizes() {
+    const auto mode = [](const std::vector<std::uint32_t>& spirv, std::uint32_t execution_mode) {
+        for (std::size_t i = 5; i < spirv.size();) {
+            const std::uint32_t n = spirv[i] >> 16;
+            if ((spirv[i] & 0xffff) == 16 && n >= 3 && spirv[i + 2] == execution_mode) return true;  // OpExecutionMode
+            i += n ? n : 1;
+        }
+        return false;
+    };
+    const auto coords = [](Asm& a) {
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vop1(7, 2, 256 + 2);  // v_cvt_u32_f32 v2, v2
+        a.vop1(7, 3, 256 + 3);
+    };
+    {
+        Asm a;
+        coords(a);
+        a.mimg(0, 4, 2, 0xf);  // image_load v[4:7], v[2:3], s[4:11]
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        const gcn::LiftResult r = lift(a.w);
+        CHECK(lifted(r) && has_op(r.spirv, 95) && proof_says(r, "1 image loads"));  // OpImageFetch
+    }
+    {
+        Asm a;
+        coords(a);
+        a.vop1(1, 4, kZero);   // v_mov_b32 v4, 0: the level
+        a.mimg(1, 8, 2, 0xf);  // image_load_mip v[8:11], v[2:4], s[4:11]
+        a.exp_mrt0(8);
+        a.w.push_back(0xbf810000u);
+        CHECK(lifted(lift(a.w)));
+    }
+    {
+        Asm a;
+        a.vop1(1, 2, kZero);    // the level
+        a.mimg(14, 4, 2, 0xf);  // image_get_resinfo v[4:7], v2, s[4:11]
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        const gcn::LiftResult r = lift(a.w);
+        CHECK(lifted(r) && has_op(r.spirv, 103) && has_op(r.spirv, 106));  // OpImageQuerySizeLod, OpImageQueryLevels
+    }
+    {
+        Asm a;
+        a.interp(2, 0, 0);
+        a.w.push_back(0xf8000000u | 1u << 12 | 0x0fu);  // exp mrt0 v2, v2, v2, v2 vm
+        a.w.push_back(2u | 2u << 8 | 2u << 16 | 2u << 24);
+        a.w.push_back(0xf8000000u | 1u << 12 | 1u << 11 | 8u << 4 | 0x1u);  // exp mrtz v2 done vm
+        a.w.push_back(2u);
+        a.w.push_back(0xbf810000u);
+        const gcn::Program p = gcn::decode(a.w.data(), a.w.size());
+        gcn::TranslateOptions o;
+        o.stage = gcn::Stage::Pixel;
+        o.ps_input_ena = 2;
+        o.descriptor_set = 1;
+        o.cb_ssbo = true;
+        o.cb_no_fallback = true;
+        o.early_fragment_tests = true;  // asked for, and not given with a depth export
+        const gcn::TranslateResult ref = gcn::translate(p, o);
+        const gcn::LiftResult r = gcn::lift_pixel_shader(p, o, ref);
+        CHECK(ref.ok() && lifted(r) && mode(r.spirv, 12) && !mode(r.spirv, 9));  // DepthReplacing, no EarlyFragmentTests
+    }
+}
+
+// A VCC branch on a texel: the tone map's adaptation samples one texel at
+// constant coordinates and branches on comparing it, which every lane does
+// alike - the same coordinates sample the same texel - so it is an if. At
+// per-pixel coordinates the texels differ and the branch is the wave's.
+void uniform_texels() {
+    const auto program = [](bool per_pixel) {
+        Asm a;
+        if (per_pixel) {
+            a.interp(0, 0, 0);
+            a.interp(1, 0, 1);
+        } else {
+            a.vop1(1, 0, kZero);  // v_mov_b32 v0, 0
+            a.vop1(1, 1, kZero);
+        }
+        a.mimg(kSampleLz, 2, 0, 0x3);  // image_sample_lz v[2:3], v[0:1], s[4:11], s[12:15]
+        a.w.push_back(0xbf8c0070u);   // s_waitcnt vmcnt(0)
+        a.vopc(4, 256 + 2, 3);        // v_cmp_gt_f32 vcc, v2, v3
+        const std::size_t skip = a.branch(6);  // s_cbranch_vccz
+        a.vop1(1, 4, kOne);           // then: v4 = 1.0
+        const std::size_t join = a.branch(2);  // s_branch
+        a.land(skip);
+        a.vop1(1, 4, kHalf);          // else: v4 = 0.5
+        a.land(join);
+        for (std::uint32_t k = 5; k < 8; ++k) a.vop1(1, k, kZero);
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        return a.w;
+    };
+    const gcn::LiftResult uniform = lift(program(false));
+    CHECK(lifted(uniform) && proof_says(uniform, "1 ifs on a bit every lane holds alike"));
+    CHECK(rejected_with(lift(program(true)), "s_cbranch_vccz tests a VCC that may differ between lanes"));
+}
+
 void cases() {
     // A sample under a varying EXEC whose coordinates were computed for every
     // pixel: lifted for every pixel, its texel written under EXEC.
@@ -884,6 +1039,47 @@ void cases() {
     };
     CHECK(lifted(lift(nested(false))));
     CHECK(rejected_with(lift(nested(true)), "a whole-quad block computes v12 from a value the lift may hold differently"));
+    // A register written in whole-quad mode for one region's quads (EXEC M),
+    // then by a sample under another region's EXEC (N & ~M), as the G-buffer
+    // shaders' two arms do: exact in M's quads and in the N & ~M pixels, so a
+    // comparison under N & ~M is lifted. Under the EXEC both regions came
+    // from it is still refused: in the pixels outside both, GCN kept the old
+    // value where the lift wrote the block's for every pixel.
+    const auto two_regions = [](bool compare_after) {
+        Asm a;
+        a.sop1(4, 20, kExec);
+        a.wqm();
+        a.interp(2, 0, 0);
+        a.interp(3, 0, 1);
+        a.vopc(1, kZero, 3);              // v_cmp_lt_f32 vcc, 0, v3: N
+        a.sop1(4, 26, kVcc);
+        a.vopc(1, kZero, 2);              // v_cmp_lt_f32 vcc, 0, v2: M
+        a.sop1(4, 28, kVcc);
+        a.sop1(36, 22, kVcc);             // s_and_saveexec_b64 s[22:23], vcc: EXEC = M
+        std::size_t skip = a.branch(8);
+        quad_coords(a);                   // v8, v9 in the quads of M
+        a.mimg(kSample, 4, 8, 0xf);
+        a.land(skip);
+        a.sop1(4, kExec, 22);
+        a.sop2(21, kExec, 26, 28);        // s_andn2_b64 exec, s[26:27], s[28:29]: EXEC = N & ~M
+        skip = a.branch(8);
+        a.sop1(4, 24, kExec);
+        a.wqm();
+        a.vop2(8, 10, kHalf, 3);          // v10, v11 in the quads of N & ~M
+        a.vop2(8, 11, kHalf, 2);
+        a.sop1(4, kExec, 24);
+        a.mimg(kSample, 8, 10, 0xf);      // v8..v11 under N & ~M, over the block's v8, v9
+        a.vopc(2, kZero, 9);              // v_cmp_eq_f32 vcc, 0, v9
+        a.vop2(0, 4, 256 + 8, 4);         // v_cndmask_b32 v4, v8, v4
+        a.land(skip);
+        a.sop1(4, kExec, 22);             // EXEC as the regions found it
+        if (compare_after) a.vopc(2, kZero, 9);
+        a.exp_mrt0(4);
+        a.w.push_back(0xbf810000u);
+        return a.w;
+    };
+    CHECK(lifted(lift(two_regions(false))));
+    CHECK(rejected_with(lift(two_regions(true)), "a lane mask is computed from a value the lift may hold differently"));
     // An if on a scalar condition inside the region: the coordinates come from
     // a block on one arm and from plain moves on the other; at the join they
     // hold GCN's value in the quads of the region's EXEC, as the sample needs.
@@ -1295,10 +1491,14 @@ struct Asm {
         w.push_back(0xf8000000u | 1u << 12 | 1u << 11 | 0xfu);
         w.push_back(v | v << 8 | v << 16 | v << 24);
     }
+    void exp_mrt0(std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint32_t q) {  // exp mrt0 x, y, z, q done vm
+        w.push_back(0xf8000000u | 1u << 12 | 1u << 11 | 0xfu);
+        w.push_back(x | y << 8 | z << 16 | q << 24);
+    }
 };
 
 // Operand codes and opcodes.
-constexpr std::uint32_t kV = 256, kC0 = 128, kOne = 242, kTwo = 244, kVcc = 106, kExec = 126;
+constexpr std::uint32_t kV = 256, kC0 = 128, kOne = 242, kTwo = 244, kFour = 246, kVcc = 106, kExec = 126;
 constexpr std::uint32_t kEndpgm = 1, kBranch = 2, kScc0 = 4, kScc1 = 5, kVccz = 6, kExecz = 8;  // SOPP
 constexpr std::uint32_t kSMov = 3, kSMov64 = 4, kSWqm = 10, kSAndSaveexec = 36;                 // SOP1
 constexpr std::uint32_t kSAddU32 = 0, kSAnd64 = 15, kSXor64 = 19, kSAndn2_64 = 21, kSLshl = 30;  // SOP2
@@ -1381,6 +1581,272 @@ Asm uniform_loop(bool counter_kept = false) {
     return a;
 }
 
+// ---- one invocation of a lifted pixel shader, control flow and all ----------------------
+// Runs the module's blocks from the entry, phis by the edge taken, with attr0
+// as given and the params block's user SGPRs, and returns mrt0. It knows the
+// instructions the loop and region programs below lift to; anything else fails.
+struct CfgRun {
+    bool ok = false;
+    std::string error;
+    std::array<float, 4> out{};
+    std::size_t blocks = 0;  // blocks entered
+};
+CfgRun run_cfg(const std::vector<std::uint32_t>& spv, const std::array<float, 4>& attr0, const std::array<std::uint32_t, 16>& user = {}) {
+    CfgRun run;
+    using Vec = std::vector<std::uint32_t>;
+    std::map<std::uint32_t, Vec> val;
+    std::map<std::uint32_t, std::uint32_t> storage, location, builtin, glsl_set;
+    struct Ptr {
+        std::uint32_t var = 0;
+        std::vector<std::uint32_t> idx;
+    };
+    std::map<std::uint32_t, Ptr> ptrs;
+    std::map<std::uint32_t, Vec> memory;  // Function and Private variables
+    std::map<std::uint32_t, std::size_t> label_at;  // label -> word index of its OpLabel
+    std::size_t entry = 0;
+    const auto fail = [&](const std::string& why) {
+        run.error = why;
+        return run;
+    };
+    bool in_function = false;
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+        if (n == 0 || i + n > spv.size()) return fail("malformed module");
+        const std::uint32_t* a = &spv[i + 1];
+        switch (op) {
+        case 11: glsl_set[a[0]] = 1; break;                          // OpExtInstImport
+        case 71:                                                     // OpDecorate
+            if (a[1] == 11) builtin[a[0]] = a[2];
+            if (a[1] == 30) location[a[0]] = a[2];
+            break;
+        case 59: if (!in_function) storage[a[1]] = a[2]; else storage[a[1]] = a[2]; break;  // OpVariable
+        case 43: val[a[1]] = {a[2]}; break;                          // OpConstant (low word)
+        case 41: val[a[1]] = {1}; break;                             // OpConstantTrue
+        case 42: val[a[1]] = {0}; break;                             // OpConstantFalse
+        case 44: {                                                   // OpConstantComposite
+            Vec v;
+            for (std::uint32_t k = 3; k < n; ++k) v.push_back(val[a[k - 1]].empty() ? 0 : val[a[k - 1]][0]);
+            val[a[1]] = v;
+            break;
+        }
+        case 1: val[a[1]] = {0, 0, 0, 0}; break;                     // OpUndef
+        case 54: in_function = true; break;                          // OpFunction
+        case 248:                                                    // OpLabel
+            label_at[a[0]] = i;
+            if (!entry) entry = i;
+            break;
+        default: break;
+        }
+        i += n;
+    }
+    if (!entry) return fail("no function body");
+    const auto f = [](std::uint32_t b) { return std::bit_cast<float>(b); };
+    const auto fb = [](float x) { return std::bit_cast<std::uint32_t>(x); };
+    const auto get = [&](std::uint32_t id) -> const Vec& { return val[id]; };
+    const auto s0 = [&](std::uint32_t id) -> std::uint32_t {
+        const Vec& v = val[id];
+        return v.empty() ? 0u : v[0];
+    };
+    std::size_t pc = entry;
+    std::uint32_t prev = 0, current = spv[entry + 1];
+    for (std::size_t steps = 0; steps < 200000; ++steps) {
+        const std::uint32_t n = spv[pc] >> 16, op = spv[pc] & 0xffff;
+        const std::uint32_t* a = &spv[pc + 1];
+        std::size_t next = pc + n;
+        const auto go = [&](std::uint32_t label) {
+            const auto it = label_at.find(label);
+            if (it == label_at.end()) return false;
+            prev = current;
+            current = label;
+            next = it->second;
+            ++run.blocks;
+            return true;
+        };
+        const auto bin_f = [&](auto fn) {
+            const Vec& x = get(a[2]);
+            const Vec& y = get(a[3]);
+            Vec r(x.size());
+            for (std::size_t k = 0; k < x.size(); ++k) r[k] = fn(f(x[k]), f(k < y.size() ? y[k] : 0));
+            val[a[1]] = r;
+        };
+        const auto bin_u = [&](auto fn) {
+            const Vec& x = get(a[2]);
+            const Vec& y = get(a[3]);
+            Vec r(x.size());
+            for (std::size_t k = 0; k < x.size(); ++k) r[k] = fn(x[k], k < y.size() ? y[k] : 0);
+            val[a[1]] = r;
+        };
+        switch (op) {
+        case 248: break;                                   // OpLabel
+        case 246: case 247: break;                         // OpLoopMerge, OpSelectionMerge
+        case 245: {                                        // OpPhi
+            bool found = false;
+            for (std::uint32_t k = 2; k + 1 < n; k += 2) {
+                if (a[k + 1] == prev) {
+                    val[a[1]] = get(a[k]);
+                    found = true;
+                }
+            }
+            if (!found) return fail("a phi without the edge taken");
+            break;
+        }
+        case 249: if (!go(a[0])) return fail("a branch to no label"); break;
+        case 250: if (!go(s0(a[0]) ? a[1] : a[2])) return fail("a branch to no label"); break;
+        case 253: case 56: run.ok = true; return run;      // OpReturn
+        case 252: return fail("OpKill");
+        case 65: {                                         // OpAccessChain
+            Ptr p;
+            const auto base = ptrs.find(a[2]);
+            if (base != ptrs.end()) p = base->second;
+            else p.var = a[2];
+            for (std::uint32_t k = 3; k + 1 < n; ++k) p.idx.push_back(s0(a[k]));
+            ptrs[a[1]] = p;
+            break;
+        }
+        case 61: {                                         // OpLoad
+            std::uint32_t var = a[2];
+            std::vector<std::uint32_t> idx;
+            if (const auto it = ptrs.find(a[2]); it != ptrs.end()) {
+                var = it->second.var;
+                idx = it->second.idx;
+            }
+            const std::uint32_t sc = storage.count(var) ? storage[var] : 99;
+            if (sc == 1 && location.count(var) && location[var] == 0) {
+                Vec v = {fb(attr0[0]), fb(attr0[1]), fb(attr0[2]), fb(attr0[3])};
+                val[a[1]] = idx.empty() ? v : Vec{v[idx[0] & 3]};
+            } else if (sc == 1 && builtin.count(var) && builtin[var] == 15) {
+                val[a[1]] = {fb(0.5f), fb(0.5f), 0, fb(1.0f)};
+            } else if (sc == 2) {                          // the params block: user SGPRs are member 2
+                if (idx.size() < 3 || idx[0] != 2) return fail("a params load other than a user SGPR");
+                val[a[1]] = {user[(idx[1] * 4 + idx[2]) & 15]};
+            } else if (sc == 7 || sc == 6) {
+                Vec m = memory[var];
+                val[a[1]] = idx.empty() ? m : Vec{idx[0] < m.size() ? m[idx[0]] : 0};
+            } else {
+                return fail("a load the test does not model (storage class " + std::to_string(sc) + ")");
+            }
+            break;
+        }
+        case 62: {                                         // OpStore
+            std::uint32_t var = a[0];
+            std::vector<std::uint32_t> idx;
+            if (const auto it = ptrs.find(a[0]); it != ptrs.end()) {
+                var = it->second.var;
+                idx = it->second.idx;
+            }
+            const std::uint32_t sc = storage.count(var) ? storage[var] : 99;
+            if (sc == 3 && location.count(var) && location[var] == 0) {
+                const Vec& v = get(a[1]);
+                for (std::size_t k = 0; k < 4 && k < v.size(); ++k) run.out[k] = f(v[k]);
+            } else if (sc == 7 || sc == 6) {
+                if (idx.empty()) {
+                    memory[var] = get(a[1]);
+                } else {
+                    Vec& m = memory[var];
+                    if (m.size() <= idx[0]) m.resize(idx[0] + 1);
+                    m[idx[0]] = s0(a[1]);
+                }
+            } else if (sc != 3) {
+                return fail("a store the test does not model");
+            }
+            break;
+        }
+        case 59: if (!memory.count(a[1])) memory[a[1]] = n > 4 ? get(a[3]) : Vec{0, 0, 0, 0}; break;  // a Function variable, initialised
+        case 81: {                                         // OpCompositeExtract
+            const Vec& v = get(a[2]);
+            val[a[1]] = {a[3] < v.size() ? v[a[3]] : 0};
+            break;
+        }
+        case 80: {                                         // OpCompositeConstruct
+            Vec v;
+            for (std::uint32_t k = 2; k < n - 1; ++k) {
+                const Vec& c = get(a[k]);
+                v.insert(v.end(), c.begin(), c.end());
+            }
+            val[a[1]] = v;
+            break;
+        }
+        case 124: val[a[1]] = get(a[2]); break;            // OpBitcast
+        case 109: val[a[1]] = {static_cast<std::uint32_t>(f(s0(a[2])))}; break;                       // OpConvertFToU
+        case 110: val[a[1]] = {static_cast<std::uint32_t>(static_cast<std::int32_t>(f(s0(a[2]))))}; break;  // OpConvertFToS
+        case 111: val[a[1]] = {fb(static_cast<float>(static_cast<std::int32_t>(s0(a[2]))))}; break;    // OpConvertSToF
+        case 112: val[a[1]] = {fb(static_cast<float>(s0(a[2])))}; break;                               // OpConvertUToF
+        case 127: val[a[1]] = {fb(-f(s0(a[2])))}; break;  // OpFNegate
+        case 129: bin_f([&](float x, float y) { return fb(x + y); }); break;
+        case 131: bin_f([&](float x, float y) { return fb(x - y); }); break;
+        case 133: bin_f([&](float x, float y) { return fb(x * y); }); break;
+        case 136: bin_f([&](float x, float y) { return fb(x / y); }); break;
+        case 128: bin_u([](std::uint32_t x, std::uint32_t y) { return x + y; }); break;
+        case 130: bin_u([](std::uint32_t x, std::uint32_t y) { return x - y; }); break;
+        case 149: {                                        // OpIAddCarry: {sum, carry}
+            const std::uint64_t r = static_cast<std::uint64_t>(s0(a[2])) + s0(a[3]);
+            val[a[1]] = {static_cast<std::uint32_t>(r), static_cast<std::uint32_t>(r >> 32)};
+            break;
+        }
+        case 150: {                                        // OpISubBorrow: {difference, borrow}
+            const std::uint32_t x = s0(a[2]), y = s0(a[3]);
+            val[a[1]] = {x - y, x < y ? 1u : 0u};
+            break;
+        }
+        case 132: bin_u([](std::uint32_t x, std::uint32_t y) { return x * y; }); break;
+        case 170: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x == y}; }); break;
+        case 171: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x != y}; }); break;
+        case 172: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x > y}; }); break;
+        case 173: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{static_cast<std::int32_t>(x) > static_cast<std::int32_t>(y)}; }); break;
+        case 174: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x >= y}; }); break;
+        case 175: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{static_cast<std::int32_t>(x) >= static_cast<std::int32_t>(y)}; }); break;
+        case 176: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x < y}; }); break;
+        case 177: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{static_cast<std::int32_t>(x) < static_cast<std::int32_t>(y)}; }); break;
+        case 178: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x <= y}; }); break;
+        case 179: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{static_cast<std::int32_t>(x) <= static_cast<std::int32_t>(y)}; }); break;
+        case 180: bin_f([](float x, float y) { return std::uint32_t{x == y}; }); break;
+        case 182: bin_f([](float x, float y) { return std::uint32_t{x != y && x == x && y == y}; }); break;
+        case 183: bin_f([](float x, float y) { return std::uint32_t{!(x == y)}; }); break;
+        case 184: bin_f([](float x, float y) { return std::uint32_t{x < y}; }); break;
+        case 185: bin_f([](float x, float y) { return std::uint32_t{!(x >= y)}; }); break;
+        case 186: bin_f([](float x, float y) { return std::uint32_t{x > y}; }); break;
+        case 187: bin_f([](float x, float y) { return std::uint32_t{!(x <= y)}; }); break;
+        case 188: bin_f([](float x, float y) { return std::uint32_t{x <= y}; }); break;
+        case 190: bin_f([](float x, float y) { return std::uint32_t{x >= y}; }); break;
+        case 164: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{(x != 0) == (y != 0)}; }); break;
+        case 165: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{(x != 0) != (y != 0)}; }); break;
+        case 166: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x || y}; }); break;
+        case 167: bin_u([](std::uint32_t x, std::uint32_t y) { return std::uint32_t{x && y}; }); break;
+        case 168: val[a[1]] = {s0(a[2]) ? 0u : 1u}; break;  // OpLogicalNot
+        case 169: val[a[1]] = s0(a[2]) ? get(a[3]) : get(a[4]); break;  // OpSelect (scalar condition)
+        case 194: bin_u([](std::uint32_t x, std::uint32_t y) { return x >> (y & 31); }); break;
+        case 195: bin_u([](std::uint32_t x, std::uint32_t y) { return static_cast<std::uint32_t>(static_cast<std::int32_t>(x) >> (y & 31)); }); break;
+        case 196: bin_u([](std::uint32_t x, std::uint32_t y) { return x << (y & 31); }); break;
+        case 197: bin_u([](std::uint32_t x, std::uint32_t y) { return x | y; }); break;
+        case 198: bin_u([](std::uint32_t x, std::uint32_t y) { return x ^ y; }); break;
+        case 199: bin_u([](std::uint32_t x, std::uint32_t y) { return x & y; }); break;
+        case 200: val[a[1]] = {~s0(a[2])}; break;          // OpNot
+        case 156: val[a[1]] = {f(s0(a[2])) != f(s0(a[2])) ? 1u : 0u}; break;  // OpIsNan
+        case 12: {                                         // OpExtInst (GLSL.std.450)
+            const std::uint32_t inst = a[3];
+            const float x = f(s0(a[4]));
+            const float y = n > 6 ? f(s0(a[5])) : 0.0f;
+            const float z = n > 7 ? f(s0(a[6])) : 0.0f;
+            float r = 0.0f;
+            switch (inst) {
+            case 4: r = std::fabs(x); break;
+            case 8: r = std::floor(x); break;
+            case 37: r = std::fmin(x, y); break;
+            case 40: r = std::fmax(x, y); break;
+            case 43: r = std::fmin(std::fmax(x, y), z); break;
+            case 50: r = std::fma(x, y, z); break;
+            default: return fail("GLSL.std.450 instruction " + std::to_string(inst));
+            }
+            val[a[1]] = {fb(r)};
+            break;
+        }
+        default: return fail("unsupported opcode " + std::to_string(op));
+        }
+        pc = next;
+    }
+    return fail("did not return");
+}
+
 // The per-lane exit idiom: each pixel adds 1.0 to v3 while v5 < its own count
 // v4, inside an s_cbranch_execz region on a per-pixel condition. `variant`
 // breaks one rule each (see the cases below).
@@ -1433,11 +1899,106 @@ void loops() {
         CHECK(proof_has(r, "divergent, the per-lane exit idiom on s12"));
         CHECK(count_op(r.spirv, kOpLoopMerge) == 1);
     }
+    // The interpreter on the one-exit loop: each pixel adds 1.0 per count.
+    {
+        const gcn::LiftResult r = lift(divergent_loop());
+        for (const float count : {0.0f, 3.0f, 5.0f}) {
+            const CfgRun run = run_cfg(r.spirv, {count, 1.0f, 0, 0});
+            if (!run.ok) std::fprintf(stderr, "divergent loop: %s\n", run.error.c_str());
+            CHECK(run.ok && run.out[0] == count);
+        }
+    }
+    // Two ways out, as the ray-cast shaders leave: each inside an
+    // s_cbranch_execz region on the lanes leaving, with moves those lanes make
+    // on the way out, and an instruction no branch reaches after the back
+    // edge. Each pixel: while i < limit, acc += step and leave once acc > 4;
+    // the way out it took marks v6 (1.0 or 2.0), and the first also v7.
+    const auto two_ways_out = [](bool distinct_masks) {
+        Asm a;
+        a.interp(2, 0, 0);                         // v2 = the limit
+        a.interp(3, 0, 1);                         // v3 = the step
+        a.vop1(kVMov, 4, kC0);                     // v4 = i
+        a.vop1(kVMov, 5, kC0);                     // v5 = acc
+        a.vop1(kVMov, 6, kC0);                     // v6 = the way out
+        a.vop1(kVMov, 7, kC0);                     // v7
+        a.sop1(kSMov64, 10, kExec);                // EXEC kept for after the loop
+        a.sop1(kSMov64, 12, kExec);                // the loop mask L
+        if (distinct_masks) a.sop1(kSMov64, 16, kExec);
+        const std::uint32_t header = a.at();
+        a.vopc(kCmpGtF32, kV + 2, 4);              // vcc = limit > i: stay
+        a.sop1(kSMov64, 14, kExec);
+        a.sop2(kSAndn2_64, kExec, 14, kVcc);       // EXEC = the lanes leaving
+        a.vop1(kVMov, 6, kOne);                    // on the way out: v6 = 1.0
+        const std::size_t skip1 = a.forward(kExecz);
+        a.vop2(kVAddF32, 7, kOne, 5);              // v7 = acc + 1
+        a.sop2(kSAndn2_64, 12, 12, kExec);         // L loses them
+        const std::size_t exit1 = a.forward(kScc0);
+        a.land(skip1);
+        a.sop2(kSAnd64, kExec, 14, 12);            // EXEC = the lanes staying
+        a.vop2(kVAddF32, 5, kV + 3, 5);            // acc += step
+        a.vopc(kCmpLtF32, kFour, 5);               // vcc = 4 < acc: leave
+        a.sop1(kSAndSaveexec, 14, kVcc);           // EXEC = the lanes leaving
+        a.vop1(kVMov, 6, kTwo);                    // on the way out: v6 = 2.0
+        const std::size_t skip2 = a.forward(kExecz);
+        const std::uint32_t m2 = distinct_masks ? 16 : 12;
+        a.sop2(kSAndn2_64, m2, m2, kExec);
+        const std::size_t exit2 = a.forward(kScc0);
+        a.land(skip2);
+        a.sop2(kSAnd64, kExec, 14, 12);
+        a.vop2(kVAddF32, 4, kOne, 4);              // i += 1
+        a.branch(kBranch, header);
+        a.vop1(kVMov, 6, kC0 + 9);                 // no branch reaches it
+        a.land(exit1);
+        a.land(exit2);
+        a.sop1(kSMov64, kExec, 10);
+        a.exp_mrt0(5, 6, 4, 7);
+        a.sopp(kEndpgm);
+        return a;
+    };
+    {
+        const gcn::LiftResult r = lift(two_ways_out(false));
+        CHECK(lifted_valid(r, "a divergent loop with two ways out"));
+        CHECK(proof_has(r, "2 exits joined"));
+        CHECK(proof_has(r, "(in the region at"));
+        CHECK(proof_has(r, "after the back edge is reached by no branch and is not lifted"));
+        const auto expect = [](float limit, float step) {
+            float i = 0, acc = 0, way = 0, v7 = 0;
+            for (;;) {
+                if (!(limit > i)) {
+                    way = 1.0f;
+                    v7 = acc + 1.0f;
+                    break;
+                }
+                acc += step;
+                if (4.0f < acc) {
+                    way = 2.0f;
+                    break;
+                }
+                i += 1.0f;
+            }
+            return std::array<float, 4>{acc, way, i, v7};
+        };
+        for (const auto [limit, step] : {std::pair{3.0f, 1.0f}, std::pair{10.0f, 1.5f}, std::pair{0.0f, 1.0f}, std::pair{2.0f, 5.0f}}) {
+            const CfgRun run = run_cfg(r.spirv, {limit, step, 0, 0});
+            if (!run.ok) std::fprintf(stderr, "a divergent loop with two ways out: %s\n", run.error.c_str());
+            CHECK(run.ok);
+            const std::array<float, 4> want = expect(limit, step);
+            for (std::size_t k = 0; k < 4 && run.ok; ++k) {
+                if (run.out[k] != want[k]) {
+                    std::fprintf(stderr, "two ways out (limit %g, step %g): output %zu is %g, expected %g\n", limit, step, k, run.out[k], want[k]);
+                    ++g_failures;
+                }
+            }
+        }
+    }
+    // The second way out taking lanes out of another mask: refused.
+    CHECK(rejected_with(lift(two_ways_out(true)), "on different masks"));
     // The loop mask must start as EXEC.
     CHECK(rejected_with(lift(divergent_loop(1)), "does not start as EXEC"));
     // GCN may run more iterations than the pixel: a scalar the loop writes is dead after it.
     CHECK(rejected_with(lift(divergent_loop(2)), "written inside the divergent loop"));
-    // A second way out of the loop.
+    // A second way out of the loop: acc += x until s5 reaches s0 or 7, the
+    // exits joined at the merge; run for both ways out.
     {
         Asm b;
         b.interp(2, 0, 0);
@@ -1455,26 +2016,48 @@ void loops() {
         b.land(exit2);
         b.exp_mrt0(3);
         b.sopp(kEndpgm);
-        CHECK(rejected_with(lift(b), "a second exit from the loop"));
+        const gcn::LiftResult r = lift(b);
+        CHECK(lifted_valid(r, "a uniform loop with two exits"));
+        CHECK(proof_has(r, "2 exits joined"));
+        for (const auto [count, want] : {std::pair{3u, 3.0f * 1.5f}, std::pair{12u, 7.0f * 1.5f}}) {
+            std::array<std::uint32_t, 16> user{};
+            user[0] = count;
+            const CfgRun run = run_cfg(r.spirv, {1.5f, 0, 0, 0}, user);
+            if (!run.ok) std::fprintf(stderr, "a uniform loop with two exits: %s\n", run.error.c_str());
+            CHECK(run.ok && run.out[0] == want);
+        }
     }
-    // A branch from inside the loop past its exit.
-    {
+    // A branch from inside the loop past its exit, over an instruction no
+    // branch reaches (the copies of a dead path the compiler leaves after the
+    // back edge): the exit is there, and that instruction is not lifted. One
+    // a branch does reach is still refused.
+    const auto past_exit = [](bool reached) {
         Asm b;
         b.interp(2, 0, 0);
         b.vop1(kVMov, 3, kC0);
         b.sop1(kSMov, 5, kC0);
+        b.sopc(kSCmpEqI32, 0, kC0);                // s0 == 0: around the loop (and, reached, into the skipped instruction)
+        const std::size_t into = b.forward(kScc1);
         const std::uint32_t header = b.at();
         b.sopc(kSCmpGeI32, 5, 0);
         const std::size_t far = b.forward(kScc1);
         b.vop2(kVAddF32, 3, kV + 2, 3);
         b.sop2(kSAddU32, 5, 5, kC0 + 1);
         b.branch(kBranch, header);
+        if (reached) b.land(into);
         b.vop1(kVMov, 3, kC0);  // skipped by the exit
         b.land(far);
+        if (!reached) b.land(into);
         b.exp_mrt0(3);
         b.sopp(kEndpgm);
-        CHECK(rejected_with(lift(b), "for somewhere other than its exit"));
+        return b;
+    };
+    {
+        const gcn::LiftResult r = lift(past_exit(false));
+        CHECK(lifted_valid(r, "an exit past instructions no branch reaches"));
+        CHECK(proof_has(r, "after the back edge is reached by no branch and is not lifted"));
     }
+    CHECK(rejected_with(lift(past_exit(true)), "for somewhere other than its exit"));
     // SCC carried around the loop: read at the header before the body writes it.
     {
         Asm b;
@@ -2087,6 +2670,15 @@ struct Asm {
     void smrd(std::uint32_t op, std::uint32_t sdst, std::uint32_t sbase, std::uint32_t offset_dw) {
         w.push_back(0xc0000000u | op << 22 | sdst << 15 | (sbase / 2) << 9 | 1u << 8 | offset_dw);
     }
+    // The same with the byte offset in SGPR `soff` (IMM clear).
+    void smrd_reg(std::uint32_t op, std::uint32_t sdst, std::uint32_t sbase, std::uint32_t soff) {
+        w.push_back(0xc0000000u | op << 22 | sdst << 15 | (sbase / 2) << 9 | soff);
+    }
+    // tbuffer_load_format_* (op 0-3) vdata, vaddr (an index, idxen), s[srsrc..+3], soffset 0, format dfmt/nfmt.
+    void tbuffer_load(std::uint32_t op, std::uint32_t vdata, std::uint32_t vaddr, std::uint32_t srsrc, std::uint32_t dfmt, std::uint32_t nfmt) {
+        w.push_back(0xe8000000u | nfmt << 23 | dfmt << 19 | op << 16 | 1u << 13);
+        w.push_back(vaddr | vdata << 8 | (srsrc / 4) << 16 | 128u << 24);
+    }
     void vop1(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0) { w.push_back(0x7e000000u | vdst << 17 | op << 9 | src0); }
     // `vsrc1` is the 8-bit field: a VGPR index, or for v_readlane/v_writelane_b32 the lane's scalar code.
     void vop2(std::uint32_t op, std::uint32_t vdst, std::uint32_t src0, std::uint32_t vsrc1) { w.push_back(op << 25 | vdst << 17 | vsrc1 << 9 | src0); }
@@ -2129,7 +2721,9 @@ constexpr std::uint32_t kSampleLz = 39;                                        /
 
 // Translates as the renderer's no-fallback variant (user SGPRs s0..s3,
 // interpolation at the centre) and lifts against that reference.
-gcn::LiftResult lift_words(const std::vector<std::uint32_t>& words, gcn::Program* out = nullptr) {
+// `exclude`: resource paths left to the page table (cb_ssbo_exclude).
+gcn::LiftResult lift_words(const std::vector<std::uint32_t>& words, gcn::Program* out = nullptr, gcn::TranslateResult* reference = nullptr,
+                           const std::vector<std::string>& exclude = {}) {
     const gcn::Program p = gcn::decode(words.data(), words.size());
     CHECK(p.errors.empty());
     if (out) *out = p;
@@ -2140,9 +2734,11 @@ gcn::LiftResult lift_words(const std::vector<std::uint32_t>& words, gcn::Program
     o.descriptor_set = 1;
     o.cb_ssbo = true;
     o.cb_no_fallback = true;
+    o.cb_ssbo_exclude = exclude;
     const gcn::TranslateResult ref = gcn::translate(p, o);
     if (!ref.ok()) std::fprintf(stderr, "reference failed: %s\n", ref.errors[0].c_str());
     CHECK(ref.ok());
+    if (reference) *reference = ref;
     return gcn::lift_pixel_shader(p, o, ref);
 }
 
@@ -2240,6 +2836,34 @@ void spills() {
     }
     // A lane nothing parked a scalar in: the reference shuffles, reading another pixel.
     CHECK(rejected_with(lift_words(spill([](Asm&) {}, 4)), "no v_writelane_b32 alone reaches"));
+    // Read back, v5 is written again under a varying EXEC (an execz region):
+    // GCN's value where EXEC is set, the parked word or what the lane held
+    // before elsewhere - so exact only where EXEC was set. Read there (inside
+    // the region) it lifts, and so does a value made from it under the same
+    // EXEC; exported after the region before written whole, it does not.
+    {
+        const auto reuse = [](bool export_v5_after) {
+            Asm a = start();                        // 000000
+            a.vop2(kWritelane, 5, 2, kC0 + 3);      // 000008 v_writelane_b32 v5, s2, 3
+            a.sop1(kSMov, 2, kC0);                  // 00000c s_mov_b32 s2, 0
+            a.vop2(kReadlane, 6, kV + 5, kC0 + 3);  // 000010 v_readlane_b32 s6, v5, 3
+            a.vopc(kCmpLt, kHalf, 2);               // 000014 v_cmp_lt_f32 vcc, 0.5, v2
+            a.sop1(kSAndSaveexec, 10, kVcc);        // 000018 s_and_saveexec_b64 s[10:11], vcc
+            a.branch(kExecz, 0x28);                 // 00001c s_cbranch_execz 0x28
+            a.vop1(kVMov, 5, kV + 2);               // 000020 v_mov_b32 v5, v2: over the parked lane
+            a.vop2(kVMul, 7, kV + 5, 2);            // 000024 v_mul_f32 v7, v5, v2: v5 read where it is exact
+            a.sop1(kSMov64, kExec, 10);             // 000028 s_mov_b64 exec, s[10:11]
+            if (!export_v5_after) a.vop1(kVMov, 5, kOne);  // v_mov_b32 v5, 1.0: written whole
+            a.vop2(kVMul, 3, 6, 2);                 // v_mul_f32 v3, s6, v2
+            a.exp_mrt0(3, 7, 5, 3);
+            a.endpgm();
+            return a.w;
+        };
+        const gcn::LiftResult r = lift_words(reuse(false));
+        CHECK(lifted_valid(r));
+        CHECK(proof_has(r, "1 over a VGPR whose lanes held spilled words, exact only where EXEC was set"));
+        CHECK(rejected_with(lift_words(reuse(true)), "an export reads a value the lift may hold differently from GCN in pixels of EXEC"));
+    }
     // v5 differs between lanes now: it is not this pixel's word.
     CHECK(rejected_with(lift_words(spill([](Asm& a) { a.vop1(kVMov, 7, kV + 5); })), "v5 holds a word in one lane"));
     // Written whole again it is, but the cell is gone (the reference shuffles).
@@ -2325,9 +2949,10 @@ void spills() {
 }
 
 void descriptor_loads() {
-    // s[2:3] copied to s[20:21]: the reference stops binding the table (its
-    // registers are written) and walks the page table for both loads. They
-    // are a T# and an S#, which the sample binds by path.
+    // s[2:3] copied to s[20:21], the table left to the page table (as the
+    // translator leaves a V# it cannot show holds at every load): the
+    // reference walks the page table for both loads. They are a T# and an S#,
+    // which the sample binds by path.
     const auto sample = [](const std::function<void(Asm&)>& after) {
         Asm a;
         a.sop1(kSMov, 20, 2);
@@ -2343,15 +2968,327 @@ void descriptor_loads() {
         a.endpgm();
         return a.w;
     };
-    const gcn::LiftResult ok = lift_words(sample([](Asm&) {}));
+    const std::vector<std::string> table = {"user_sgpr[2]"};
+    const gcn::LiftResult ok = lift_words(sample([](Asm&) {}), nullptr, nullptr, table);
     CHECK(lifted_valid(ok));
     CHECK(proof_has(ok, "2 scalar loads the reference walks the page table for hold descriptors only"));
     // A word of them read as data: the reference reads it from guest memory.
-    CHECK(rejected_with(lift_words(sample([](Asm& a) {
-                            a.vop1(kVMov, 6, 16);       // v_mov_b32 v6, s16 (a copy is still a descriptor)
-                            a.vop2(kVAdd, 0, kV + 0, 6);  // v_add_f32 v0, v0, v6
-                        })),
+    const auto as_data = [](Asm& a) {
+        a.vop1(kVMov, 6, 16);         // v_mov_b32 v6, s16 (a copy is still a descriptor)
+        a.vop2(kVAdd, 0, kV + 0, 6);  // v_add_f32 v0, v0, v6
+    };
+    CHECK(rejected_with(lift_words(sample(as_data), nullptr, nullptr, table), "data from a scalar load the reference walks the page table for"));
+    // Not excluded, the copies of s[2:3] are its definitions (the translator's
+    // resolve_copy_keys): the table is bound, and its words are data like any.
+    gcn::TranslateResult ref;
+    const gcn::LiftResult bound = lift_words(sample(as_data), nullptr, &ref);
+    CHECK(lifted_valid(bound));
+    CHECK(ref.buffers.size() == 1 && ref.buffers[0].path.str() == "user_sgpr[2]" && ref.buffer_at.count(8) && ref.buffer_at.count(12));
+}
+
+// One invocation of a straight-line lifted pixel shader that reads only the
+// params block and storage buffers: `user` the user SGPRs, `bias` and `range`
+// StageParams::cb_bias_dw and cb_stride, `buffers` each binding's dwords.
+// Returns mrt0's four words, or an error.
+struct ScalarRun {
+    bool ok = false;
+    std::string error;
+    std::array<std::uint32_t, 4> mrt0{};
+};
+ScalarRun run_scalar_ps(const std::vector<std::uint32_t>& spv, const std::array<std::uint32_t, 16>& user, const std::array<std::uint32_t, 16>& bias,
+                        const std::array<std::uint32_t, 16>& range, const std::map<std::uint32_t, std::vector<std::uint32_t>>& buffers) {
+    ScalarRun run;
+    using Vec = std::array<std::uint32_t, 4>;
+    std::map<std::uint32_t, Vec> val;
+    std::map<std::uint32_t, std::uint32_t> constants, location, binding, storage;
+    struct Chain {
+        std::uint32_t base;
+        std::vector<std::uint32_t> idx;
+    };
+    std::map<std::uint32_t, Chain> chains;
+    const auto fail = [&](const std::string& why) {
+        run.error = why;
+        return run;
+    };
+    bool in_body = false, stored = false;
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+        if (n == 0 || i + n > spv.size()) return fail("malformed module");
+        const std::uint32_t* a = &spv[i + 1];
+        i += n;
+        switch (op) {
+        case 71:  // OpDecorate
+            if (a[1] == 30) location[a[0]] = a[2];
+            if (a[1] == 33) binding[a[0]] = a[2];
+            continue;
+        case 59: storage[a[1]] = a[2]; continue;  // OpVariable
+        case 43: constants[a[1]] = a[2]; continue;
+        case 41: constants[a[1]] = 1; continue;
+        case 42: constants[a[1]] = 0; continue;
+        case 50: constants[a[1]] = a[2]; continue;  // OpSpecConstant: its default
+        case 248: in_body = true; continue;
+        default: break;
+        }
+        if (!in_body) continue;
+        const auto get = [&](std::uint32_t id) -> Vec {
+            if (const auto c = constants.find(id); c != constants.end()) return {c->second, 0, 0, 0};
+            return val[id];
+        };
+        const auto g0 = [&](std::uint32_t id) { return get(id)[0]; };
+        const auto set = [&](std::uint32_t id, std::uint32_t v) { val[id] = {v, 0, 0, 0}; };
+        switch (op) {
+        case 65: {  // OpAccessChain
+            Chain c{a[2], {}};
+            for (std::uint32_t k = 3; k < n - 1; ++k) c.idx.push_back(g0(a[k]));
+            chains[a[1]] = c;
+            break;
+        }
+        case 132: set(a[1], g0(a[2]) * g0(a[3])); break;   // OpIMul
+        case 170: set(a[1], g0(a[2]) == g0(a[3])); break;  // OpIEqual
+        case 171: set(a[1], g0(a[2]) != g0(a[3])); break;  // OpINotEqual
+        case 61: {  // OpLoad
+            const auto c = chains.find(a[2]);
+            if (c == chains.end()) return fail("a load of something other than the params or a storage buffer");
+            const std::uint32_t base = c->second.base;
+            const auto& idx = c->second.idx;
+            if (storage[base] == 2) {  // Uniform: the params block
+                if (idx.size() != 3) return fail("a params load of another shape");
+                const std::uint32_t k = idx[1] * 4 + idx[2];
+                if (k >= 16) return fail("a params entry past 16");
+                if (idx[0] == 2) set(a[1], user[k]);
+                else if (idx[0] == 4) set(a[1], bias[k]);
+                else if (idx[0] == 5) set(a[1], range[k]);
+                else return fail("a params member the test does not give: " + std::to_string(idx[0]));
+            } else if (storage[base] == 12) {  // StorageBuffer
+                const auto b = buffers.find(binding[base]);
+                if (b == buffers.end() || idx.size() != 2 || idx[0] != 0) return fail("a storage buffer the test does not give");
+                if (idx[1] >= b->second.size()) return fail("a storage-buffer read past the binding (dword " + std::to_string(idx[1]) + ")");
+                set(a[1], b->second[idx[1]]);
+            } else {
+                return fail("a load from another storage class");
+            }
+            break;
+        }
+        case 62:  // OpStore
+            if (storage[a[0]] != 3 || !location.count(a[0]) || location[a[0]] != 0) return fail("a store to something other than mrt0");
+            run.mrt0 = get(a[1]);
+            stored = true;
+            break;
+        case 80: {  // OpCompositeConstruct
+            Vec v{};
+            for (std::uint32_t k = 2; k < n - 1 && k < 6; ++k) v[k - 2] = g0(a[k]);
+            val[a[1]] = v;
+            break;
+        }
+        case 124: val[a[1]] = get(a[2]); break;                         // OpBitcast
+        case 128: set(a[1], g0(a[2]) + g0(a[3])); break;                // OpIAdd
+        case 176: set(a[1], g0(a[2]) < g0(a[3])); break;                // OpULessThan
+        case 194: set(a[1], g0(a[2]) >> (g0(a[3]) & 31)); break;        // OpShiftRightLogical
+        case 199: set(a[1], g0(a[2]) & g0(a[3])); break;                // OpBitwiseAnd
+        case 169: val[a[1]] = g0(a[2]) ? get(a[3]) : get(a[4]); break;  // OpSelect
+        case 253: case 56: break;                                       // OpReturn, OpFunctionEnd
+        default: return fail("unsupported opcode " + std::to_string(op));
+        }
+    }
+    if (!stored) return fail("mrt0 is not written");
+    run.ok = true;
+    return run;
+}
+
+// s_buffer_load_dwordx4 at a register offset from a V# in a table: the
+// reference binds the V#'s whole range (BufferBinding::ranged), and the lift
+// reads dword (offset >> 2) + k of it, 0 at or past the range, as GCN's range
+// check returns - here through an interpreter of the lifted module, at
+// offsets inside, straddling and past the range and with the low bits set.
+void ranged_loads() {
+    constexpr std::uint32_t kBufferLoadX4 = 10;  // SMRD s_buffer_load_dwordx4
+    const auto program = [&] {
+        Asm a;
+        a.smrd(kLoadX4, 8, 2, 4);                 // s_load_dwordx4 s[8:11], s[2:3], 0x4: the V#
+        a.sopp(kWaitcnt, 0);
+        a.smrd_reg(kBufferLoadX4, 12, 8, 1);      // s_buffer_load_dwordx4 s[12:15], s[8:11], s1
+        a.sopp(kWaitcnt, 0);
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop1(kVMov, k, 12 + k);
+        a.exp_mrt0(0, 1, 2, 3);
+        a.endpgm();
+        return a.w;
+    };
+    gcn::TranslateResult ref;
+    const gcn::LiftResult l = lift_words(program(), nullptr, &ref);
+    CHECK(lifted_valid(l));
+    CHECK(ref.buffers.size() == 2 && ref.buffers[1].ranged && !ref.buffers[1].indexed && !ref.buffers[0].ranged &&
+          ref.buffers[1].path.str() == "user_sgpr[2]->load(+16)" && ref.buffer_at.count(8) && ref.buffer_at.at(8) == 1);
+    CHECK(proof_has(l, "1 at a run-time offset, each dword checked against the V#'s range"));
+    if (!l.ok() || ref.buffers.size() != 2) return;
+    const std::uint32_t b0 = ref.buffers[0].binding, b1 = ref.buffers[1].binding;
+    std::vector<std::uint32_t> data(64);
+    for (std::uint32_t k = 0; k < 64; ++k) data[k] = 0x1000u + k;
+    for (const auto& [offset, range, bias] : {std::array<std::uint32_t, 3>{16, 10, 0}, {33, 10, 0}, {40, 10, 0}, {36, 10, 0}, {0, 0, 0},
+                                              {8, 10, 6}, {0xfffffffcu, 10, 0}, {28, 64, 2}}) {
+        std::array<std::uint32_t, 16> user{}, biases{}, ranges{};
+        user[1] = offset;
+        biases[1] = bias;
+        ranges[1] = range;
+        const ScalarRun r = run_scalar_ps(l.spirv, user, biases, ranges, {{b0, std::vector<std::uint32_t>(16, 0)}, {b1, data}});
+        if (!r.ok) std::fprintf(stderr, "ranged load at %u: %s\n", offset, r.error.c_str());
+        CHECK(r.ok);
+        for (std::uint32_t k = 0; k < 4 && r.ok; ++k) {
+            const std::uint32_t at = (offset >> 2) + k;
+            const std::uint32_t want = at < range ? data[bias + at] : 0;
+            if (r.mrt0[k] != want) {
+                std::fprintf(stderr, "ranged load at byte %u (range %u dwords, bias %u): dword %u read %08x, expected %08x\n", offset, range, bias, k,
+                             r.mrt0[k], want);
+                ++g_failures;
+            }
+        }
+    }
+    // Left to the page table (the reference walks it, without a binding), the
+    // words are data the lift does not have.
+    CHECK(rejected_with(lift_words(program(), nullptr, nullptr, {"user_sgpr[2]->load(+16)"}),
                         "data from a scalar load the reference walks the page table for"));
+}
+
+// tbuffer_load_format_* by index from a V# in a table: the instruction's
+// format with the identity select (gcn::tbuffer_dst_sel), whatever the V#'s
+// DST_SEL - the lifted module reads the element and never the params' word 3
+// (the interpreter refuses a load of it), and a VGPR past the format's
+// components reads 0.
+void typed_loads() {
+    const auto program = [&](std::uint32_t op, std::uint32_t dfmt) {
+        Asm a;
+        a.smrd(kLoadX4, 8, 2, 4);  // s_load_dwordx4 s[8:11], s[2:3], 0x4: the V#
+        a.sopp(kWaitcnt, 0);
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop1(kVMov, k, kC0 + 9);  // v0..v3 = 9, to see what a load leaves
+        a.vop1(kVMov, 4, 1);       // v4 = s1: the element's index
+        a.tbuffer_load(op, 0, 4, 8, dfmt, 7);
+        a.sopp(kWaitcnt, 0);
+        a.exp_mrt0(0, 1, 2, 3);
+        a.endpgm();
+        return a.w;
+    };
+    std::vector<std::uint32_t> data(64);
+    for (std::uint32_t k = 0; k < 64; ++k) data[k] = 0x2000u + k;
+    for (const auto& [op, dfmt, comps] : {std::array<std::uint32_t, 3>{3, 14, 4}, {3, 13, 3}, {2, 11, 2}, {0, 4, 1}, {1, 14, 4}}) {
+        gcn::TranslateResult ref;
+        const gcn::LiftResult l = lift_words(program(op, dfmt), nullptr, &ref);
+        CHECK(lifted_valid(l));
+        CHECK(ref.buffers.size() == 2 && ref.buffers[1].indexed && !ref.buffers[1].ranged);
+        if (!l.ok() || ref.buffers.size() != 2) continue;
+        for (const std::uint32_t index : {0u, 3u}) {
+            std::array<std::uint32_t, 16> user{}, bias{}, stride{};
+            user[1] = index;
+            bias[1] = 2;
+            stride[1] = 16;  // StageParams::cb_stride: the V#'s stride in bytes
+            const ScalarRun r = run_scalar_ps(l.spirv, user, bias, stride, {{ref.buffers[0].binding, std::vector<std::uint32_t>(16, 0)}, {ref.buffers[1].binding, data}});
+            if (!r.ok) std::fprintf(stderr, "typed load dfmt %u: %s\n", dfmt, r.error.c_str());
+            CHECK(r.ok);
+            for (std::uint32_t k = 0; k < 4 && r.ok; ++k) {
+                const std::uint32_t want = k > op ? 9u : k < comps ? data[2 + index * 4 + k] : 0u;
+                if (r.mrt0[k] != want) {
+                    std::fprintf(stderr, "typed load op %u dfmt %u, element %u: component %u read %08x, expected %08x\n", op, dfmt, index, k, r.mrt0[k], want);
+                    ++g_failures;
+                }
+            }
+        }
+    }
+}
+
+// Copies of a V#: a spill to lanes of a VGPR and back (v_writelane_b32 /
+// v_readlane_b32 of a spill cell), or s_mov, define what they copy, so a
+// constant buffer read through a copy of its V# is bound - where every copy
+// reaching the load copies that V#. Otherwise it stays on the page table and
+// its data is not lifted.
+void copies() {
+    constexpr std::uint32_t kBufferLoad = 8;  // SMRD s_buffer_load_dword
+    // s[16:19] (the V# at dword 4 of the table s[2:3]) and s[24:27] (at dword
+    // 8) loaded; `spill` parks one in lanes 4-7 of v3; s[16:19] clobbered;
+    // s[20:23] from the lanes; s_buffer_load_dword s0, s[20:23], 0x2 as data.
+    const auto program = [](const std::function<void(Asm&)>& spill) {
+        Asm a;
+        a.smrd(kLoadX4, 16, 2, 4);
+        a.smrd(kLoadX4, 24, 2, 8);
+        a.sopp(kWaitcnt, 0);
+        spill(a);
+        for (std::uint32_t k = 0; k < 4; ++k) a.sop1(kSMov, 16 + k, kC0);  // s16..s19 = 0
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop2(kReadlane, 20 + k, kV + 3, kC0 + 4 + k);  // v_readlane_b32 s(20+k), v3, 4+k
+        a.smrd(kBufferLoad, 0, 20, 2);
+        a.sopp(kWaitcnt, 0);
+        a.vop1(kVMov, 0, 0);  // v_mov_b32 v0, s0
+        a.exp_mrt0(0, 0, 0, 0);
+        a.endpgm();
+        return a.w;
+    };
+    const auto park = [](Asm& a, std::uint32_t s) {
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop2(kWritelane, 3, s + k, kC0 + 4 + k);  // v_writelane_b32 v3, s(s+k), 4+k
+    };
+    const auto bound_at = [](const gcn::TranslateResult& ref, std::uint32_t at, const char* path) {
+        const auto it = ref.buffer_at.find(at);
+        return it != ref.buffer_at.end() && it->second < ref.buffers.size() && ref.buffers[it->second].path.str() == path;
+    };
+    {  // straight-line: the cell holds the V# at dword 4
+        gcn::TranslateResult ref;
+        const gcn::LiftResult r = lift_words(program([&](Asm& a) { park(a, 16); }), nullptr, &ref);
+        CHECK(lifted_valid(r));
+        CHECK(bound_at(ref, 0x3c, "user_sgpr[2]->load(+16)"));  // the path counts bytes
+        CHECK(ref.walks.empty());
+    }
+    // An if on user data whose arms park different V#s: the cell is one or
+    // the other, so the load stays on the page table (the walk's order would
+    // have said the else arm's).
+    const auto two_arms = [&](std::uint32_t then_v, std::uint32_t else_v) {
+        return program([&, then_v, else_v](Asm& a) {
+            a.sopc(kSCmpEqU32, 0, kC0);  // s_cmp_eq_u32 s0, 0
+            const std::size_t branch = a.w.size();
+            a.sopp(kScc1, 0);  // patched below
+            park(a, then_v);
+            const std::size_t jump = a.w.size();
+            a.sopp(kBranch, 0);
+            const std::uint32_t else_at = a.at();
+            park(a, else_v);
+            const std::uint32_t join = a.at();
+            a.w[branch] = 0xbf800000u | kScc1 << 16 | static_cast<std::uint16_t>((else_at - static_cast<std::uint32_t>(branch * 4) - 4) / 4);
+            a.w[jump] = 0xbf800000u | kBranch << 16 | static_cast<std::uint16_t>((join - static_cast<std::uint32_t>(jump * 4) - 4) / 4);
+        });
+    };
+    {
+        gcn::TranslateResult ref;
+        const std::vector<std::uint32_t> w = two_arms(16, 24);
+        CHECK(rejected_with(lift_words(w, nullptr, &ref), "data from a scalar load the reference walks the page table for"));
+        bool walked = false;
+        for (const auto& [why, n] : ref.walks) walked |= why.find("registers reused") != std::string::npos;
+        CHECK(walked);
+    }
+    {  // both arms park the same V#: bound
+        gcn::TranslateResult ref;
+        const std::vector<std::uint32_t> w = two_arms(16, 16);
+        CHECK(lifted_valid(lift_words(w, nullptr, &ref)));
+        CHECK(ref.walks.empty());
+    }
+    {  // user data: the V# s[0:3] parked, s0 clobbered, back in s[8:11]
+        Asm a;
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop2(kWritelane, 3, k, kC0 + k);
+        a.sop1(kSMov, 0, kC0);
+        for (std::uint32_t k = 0; k < 4; ++k) a.vop2(kReadlane, 8 + k, kV + 3, kC0 + k);
+        a.smrd(kBufferLoad, 4, 8, 1);  // s_buffer_load_dword s4, s[8:11], 0x1
+        a.sopp(kWaitcnt, 0);
+        a.vop1(kVMov, 0, 4);
+        a.exp_mrt0(0, 0, 0, 0);
+        a.endpgm();
+        gcn::TranslateResult ref;
+        CHECK(lifted_valid(lift_words(a.w, nullptr, &ref)));
+        CHECK(bound_at(ref, 0x24, "user_sgpr[0]"));
+        // ... but not when the clobber reaches the load instead of the copy.
+        Asm b;
+        b.sop1(kSMov, 0, kC0);
+        b.smrd(kBufferLoad, 4, 0, 1);  // s_buffer_load_dword s4, s[0:3], 0x1
+        b.sopp(kWaitcnt, 0);
+        b.vop1(kVMov, 0, 4);
+        b.exp_mrt0(0, 0, 0, 0);
+        b.endpgm();
+        gcn::TranslateResult ref_b;
+        lift_words(b.w, nullptr, &ref_b);
+        CHECK(!bound_at(ref_b, 4, "user_sgpr[0]"));
+    }
 }
 
 void cselect() {
@@ -2444,21 +3381,602 @@ void lshl_b64() {
 void run() {
     spills();
     descriptor_loads();
+    ranged_loads();
+    typed_loads();
+    copies();
     cselect();
     lshl_b64();
 }
 
 }  // namespace lane_ops
 
+// ---- vertex shaders on vertex input, hand-encoded ---------------------------------------
+// The elements load at s_swappc_b64 (the fetch shader's call). With
+// vertex_formats_from_params the lift converts each element by its descriptor
+// in the params block - or the relink's specialization constant - as the
+// translator does; run through a straight-line interpreter of one vertex, it
+// must compute what the lift with the same formats as constants computes
+// (TranslateOptions::vertex_input's own conversions), for every kind the
+// loader serves, every component count and DST_SEL's ones and zeros past them.
+namespace vertex {
+
+std::uint32_t sop1(std::uint32_t op, std::uint32_t sdst, std::uint32_t ssrc) { return 0xbe800000u | sdst << 16 | op << 8 | ssrc; }
+// exp <tgt> v0..v3, all four components, done where asked.
+void export_vec(std::vector<std::uint32_t>& w, std::uint32_t tgt, std::uint32_t v, bool done = false) {
+    w.push_back(0xf8000000u | (done ? 1u << 11 : 0u) | tgt << 4 | 0xfu);
+    w.push_back((v + 3) << 24 | (v + 2) << 16 | (v + 1) << 8 | v);
+}
+constexpr std::uint32_t kEndpgm = 0xbf810000u;
+
+// s_swappc_b64 s[0:1], s[2:3]; the position from v4-v7, param 0 from v8-v11,
+// then `extra` exports; two elements at v4 and v8.
+std::vector<std::uint32_t> program(const std::function<void(std::vector<std::uint32_t>&)>& extra = {}) {
+    std::vector<std::uint32_t> w = {sop1(33, 0, 2)};
+    export_vec(w, 12, 4);
+    export_vec(w, 32, 8);
+    if (extra) extra(w);
+    w.push_back(kEndpgm);
+    return w;
+}
+
+gcn::TranslateOptions options(std::uint32_t w3_a, std::uint32_t w3_b, bool from_params) {
+    gcn::TranslateOptions o;
+    o.stage = gcn::Stage::Vertex;
+    o.rsrc1 = 3u << 24;  // VGPR_COMP_CNT 3
+    o.descriptor_set = 0;
+    o.cb_ssbo = true;
+    o.cb_no_fallback = true;
+    o.link_outputs = true;
+    for (std::uint8_t r = 0; r < 32; ++r) o.output_links.push_back(r);
+    o.vertex_input = {{0, 4, 4, from_params ? 0u : w3_a}, {1, 8, 4, from_params ? 0u : w3_b}};
+    o.vertex_formats_from_params = from_params;
+    return o;
+}
+
+struct Lifted {
+    gcn::TranslateResult ref;
+    gcn::LiftResult lift;
+};
+Lifted lift_vs(const std::vector<std::uint32_t>& words, const gcn::TranslateOptions& o) {
+    const gcn::Program p = gcn::decode(words.data(), words.size());
+    Lifted r;
+    r.ref = gcn::translate(p, o);
+    if (!r.ref.ok()) std::fprintf(stderr, "reference failed: %s\n", r.ref.errors[0].c_str());
+    r.lift = gcn::lift_vertex_shader(p, o, r.ref);
+    return r;
+}
+
+// One vertex through the lifted module: `inputs` at their locations, the
+// params' vertex_formats, the specialization constants by SpecId. Returns
+// the position, the params by location and the clip distances.
+struct VertexRun {
+    bool ok = false;
+    std::string error;
+    std::array<std::uint32_t, 4> position{};
+    std::map<std::uint32_t, std::array<std::uint32_t, 4>> params;
+    std::map<std::uint32_t, std::uint32_t> clip;
+};
+VertexRun run_vertex(const std::vector<std::uint32_t>& spv, const std::map<std::uint32_t, std::array<std::uint32_t, 4>>& inputs,
+                     const std::array<std::uint32_t, 16>& formats, const std::map<std::uint32_t, std::uint32_t>& spec = {}) {
+    VertexRun run;
+    using Vec = std::array<std::uint32_t, 4>;
+    std::map<std::uint32_t, Vec> val;
+    std::map<std::uint32_t, std::uint32_t> constants, builtin, location, storage, spec_id, spec_default;
+    struct Chain {
+        std::uint32_t base;
+        std::vector<std::uint32_t> idx;
+    };
+    std::map<std::uint32_t, Chain> chains;
+    std::uint32_t ubo = 0;
+    const auto fail = [&](const std::string& why) {
+        run.error = why;
+        return run;
+    };
+    bool in_body = false;
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+        if (n == 0 || i + n > spv.size()) return fail("malformed module");
+        const std::uint32_t* a = &spv[i + 1];
+        i += n;
+        switch (op) {
+        case 71:  // OpDecorate
+            if (a[1] == 11) builtin[a[0]] = a[2];
+            if (a[1] == 30) location[a[0]] = a[2];
+            if (a[1] == 1) spec_id[a[0]] = a[2];
+            continue;
+        case 59:  // OpVariable
+            storage[a[1]] = a[2];
+            if (a[2] == 2) ubo = a[1];  // Uniform: the params block
+            continue;
+        case 43: constants[a[1]] = a[2]; continue;      // OpConstant (low word)
+        case 41: constants[a[1]] = 1; continue;         // OpConstantTrue
+        case 42: constants[a[1]] = 0; continue;         // OpConstantFalse
+        case 50: spec_default[a[1]] = a[2]; continue;   // OpSpecConstant
+        case 248: in_body = true; continue;             // OpLabel
+        default: break;
+        }
+        if (!in_body) continue;
+        const auto get = [&](std::uint32_t id) -> Vec {
+            if (const auto c = constants.find(id); c != constants.end()) return {c->second, 0, 0, 0};
+            if (const auto s = spec_default.find(id); s != spec_default.end()) {
+                const auto given = spec_id.count(id) ? spec.find(spec_id.at(id)) : spec.end();
+                return {given != spec.end() ? given->second : s->second, 0, 0, 0};
+            }
+            return val[id];
+        };
+        const auto g0 = [&](std::uint32_t id) { return get(id)[0]; };
+        const auto f = [](std::uint32_t b) { return std::bit_cast<float>(b); };
+        const auto u = [](float x) { return std::bit_cast<std::uint32_t>(x); };
+        const auto set = [&](std::uint32_t id, std::uint32_t v) { val[id] = {v, 0, 0, 0}; };
+        switch (op) {
+        case 65: {  // OpAccessChain
+            Chain c{a[2], {}};
+            for (std::uint32_t k = 3; k < n - 1; ++k) c.idx.push_back(g0(a[k]));
+            chains[a[1]] = c;
+            break;
+        }
+        case 61: {  // OpLoad
+            const std::uint32_t ptr = a[2];
+            if (const auto c = chains.find(ptr); c != chains.end()) {
+                if (c->second.base != ubo || c->second.idx.size() != 3 || c->second.idx[0] != 7) return fail("a params load outside vertex_formats");
+                set(a[1], formats.at(c->second.idx[1] * 4 + c->second.idx[2]));
+            } else if (storage[ptr] == 1 && location.count(ptr) && !builtin.count(ptr)) {
+                const auto in = inputs.find(location[ptr]);
+                if (in == inputs.end()) return fail("an input location the test does not give");
+                val[a[1]] = in->second;
+            } else {
+                return fail("a load of something other than a vertex input or the params");
+            }
+            break;
+        }
+        case 62: {  // OpStore
+            const std::uint32_t ptr = a[0];
+            if (const auto c = chains.find(ptr); c != chains.end()) {
+                if (!builtin.count(c->second.base) || builtin[c->second.base] != 3 || c->second.idx.size() != 1) return fail("a chained store outside ClipDistance");
+                run.clip[c->second.idx[0]] = g0(a[1]);
+            } else if (builtin.count(ptr) && builtin[ptr] == 0) {
+                run.position = get(a[1]);
+            } else if (storage[ptr] == 3 && location.count(ptr)) {
+                run.params[location[ptr]] = get(a[1]);
+            } else {
+                return fail("a store to something other than the position, a param or a clip distance");
+            }
+            break;
+        }
+        case 81: set(a[1], get(a[2])[a[3]]); break;  // OpCompositeExtract
+        case 80: {                                   // OpCompositeConstruct
+            Vec v{};
+            for (std::uint32_t k = 2; k < n - 1 && k < 6; ++k) v[k - 2] = g0(a[k]);
+            val[a[1]] = v;
+            break;
+        }
+        case 124: val[a[1]] = get(a[2]); break;                           // OpBitcast
+        case 112: set(a[1], u(static_cast<float>(g0(a[2])))); break;      // OpConvertUToF
+        case 136: set(a[1], u(f(g0(a[2])) / f(g0(a[3])))); break;         // OpFDiv
+        case 133: set(a[1], u(f(g0(a[2])) * f(g0(a[3])))); break;         // OpFMul
+        case 129: set(a[1], u(f(g0(a[2])) + f(g0(a[3])))); break;         // OpFAdd
+        case 170: set(a[1], g0(a[2]) == g0(a[3])); break;                 // OpIEqual
+        case 171: set(a[1], g0(a[2]) != g0(a[3])); break;                 // OpINotEqual
+        case 176: set(a[1], g0(a[2]) < g0(a[3])); break;                  // OpULessThan
+        case 194: set(a[1], g0(a[2]) >> (g0(a[3]) & 31)); break;          // OpShiftRightLogical
+        case 199: set(a[1], g0(a[2]) & g0(a[3])); break;                  // OpBitwiseAnd
+        case 166: set(a[1], g0(a[2]) | g0(a[3])); break;                  // OpLogicalOr
+        case 169: val[a[1]] = g0(a[2]) ? get(a[3]) : get(a[4]); break;    // OpSelect
+        case 202: {                                                       // OpBitFieldSExtract
+            const std::uint32_t off = g0(a[3]), count = g0(a[4]);
+            if (count == 0 || off + count > 32) return fail("a bit field outside the word");
+            const std::int32_t x = static_cast<std::int32_t>(g0(a[2]) << (32 - off - count)) >> (32 - count);
+            set(a[1], static_cast<std::uint32_t>(x));
+            break;
+        }
+        case 253: case 56: break;  // OpReturn, OpFunctionEnd
+        default: return fail("unsupported opcode " + std::to_string(op));
+        }
+    }
+    run.ok = true;
+    return run;
+}
+
+void formats() {
+    // Word 3 of an element: DST_SEL x,y,z,w in place (0xfac), data format
+    // [18:15], number format [14:12]; past a format's components DST_SEL 1 or 0.
+    const auto w3 = [](std::uint32_t dfmt, std::uint32_t nfmt, std::uint32_t sel) { return dfmt << 15 | nfmt << 12 | sel; };
+    std::vector<std::uint32_t> words3;
+    for (const auto [dfmt, nfmt] : {std::pair{14u, 7u}, {13u, 7u}, {11u, 7u}, {4u, 7u},  // 32-bit floats: the raw bits
+                                    {14u, 4u}, {11u, 4u}, {4u, 5u}, {13u, 5u},            // 32-bit integers
+                                    {14u, 0u}, {4u, 1u},                                  // 32-bit unorm, snorm: the raw bits too
+                                    {10u, 0u}, {3u, 0u}, {1u, 0u},                        // unorm8
+                                    {12u, 5u}, {5u, 5u}, {2u, 5u}}) {                     // sint16
+        int count = dfmt == 14 || dfmt == 10 || dfmt == 12 ? 4 : dfmt == 13 ? 3 : dfmt == 11 || dfmt == 3 || dfmt == 5 ? 2 : 1;
+        std::uint32_t in_place = 0;
+        for (int k = 0; k < count; ++k) in_place |= (4u + static_cast<std::uint32_t>(k)) << (3 * k);
+        // Past the components: all zero, all one, and alternating.
+        std::uint32_t ones = in_place, mixed = in_place;
+        for (int k = count; k < 4; ++k) {
+            ones |= 1u << (3 * k);
+            if (k & 1) mixed |= 1u << (3 * k);
+        }
+        for (const std::uint32_t sel : {in_place, ones, mixed}) {
+            words3.push_back(w3(dfmt, nfmt, sel));
+            CHECK(gcn::vertex_format_descriptor(words3.back()) != 0);
+        }
+    }
+    const std::vector<std::array<std::uint32_t, 4>> raws = {
+        {0x3f800000u, 0xbf000000u, 0x7f7fffffu, 0x00000001u},  // floats, a denormal
+        {0, 255, 128, 1},                                      // unorm8 edges
+        {0xffffu, 0x8000u, 0x7fffu, 0x1234u},                  // sint16 edges
+        {0x12345678u, 0xfffffffeu, 0x80000000u, 0x7fc00000u},  // NaN bits, integers
+    };
+    const std::vector<std::uint32_t> words = program();
+    std::size_t compared = 0;
+    for (std::size_t i = 0; i < words3.size(); ++i) {
+        const std::uint32_t a = words3[i], b = words3[(i + 7) % words3.size()];
+        const Lifted constant = lift_vs(words, options(a, b, false));
+        const Lifted params = lift_vs(words, options(a, b, true));
+        CHECK(lifted(constant.lift) && lifted(params.lift));
+        if (!constant.lift.ok() || !params.lift.ok()) continue;
+        CHECK(proof_says(params.lift, "2 vertex elements converted by their descriptor"));
+        std::array<std::uint32_t, 16> formats{};
+        formats[0] = gcn::vertex_format_descriptor(a);
+        formats[1] = gcn::vertex_format_descriptor(b);
+        for (const auto& ra : raws) {
+            for (const auto& rb : raws) {
+                const std::map<std::uint32_t, std::array<std::uint32_t, 4>> inputs = {{0, ra}, {1, rb}};
+                const VertexRun want = run_vertex(constant.lift.spirv, inputs, {});
+                const VertexRun got = run_vertex(params.lift.spirv, inputs, formats);
+                // The relink's specialization constants win over the params.
+                const std::array<std::uint32_t, 16> garbage = {7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
+                const VertexRun spec = run_vertex(params.lift.spirv, inputs, garbage,
+                                                  {{gcn::kVertexFormatSpecId + 0, formats[0]}, {gcn::kVertexFormatSpecId + 1, formats[1]}});
+                for (const VertexRun* r : {&want, &got, &spec}) {
+                    if (!r->ok) std::fprintf(stderr, "vertex run failed: %s\n", r->error.c_str());
+                    CHECK(r->ok);
+                }
+                if (!want.ok || !got.ok || !spec.ok) return;
+                const bool same = got.position == want.position && got.params == want.params && spec.position == want.position && spec.params == want.params;
+                if (!same) {
+                    std::fprintf(stderr, "formats %08x/%08x: the lift from params differs from the constant-format lift\n", a, b);
+                    ++g_failures;
+                    return;
+                }
+                ++compared;
+            }
+        }
+    }
+    CHECK(compared == words3.size() * raws.size() * raws.size());
+}
+
+void clip_distances() {
+    // pos1 holds clip distances 0 and 1 (PA_CL_VS_OUT_CNTL 0x400003, as 4,762
+    // of the game's vertex shaders): ClipDistance, or with the host's clip
+    // varying the distances at the clip location for the pixel stage (a
+    // disabled one reads 1), and 1s there when nothing exports them.
+    const std::vector<std::uint32_t> words = program([](std::vector<std::uint32_t>& w) { export_vec(w, 13, 4); });
+    const std::uint32_t fmt = 14u << 15 | 7u << 12 | 0xfac;  // 32_32_32_32 float
+    const std::map<std::uint32_t, std::array<std::uint32_t, 4>> inputs = {{0, {0x3f800000u, 0xc0000000u, 0x40400000u, 0x40800000u}},
+                                                                          {1, {1, 2, 3, 4}}};
+    std::array<std::uint32_t, 16> formats{};
+    formats[0] = formats[1] = gcn::vertex_format_descriptor(fmt);
+    gcn::TranslateOptions o = options(fmt, fmt, true);
+    o.vs_out_cntl = 0x400003;
+    const Lifted plain = lift_vs(words, o);
+    CHECK(lifted(plain.lift));
+    CHECK(plain.ref.vs_clip_count == 2);
+    if (plain.lift.ok()) {
+        const VertexRun r = run_vertex(plain.lift.spirv, inputs, formats);
+        if (!r.ok) std::fprintf(stderr, "vertex run failed: %s\n", r.error.c_str());
+        CHECK(r.ok && r.clip.size() == 2 && r.clip.at(0) == 0x3f800000u && r.clip.at(1) == 0xc0000000u);
+    }
+    o.vs_out_cntl = 0x400003 | gcn::TranslateOptions::kVsOutCntlClipVarying | 5u << gcn::TranslateOptions::kVsOutCntlClipLocationShift;
+    const Lifted varying = lift_vs(words, o);
+    CHECK(lifted(varying.lift));
+    CHECK(varying.ref.vs_params == std::vector<std::uint32_t>({0, 5}));
+    if (varying.lift.ok()) {
+        const VertexRun r = run_vertex(varying.lift.spirv, inputs, formats);
+        CHECK(r.ok && r.clip.empty() && r.params.count(5) &&
+              r.params.at(5) == (std::array<std::uint32_t, 4>{0x3f800000u, 0xc0000000u, 0x3f800000u, 0x3f800000u}));
+    }
+    const Lifted none = lift_vs(program(), o);  // nothing exported at pos1
+    CHECK(lifted(none.lift));
+    if (none.lift.ok()) {
+        const VertexRun r = run_vertex(none.lift.spirv, inputs, formats);
+        CHECK(r.ok && r.params.count(5) && r.params.at(5) == (std::array<std::uint32_t, 4>{0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u}));
+    }
+    // A pos1 that PA_CL_VS_OUT_CNTL does not enable is the translator's error.
+    o.vs_out_cntl = 0;
+    const Lifted stray = lift_vs(words, o);
+    CHECK(!stray.ref.ok() && rejected_with(stray.lift, "the reference translation failed"));
+}
+
+// The pixel stage's half (TranslateOptions::ps_clip_discard): the translator's
+// prologue - discard where a distance at the clip location is negative -
+// before the program, and no early fragment tests.
+void clip_discard() {
+    std::vector<std::uint32_t> w;
+    push(w, {vintrp(0, 2, 0, 0, 0), vintrp(1, 2, 0, 0, 1)});  // v2 = attr0.x
+    export_mrt0(w, 2, 2, 2, 2);
+    w.push_back(kEndpgm);
+    gcn::TranslateOptions o = synthetic_options();
+    o.ps_clip_discard = 2u | 3u << 8;
+    o.early_fragment_tests = true;
+    const ::Lifted l = lift_words(w, o);
+    CHECK(lifted(l.lift));
+    CHECK(proof_says(l.lift, "clip distances (the vertex stage's, at location 3) are negative is discarded at entry"));
+    CHECK(count_op(l.lift.spirv, 252) == 1);  // OpKill
+    CHECK(count_op(l.lift.spirv, 184) == 2);  // OpFOrdLessThan, distances 0 and 1
+    bool clip_input = false, early = false;
+    for (std::size_t i = 5; i < l.lift.spirv.size();) {
+        const std::uint32_t op = l.lift.spirv[i] & 0xffff, len = l.lift.spirv[i] >> 16;
+        if (op == 71 && len == 4 && l.lift.spirv[i + 2] == 30 && l.lift.spirv[i + 3] == 3) clip_input = true;  // Location 3
+        if (op == 16 && len >= 3 && l.lift.spirv[i + 2] == 9) early = true;                                   // EarlyFragmentTests
+        i += len;
+    }
+    CHECK(clip_input && !early);
+}
+
+void run() {
+    formats();
+    clip_distances();
+    clip_discard();
+}
+
+}  // namespace vertex
+
+// ---- buffer stores in a vertex shader -------------------------------------------------
+// The particle copies (VS_VFX_StandardParticle, VS_VFX_SparkParticle) store
+// with buffer_store_dword* through a V# from a table, at the V#'s base plus an
+// SGPR offset plus the instruction's: the reference writes the V#'s binding
+// (BufferBinding::written, bound whole: ranged), and the lift writes dword
+// (soffset + offset12) >> 2 + k where it is inside the V#'s range and the
+// invocation's EXEC bit is set - checked here through an interpreter of the
+// lifted module that keeps the storage buffers' words, at offsets inside,
+// straddling and past the range, with a bias, and with a constant soffset.
+namespace vertex_stores {
+
+struct Asm {
+    std::vector<std::uint32_t> w;
+    void smrd(std::uint32_t op, std::uint32_t sdst, std::uint32_t sbase, std::uint32_t offset_dw) {
+        w.push_back(0xc0000000u | op << 22 | sdst << 15 | (sbase / 2) << 9 | 1u << 8 | offset_dw);
+    }
+    void vmov(std::uint32_t vdst, std::uint32_t src0) { w.push_back(0x7e000000u | vdst << 17 | 1u << 9 | src0); }
+    // buffer_store_dword* (op 28 x1, 29 x2, 30 x4, 31 x3) vdata, s[srsrc..+3], soffset (a scalar code), offset12;
+    // `offen`: the VGPR vaddr adds its value (an address form the reference does not bind).
+    void store(std::uint32_t op, std::uint32_t vdata, std::uint32_t srsrc, std::uint32_t soffset, std::uint32_t offset12, bool offen = false,
+               std::uint32_t vaddr = 0) {
+        w.push_back(0xe0000000u | op << 18 | (offen ? 1u << 12 : 0u) | offset12);
+        w.push_back(vaddr | vdata << 8 | (srsrc / 4) << 16 | soffset << 24);
+    }
+    void waitcnt() { w.push_back(0xbf8c0000u); }
+    void endpgm() { w.push_back(0xbf810000u); }
+};
+
+gcn::TranslateOptions options(std::vector<std::string> exclude = {}, gcn::Stage stage = gcn::Stage::Vertex) {
+    gcn::TranslateOptions o;
+    o.stage = stage;
+    o.rsrc2 = 8u << 1;  // eight user SGPRs
+    if (stage == gcn::Stage::Pixel) o.ps_input_ena = 2;
+    o.descriptor_set = stage == gcn::Stage::Pixel ? 1 : 0;
+    o.cb_ssbo = true;
+    o.cb_no_fallback = true;
+    o.cb_ssbo_exclude = std::move(exclude);
+    return o;
+}
+
+// The V# at dword 4 of the table s[2:3] in s[8:11]; v1..v3 from s5..s7; stores
+// at s4 + 0 (one dword), s4 + 8 (two) and at the constant 0 + 4 (one).
+std::vector<std::uint32_t> program(bool offen = false) {
+    Asm a;
+    a.smrd(2, 8, 2, 4);  // s_load_dwordx4 s[8:11], s[2:3], 0x4
+    a.waitcnt();
+    a.vmov(1, 5);
+    a.vmov(2, 6);
+    a.vmov(3, 7);
+    a.store(28, 1, 8, 4, 0, offen, 1);
+    a.store(29, 2, 8, 4, 8);
+    a.store(28, 1, 8, 128, 4);  // soffset: the inline constant 0
+    a.endpgm();
+    return a.w;
+}
+
+struct Lifted {
+    gcn::TranslateResult ref;
+    gcn::LiftResult lift;
+};
+Lifted lift(const std::vector<std::uint32_t>& words, const gcn::TranslateOptions& o) {
+    const gcn::Program p = gcn::decode(words.data(), words.size());
+    Lifted r;
+    r.ref = gcn::translate(p, o);
+    if (!r.ref.ok()) std::fprintf(stderr, "reference failed: %s\n", r.ref.errors[0].c_str());
+    r.lift = o.stage == gcn::Stage::Vertex ? gcn::lift_vertex_shader(p, o, r.ref) : gcn::lift_pixel_shader(p, o, r.ref);
+    return r;
+}
+
+// One invocation of the lifted module: the params' user SGPRs, biases and
+// ranges, and the storage buffers by binding, which its stores change.
+struct Run {
+    bool ok = false;
+    std::string error;
+    std::map<std::uint32_t, std::vector<std::uint32_t>> buffers;
+};
+Run run(const std::vector<std::uint32_t>& spv, const std::array<std::uint32_t, 16>& user, const std::array<std::uint32_t, 16>& bias,
+        const std::array<std::uint32_t, 16>& range, std::map<std::uint32_t, std::vector<std::uint32_t>> buffers) {
+    Run r;
+    r.buffers = std::move(buffers);
+    std::map<std::uint32_t, std::uint32_t> val, constants, binding, storage;
+    struct Chain {
+        std::uint32_t base;
+        std::vector<std::uint32_t> idx;
+    };
+    std::map<std::uint32_t, Chain> chains;
+    const auto fail = [&](const std::string& why) {
+        r.error = why;
+        return r;
+    };
+    bool in_body = false;
+    std::uint32_t skip_to = 0;  // a label: the instructions before it are not run (a then-block whose condition is false)
+    for (std::size_t i = 5; i < spv.size();) {
+        const std::uint32_t n = spv[i] >> 16, op = spv[i] & 0xffff;
+        if (n == 0 || i + n > spv.size()) return fail("malformed module");
+        const std::uint32_t* a = &spv[i + 1];
+        i += n;
+        if (!in_body) {
+            if (op == 71 && a[1] == 33) binding[a[0]] = a[2];   // OpDecorate Binding
+            if (op == 59) storage[a[1]] = a[2];                  // OpVariable
+            if (op == 43) constants[a[1]] = a[2];                // OpConstant
+            if (op == 41) constants[a[1]] = 1;                   // OpConstantTrue
+            if (op == 42) constants[a[1]] = 0;                   // OpConstantFalse
+            if (op == 50) constants[a[1]] = a[2];                // OpSpecConstant: its default
+            if (op == 248) in_body = true;                       // OpLabel
+            continue;
+        }
+        if (skip_to) {
+            if (op == 248 && a[0] == skip_to) skip_to = 0;
+            continue;
+        }
+        const auto g = [&](std::uint32_t id) {
+            const auto c = constants.find(id);
+            return c != constants.end() ? c->second : val[id];
+        };
+        const auto word_of = [&](const Chain& c, bool for_store) -> std::uint32_t* {
+            if (storage[c.base] != 12) return nullptr;
+            auto b = r.buffers.find(binding[c.base]);
+            if (b == r.buffers.end() || c.idx.size() != 2 || c.idx[0] != 0 || c.idx[1] >= b->second.size()) return nullptr;
+            (void)for_store;
+            return &b->second[c.idx[1]];
+        };
+        switch (op) {
+        case 65: {  // OpAccessChain
+            Chain c{a[2], {}};
+            for (std::uint32_t k = 3; k < n - 1; ++k) c.idx.push_back(g(a[k]));
+            chains[a[1]] = c;
+            break;
+        }
+        case 61: {  // OpLoad
+            const auto c = chains.find(a[2]);
+            if (c == chains.end()) return fail("a load of something other than the params or a storage buffer");
+            if (storage[c->second.base] == 2) {
+                const auto& idx = c->second.idx;
+                if (idx.size() != 3) return fail("a params load of another shape");
+                const std::uint32_t k = idx[1] * 4 + idx[2];
+                if (k >= 16) return fail("a params entry past 16");
+                if (idx[0] == 2) val[a[1]] = user[k];
+                else if (idx[0] == 4) val[a[1]] = bias[k];
+                else if (idx[0] == 5) val[a[1]] = range[k];
+                else return fail("a params member the test does not give: " + std::to_string(idx[0]));
+            } else if (std::uint32_t* w = word_of(c->second, false)) {
+                val[a[1]] = *w;
+            } else {
+                return fail("a load the test does not give");
+            }
+            break;
+        }
+        case 62: {  // OpStore
+            const auto c = chains.find(a[0]);
+            std::uint32_t* w = c == chains.end() ? nullptr : word_of(c->second, true);
+            if (!w) return fail("a store outside the storage buffers the test gives");
+            *w = g(a[1]);
+            break;
+        }
+        case 124: val[a[1]] = g(a[2]); break;                          // OpBitcast
+        case 128: val[a[1]] = g(a[2]) + g(a[3]); break;                // OpIAdd
+        case 176: val[a[1]] = g(a[2]) < g(a[3]); break;                // OpULessThan
+        case 167: val[a[1]] = g(a[2]) && g(a[3]); break;               // OpLogicalAnd
+        case 194: val[a[1]] = g(a[2]) >> (g(a[3]) & 31); break;        // OpShiftRightLogical
+        case 196: val[a[1]] = g(a[2]) << (g(a[3]) & 31); break;        // OpShiftLeftLogical
+        case 199: val[a[1]] = g(a[2]) & g(a[3]); break;                // OpBitwiseAnd
+        case 169: val[a[1]] = g(a[2]) ? g(a[3]) : g(a[4]); break;      // OpSelect
+        case 247: break;                                               // OpSelectionMerge
+        case 250: if (!g(a[0])) skip_to = a[2]; break;                 // OpBranchConditional: the false label is the merge
+        case 249: case 248: case 253: case 56: break;                  // OpBranch, OpLabel, OpReturn, OpFunctionEnd
+        default: return fail("unsupported opcode " + std::to_string(op));
+        }
+    }
+    r.ok = true;
+    return r;
+}
+
+void cases() {
+    const Lifted l = lift(program(), options());
+    CHECK(lane_ops::lifted_valid(l.lift));
+    CHECK(lane_ops::proof_has(l.lift, "3 buffer stores, every one through a binding the reference writes"));
+    const std::string path = "user_sgpr[2]->load(+16)";
+    int store_binding = -1;
+    for (std::size_t k = 0; k < l.ref.buffers.size(); ++k) {
+        if (l.ref.buffers[k].path.str() == path) store_binding = static_cast<int>(k);
+    }
+    CHECK(store_binding >= 0 && l.ref.buffers[static_cast<std::size_t>(store_binding)].written &&
+          l.ref.buffers[static_cast<std::size_t>(store_binding)].ranged && !l.ref.buffers[static_cast<std::size_t>(store_binding)].indexed);
+    CHECK(l.ref.walks.empty());
+    if (!l.lift.ok() || store_binding < 0) return;
+    const std::uint32_t b_table = l.ref.buffers[0].binding == l.ref.buffers[static_cast<std::size_t>(store_binding)].binding ? l.ref.buffers[1].binding
+                                                                                                                           : l.ref.buffers[0].binding;
+    const std::uint32_t b_out = l.ref.buffers[static_cast<std::size_t>(store_binding)].binding;
+    for (const auto& [offset, range_dw, bias_dw] : {std::array<std::uint32_t, 3>{0, 10, 0}, {32, 10, 0}, {28, 10, 0}, {4, 3, 0}, {8, 16, 6},
+                                                    {0xfffffffcu, 10, 0}, {2, 10, 0}, {0, 0, 0}}) {
+        std::array<std::uint32_t, 16> user{}, bias{}, range{};
+        user[4] = offset;
+        user[5] = 0xa0a0a0a0u;
+        user[6] = 0xb1b1b1b1u;
+        user[7] = 0xc2c2c2c2u;
+        bias[static_cast<std::size_t>(store_binding)] = bias_dw;
+        range[static_cast<std::size_t>(store_binding)] = range_dw;
+        std::vector<std::uint32_t> out(32, 0x55555555u);
+        const Run r = run(l.lift.spirv, user, bias, range, {{b_table, std::vector<std::uint32_t>(16, 0)}, {b_out, out}});
+        if (!r.ok) std::fprintf(stderr, "vertex stores at %u: %s\n", offset, r.error.c_str());
+        CHECK(r.ok);
+        if (!r.ok) continue;
+        // GCN: dword (soffset + offset12) >> 2 + k of the V#'s range, written only inside it.
+        std::vector<std::uint32_t> want = out;
+        const auto put = [&](std::uint32_t byte, std::uint32_t v) {
+            const std::uint32_t at = byte >> 2;
+            if (at < range_dw) want[bias_dw + at] = v;
+        };
+        put(offset + 0, user[5]);
+        put(offset + 8, user[6]);
+        put(offset + 12, user[7]);
+        put(0 + 4, user[5]);
+        const std::vector<std::uint32_t>& got = r.buffers.at(b_out);
+        if (got != want) {
+            for (std::size_t k = 0; k < want.size(); ++k) {
+                if (got[k] != want[k]) std::fprintf(stderr, "vertex stores at byte %u (range %u, bias %u): dword %zu holds %08x, expected %08x\n",
+                                                    offset, range_dw, bias_dw, k, got[k], want[k]);
+            }
+            ++g_failures;
+        }
+    }
+    // A store with a VGPR offset keeps the page-table walk (its address is
+    // per lane), and the lift does not take it; nor one left to the page table,
+    // nor one in a pixel shader.
+    CHECK(rejected_with(lift(program(true), options()).lift, "is not a store the reference makes through a binding"));
+    CHECK(rejected_with(lift(program(), options({path})).lift, "is not a store the reference makes through a binding"));
+    {
+        std::vector<std::uint32_t> w = program();
+        w.pop_back();
+        w.push_back(0xf8000000u | 1u << 12 | 1u << 11 | 0xfu);  // exp mrt0 v1, v1, v1, v1 done vm
+        w.push_back(0x01010101u);
+        w.push_back(0xbf810000u);
+        CHECK(rejected_with(lift(w, options({}, gcn::Stage::Pixel)).lift, "outside a vertex shader is not lifted"));
+    }
+}
+
+void run() { cases(); }
+
+}  // namespace vertex_stores
+
 int main(int argc, char** argv) {
     // Hand-encoded programs first: they need no game files.
+    vertex::run();
+    vertex_stores::run();
     control_flow::run();
     cndmask_modifiers();
     packed_exports();
     synthetic_swizzles();
+    swizzles_in_blocks();
     swizzles_and_loops();
     lane_ops::run();
     lod::cases();
+    lod::loads_and_sizes();
+    lod::uniform_texels();
     lod::loops();
     lod::helper_lanes();
     if (g_failures) {

@@ -1113,6 +1113,15 @@ bool live_resolution_install(ElfImage* image) {
         max_w = std::min<std::uint32_t>(static_cast<std::uint32_t>(desk_w), kMaxW);
         max_h = std::min<std::uint32_t>(static_cast<std::uint32_t>(desk_h), kMaxH);
         max_why = "the largest display";
+    } else if (live && host_gpu_small_vram()) {
+        // No display size to go by (only Windows reads it) and little video
+        // memory: the starting size, or 1080p if smaller, instead of
+        // 5120x2160 - four display buffers of 42 MiB, a depth target and
+        // their clears for sizes the run may never reach. Larger sizes apply
+        // at the next start.
+        max_w = std::min<std::uint32_t>(std::max<std::uint32_t>(static_cast<std::uint32_t>(w), 1920), kMaxW);
+        max_h = std::min<std::uint32_t>(std::max<std::uint32_t>(static_cast<std::uint32_t>(h), 1080), kMaxH);
+        max_why = "the starting size: the GPU's video memory is small";
     }
     if (tight) {
         // Only sizes within 1080p's pixels: the heap is imported whole.

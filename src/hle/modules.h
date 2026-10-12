@@ -163,8 +163,8 @@ std::uint32_t hle_pad_button_named(const std::string& name);
 std::uint64_t hle_threads_made();
 int hle_threads_starting();
 void hle_video_set_fps_cap(int fps);  // video.fps_cap (upper bound on presented fps)
-// The game's pace once engine/frame_rate.cpp chose it (30, 60, 90, 0 uncapped):
-// 30 and 60 cap the flips at that rate; 90 and uncapped complete them at once.
+// The game's pace once engine/frame_rate.cpp chose it (30, 60, 90, 120, 0 uncapped):
+// 30 and 60 cap the flips at that rate; above 60 and uncapped complete them at once.
 // A frame rate set after that applies on the next run.
 void hle_video_set_game_pace(int fps);
 void hle_video_set_loading_uncapped(bool on);  // flips complete at once while a loading screen is up (engine/loading.cpp)

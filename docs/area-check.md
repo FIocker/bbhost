@@ -46,10 +46,19 @@ moving the player. It gets through the title by asking the game for the menus'
 confirm button every 2 s until the world's first frame (the test request
 `menutap confirm`, which bbhost carries out only while one of the game's menus
 has the input), so it reaches the title whenever the title comes: a build's
-first start compiles its shader caches before it. At each place the probe travels to a lamp the way the
-Hunter's Dream headstones do, moves to the place's view, switches off the
-ordinary enemies within 40 m, puts the camera behind the player and holds
-still:
+first start compiles its shader caches before it. Each press is held 1.5 s
+until the game has read one (`BBHOST_TRACE_PAD`), 200 ms after: a pad the game
+finds disconnected it reads only once a second, and a short press then met one
+of those reads only by chance - one to three minutes of ignored presses on a
+Steam Deck's cold start, before bbhost plugged a harness's pad in from the
+start. The report says how many presses it took and at which flip the game
+read the first.
+
+At each place the probe travels to a lamp the way the
+Hunter's Dream headstones do - done once the player stands still in the
+place's map with the loading screen gone -, moves to the place's view,
+switches off the ordinary enemies within 40 m, puts the camera behind the
+player and holds still:
 
 1. a settle (15 s): streaming and the first compiles;
 2. the window (20 s): what the place costs;
@@ -61,6 +70,17 @@ earlier places did not capture; `tools/lift_verify.py` replays each with the
 lifted pixel shader and with the translated one and compares the outputs byte
 for byte. Captures stall the GPU, which is why they get a session of their own.
 
+A place counts as measured only where the player was: each of the probe's
+marks (the arrival, the window's start and end) must be in the place's map, a
+view's within 3 m of its standpoint, and from the arrival on the player must
+not die, be placed in a map again (a respawn, or a bounce out of an area the
+game would not keep the player in), meet a loading screen in the window or
+move more than 3 m across (5 m up or down). A place that fails one of these
+says why in its status - `not there: m21_00_00_00 at the measure mark`,
+`died in the window`, `moved 40 m in the window` - and is left out of an
+A/B's numbers. The settle a place had is counted from the loading screen's
+end.
+
 For each place the report says:
 
 - in the window: fps and the frame-time percentiles from every flip interval,
@@ -71,7 +91,15 @@ For each place the report says:
 - on arrival (the travel and the settle): the loads, pipeline compiles over
   30 ms, flip stalls over 40 ms, main-loop frames over 33 ms, and the pixel
   shaders met for the first time there, lifted or not and why;
-- the frames and their brightness;
+- the frames and their brightness, over the picture: a dump is the whole
+  display buffer (5120x2160 on Linux), and the game renders into its top-left
+  corner at the run's render size. A band edge - a step in brightness between
+  two neighbouring columns or rows that runs all the way across the picture,
+  as the 4K world that was black left of three quarters of the width had - is
+  flagged, and so is a black picture;
+- memory as the place was left, from the 5-second report: the device-local
+  heaps' use, the image heap and everything bbhost allocated, and what the
+  place added since the place before;
 - the lift results of the place's captures.
 
 `report.json` has everything and `summary.txt` the same to read.
@@ -112,7 +140,8 @@ repeat - lantern flicker, fog and cloth move up to a third of the pixels
 between two identical runs. Frames are compared by the share of pixels that
 changed, a blurred difference that leaves noise out, and an 8 x 8 table of
 brightness changes; a picture of the difference goes in `diffs/`.
-`ab.txt` lists what is worse beyond the noise floor, then what is better. A
+`ab.txt` lists what is worse beyond the noise floor, then what is better,
+memory at each place included. A
 build older than the check still gives fps, its seconds' worst frames, the GPU
 busy meter and the hitches, but no frame intervals (its percentiles are marked
 approximate), draws by shader kind, frames or captures; the comparison leaves
@@ -129,6 +158,11 @@ These are for test runs and off by default.
 | `BBHOST_TEST_REQUESTS=<dir>` | the game carries out requests a harness leaves there: a frame dump, a capture budget |
 | `BBHOST_CAPTURE_DRAW=*ps` | a draw capture of the first draw of each pixel shader |
 | `BBHOST_CAPTURE_ARMED=1` | captures only while a request has allowed them |
+
+Switches given with `--env` that write files relative to the game's folder -
+`BBHOST_DUMP_FRAME` (`build/frame-N.ppm`), `BBHOST_DUMP_AT_DRAW`
+(`build/rtd-*.ppm`) - write into the pass's own `build/`, which the run makes;
+the report lists what landed there.
 
 The flip log's `pixel shaders:` line, every 300 flips in any run, gives the
 same split of draws by pixel shader.

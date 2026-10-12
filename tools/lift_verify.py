@@ -39,7 +39,7 @@ def load(path):
         return None
 
 
-def verify(capture, out, gcnlift, drawreplay, timeout, keep_replay, stage="ps"):
+def verify(capture, out, gcnlift, drawreplay, timeout, keep_replay, stage="ps", specialize=False):
     name = capture.name
     row = {"capture": str(capture), "name": name, "stage": stage}
     lift_dir = out / name / "lift"
@@ -76,8 +76,8 @@ def verify(capture, out, gcnlift, drawreplay, timeout, keep_replay, stage="ps"):
         row["status"] = "error"
         row["detail"] = ["gcnlift wrote no %s" % other.name]
         return row
-    replay = subprocess.run([str(drawreplay), str(capture), f"--{stage}", str(other), "--no-live", "--out", str(replay_dir)],
-                            capture_output=True, text=True, timeout=timeout)
+    replay = subprocess.run([str(drawreplay), str(capture), f"--{stage}", str(other), "--no-live", "--out", str(replay_dir)] +
+                            (["--specialize"] if specialize else []), capture_output=True, text=True, timeout=timeout)
     rep = load(replay_dir / "report.json")
     row["drawreplay_exit"] = replay.returncode
     variant = ((rep or {}).get("comparisons") or {}).get("A_vs_variant")
@@ -119,6 +119,8 @@ def main():
     parser.add_argument("--delete-verified", action="store_true", help="remove a capture once its lift is byte-identical")
     parser.add_argument("--keep-replay", action="store_true", help="keep drawreplay's target dumps and heatmaps (default: report.json only)")
     parser.add_argument("--stage", choices=("ps", "vs"), default="ps", help="lift the pixel (default) or the vertex shader")
+    parser.add_argument("--specialize", action="store_true",
+                        help="replay with the specialization constants bbhost's optimized relink gives (drawreplay --specialize)")
     args = parser.parse_args()
     captures = sorted(p for p in args.captures.iterdir() if (p / "manifest.json").is_file())
     if not captures:
@@ -128,7 +130,7 @@ def main():
     rows = []
     for capture in captures:
         try:
-            row = verify(capture, args.out, args.gcnlift, args.drawreplay, args.timeout, args.keep_replay, args.stage)
+            row = verify(capture, args.out, args.gcnlift, args.drawreplay, args.timeout, args.keep_replay, args.stage, args.specialize)
         except subprocess.TimeoutExpired:
             row = {"capture": str(capture), "name": capture.name, "status": "error", "detail": ["timed out"]}
         rows.append(row)

@@ -23,6 +23,24 @@ struct GpuDispatch {
     // and the clear values belong to that fill, not to the draw that later
     // binds the target (a draw from a token reads no register).
     std::uint32_t depth_clear = 0, stencil_clear = 0;
+    // The counters its ds_append / ds_consume in GDS count in (gcn::
+    // TranslateOptions::gds_counters): for GDS dwords gds_base.., the guest
+    // word each one is (0: none) and what it starts the dispatch from. GX
+    // keeps an append/consume buffer's counter in the word past its records
+    // and moves it into GDS before the dispatch and back after (DMA_DATA,
+    // gx_commit_compute_stage / gx_dispatch_post) - the initial count of a
+    // D3D11 UAV, kept or set. The dispatch counts in the word itself; a set
+    // count is written into it first, a count from another word copied in.
+    enum GdsStart : std::uint8_t { kGdsKeep, kGdsSet, kGdsCopy };
+    struct GdsCounter {
+        std::uint64_t word = 0;
+        std::uint64_t from = 0;    // kGdsCopy
+        std::uint32_t value = 0;   // kGdsSet
+        GdsStart start = kGdsKeep;
+    };
+    static constexpr std::uint32_t kGdsCounters = 8;  // gcn::kGdsCounters
+    std::uint32_t gds_base = 0;
+    GdsCounter gds[kGdsCounters] = {};
 };
 
 // Everything a draw is decoded from, in register encodings. The PM4 path
@@ -235,6 +253,11 @@ bool host_gpu_device_lost();
 // memory_tight; a Steam Deck does). Callable before host_gpu_init: the guest
 // patches size the render targets' heap by it.
 bool host_gpu_memory_tight();
+// Whether the GPU run on is a discrete one with little video memory free -
+// under 7.5 GiB at the start (BBHOST_SMALL_VRAM=0/1 says otherwise) - so the
+// small-video-memory settings apply. Before the device exists, as
+// host_gpu_memory_tight.
+bool host_gpu_small_vram();
 // Queues one compute dispatch. Returns false when the shader could not be
 // translated or queued (the caller logs and continues). Queued work runs at
 // the next host_gpu_flush().
@@ -251,6 +274,9 @@ void host_gpu_report();
 void host_gpu_submit();
 std::string host_gpu_profile_report();  // BBHOST_GPU_PROFILE=1: top pipelines by GPU time since the last call
 std::string host_gpu_fill_stats();      // fill-pending / fill-applied counters
+// Copies out of render targets: into images, and refused (copied as memory,
+// the destination's image left stale), by reason. Empty without a GPU.
+std::string host_gpu_target_copy_report();
 // Writes the Vulkan pipeline cache under the data root when pipelines were
 // created since the last save (the 300-flip report calls it); the write runs on
 // a background thread. BBHOST_PIPELINE_CACHE=0 turns loading and saving off.
@@ -274,6 +300,14 @@ std::uint64_t host_gpu_completed_submits();
 void host_gpu_explain_value(std::uint64_t va, std::uint64_t value);
 bool host_gpu_mem_fill(std::uint64_t va, std::uint32_t value, std::size_t bytes);
 bool host_gpu_mem_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
+// GDS counters (gcn::TranslateOptions::gds_counters; BBHOST_GDS_COUNTERS=0
+// turns them off, and GDS is dropped as before).
+bool host_gpu_gds_counters();
+// A copy out of or a fill of a counter word, on the GPU's timeline: the word
+// is the GPU's, as GX's GDS was, and its value is the one the dispatches
+// before this point in the stream left (D3D11's CopyStructureCount).
+bool host_gpu_counter_copy(std::uint64_t dst, std::uint64_t src, std::size_t bytes);
+bool host_gpu_counter_fill(std::uint64_t dst, std::uint32_t value, std::size_t bytes);
 // A GX buffer copy reached as a copy token, handled as the compute copy
 // path handles a recognised copy shader: marks the destination's surfaces
 // dirty; when the source is a render target, copies its image into the
@@ -348,11 +382,41 @@ struct GpuStats {
     // reason (host_gpu_draw_fail_name).
     std::uint64_t draws_ps[4];
     std::uint64_t draw_fail_why[16];
+    // The same draws by how their vertex shader ran (DrawVs), and those the
+    // lifter does not take (kDrawVsOther) by why (DrawVsWhy).
+    std::uint64_t draws_vs[4];
+    std::uint64_t draws_vs_why[16];
+    // The draws on the host's tessellator (DrawTess): all of them, and those
+    // whose evaluation, vertex and control stages ran lifted.
+    std::uint64_t draws_tess[6];
 };
+// A draw on the host's tessellator: counted, and by which of its stages ran as
+// typed lifts (BBHOST_LIFT_TESS) - the domain shader as the evaluation stage,
+// the LS as the vertex stage, the hull shader as the control stage, all three;
+// and the game's own hull draws drawn as native pipelines (no LS pass).
+enum DrawTess { kDrawTess, kDrawTessDomainLifted, kDrawTessLsLifted, kDrawTessHullLifted, kDrawTessAllLifted, kDrawTessNative, kDrawTessCount };
 // How a draw's pixel shader ran: its typed lift (BBHOST_DECOMP), a
 // translation in the no-fallback pipeline (not lifted, or not asked to be),
 // the page-table fallback pipeline's translation, or no pixel shader at all.
 enum DrawPs { kDrawPsLifted, kDrawPsTranslated, kDrawPsFallback, kDrawPsNone, kDrawPsCount };
+// How a draw's vertex shader ran: its typed lift (BBHOST_DECOMP), a
+// translation on vertex input in the no-fallback pipeline (not lifted), a
+// translation the lifter does not take (the fetch shader inlined, or a
+// tessellation stage), or the page-table fallback pipeline's translation.
+enum DrawVs { kDrawVsLifted, kDrawVsTranslated, kDrawVsOther, kDrawVsFallback, kDrawVsCount };
+// Why a draw's vertex shader is one the lifter does not take (kDrawVsOther): a
+// tessellation stage - the host tessellator's evaluation stage, or the
+// emulated domain shader - or a vertex shader whose fetch shader stays inlined
+// because the draw has no vertex input: it calls none, the draw carries no GX
+// geometry (packets), vertex input is off, the game binds the vertex table
+// itself (no slot in the draw's user data), the fetch shader has another shape
+// than the GX input layouts', or an element has no record, no Vulkan vertex
+// format, a stride shorter than itself, or data outside one imported buffer.
+enum DrawVsWhy {
+    kVsWhyTessHw, kVsWhyDomain, kVsWhyNoFetch, kVsWhyNoGx, kVsWhyInputOff, kVsWhyOwnTable,
+    kVsWhyShape, kVsWhyRecord, kVsWhyFormat, kVsWhyStride, kVsWhyPlacement, kVsWhyCount
+};
+const char* host_gpu_vs_why_name(int why);
 // A draw failure reason's name ("pixel shader"), or null past the last.
 const char* host_gpu_draw_fail_name(int reason);
 enum GpuPhase { kPhaseDraw, kPhaseDispatch, kPhasePrefetch, kPhasePipeline, kPhaseBind, kPhaseExec, kPhaseWait, kPhaseLock, kPhaseCount };

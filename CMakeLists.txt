@@ -25,7 +25,7 @@ set_target_properties(monocypher PROPERTIES C_STANDARD 99 POSITION_INDEPENDENT_C
 
 # Sea Islands shader decoder and the offline tools built on it.
 find_package(ZLIB REQUIRED)
-add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp)
+add_library(gcn STATIC src/gcn/decode.cpp src/gcn/container.cpp src/gcn/spirv.cpp src/gcn/half.cpp src/gcn/translate.cpp src/gcn/lift.cpp src/gcn/image_dims.cpp src/gcn/wave.cpp src/gcn/names.cpp)
 target_include_directories(gcn PUBLIC src)
 target_link_libraries(gcn PUBLIC ZLIB::ZLIB)
 add_executable(gcndis tools/gcndis.cpp)
@@ -45,6 +45,7 @@ add_executable(bbhost
   src/core/imports.cpp
   src/core/thunk.cpp
   src/core/portable.cpp
+  src/core/paced_file.cpp
   src/core/host_clock.cpp
   src/core/futex.cpp
   src/core/win_vm.cpp
@@ -93,6 +94,7 @@ add_executable(bbhost
   src/engine/fmod_probe.cpp
   src/engine/menu_memory.cpp
   src/engine/frame_rate.cpp
+  src/engine/frame_tick.cpp
   src/engine/frame_pool.cpp
   src/engine/sf_heap_probe.cpp
   src/engine/debug_menu.cpp
@@ -261,7 +263,7 @@ if(Vulkan_FOUND)
   add_library(replay_common STATIC src/replay/json.cpp src/replay/compare.cpp)
   target_include_directories(replay_common PUBLIC src)
   target_link_libraries(replay_common PUBLIC Vulkan::Headers)
-  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
+  target_sources(bbhost PRIVATE src/host/gpu.cpp src/host/gpu_busy.cpp src/host/gpu_memtrack.cpp src/host/gpu_mutex.cpp src/host/buffer_shadow.cpp src/host/recorder.cpp src/host/bindless.cpp src/host/render.cpp src/host/textures.cpp src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp src/host/draw_capture.cpp src/host/stream_selftest.cpp
                                 src/host/shader_patch.cpp src/host/translation_cache.cpp)
   target_link_libraries(bbhost PRIVATE Vulkan::Vulkan gcn replay_common)
   # Which user-data tables a no-fallback shader still reads, from the SPIRV-Tools
@@ -305,7 +307,7 @@ if(SDL3_FOUND AND Vulkan_FOUND)
   set_source_files_properties(src/host/overlay.cpp src/host/present_pass.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/ingame_menu.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
   set_source_files_properties(src/host/buffer_shadow.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
-  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
+  set_source_files_properties(src/host/gpu_untile.cpp src/host/depth_copy.cpp src/host/indirect_clamp.cpp src/host/fsr.cpp src/host/glitch.cpp src/host/occlusion.cpp PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers")
 else()
   message(STATUS "bbhost: SDL3/Vulkan not found; headless only")
 endif()
@@ -454,6 +456,9 @@ if(UNIX)
   target_include_directories(write_watch_test PRIVATE src)
   target_link_libraries(write_watch_test PRIVATE pthread)
   add_test(NAME write_watch_test COMMAND write_watch_test)
+  add_executable(paced_file_test tests/paced_file_test.cpp src/core/paced_file.cpp)
+  target_include_directories(paced_file_test PRIVATE src)
+  add_test(NAME paced_file_test COMMAND paced_file_test)
   # The decomp's tests (tests/decomp, docs/decomp.md "How one is checked"):
   # the eboot kit loads the 1.09 eboot with bbhost's own loader, every import a
   # trap, and a test runs the game's functions beside ours. They skip (77)
@@ -543,7 +548,7 @@ if(UNIX)
   set_tests_properties(gcn_decode_test PROPERTIES SKIP_RETURN_CODE 77)
   # The translation cache (src/host/translation_cache.cpp, which it includes)
   # against the shipped shader bundles.
-  add_executable(translation_cache_test tests/translation_cache_test.cpp)
+  add_executable(translation_cache_test tests/translation_cache_test.cpp src/core/paced_file.cpp)
   target_include_directories(translation_cache_test PRIVATE src ${CMAKE_BINARY_DIR}/gen)
   target_link_libraries(translation_cache_test PRIVATE gcn ZLIB::ZLIB)
   add_dependencies(translation_cache_test bbhost_translator_fingerprint)
@@ -552,6 +557,10 @@ if(UNIX)
   add_executable(gcn_wave_test tests/gcn_wave_test.cpp)
   target_link_libraries(gcn_wave_test PRIVATE gcn)
   add_test(NAME gcn_wave_test COMMAND gcn_wave_test)
+  add_executable(gcn_bindings_test tests/gcn_bindings_test.cpp)
+  target_link_libraries(gcn_bindings_test PRIVATE gcn)
+  add_test(NAME gcn_bindings_test COMMAND gcn_bindings_test)
+  set_tests_properties(gcn_bindings_test PROPERTIES SKIP_RETURN_CODE 77)
   if(SPIRV_TOOLS_LIB)
     add_executable(gcn_translate_test tests/gcn_translate_test.cpp)
     target_link_libraries(gcn_translate_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
@@ -564,11 +573,24 @@ if(UNIX)
     target_link_libraries(gcn_lift_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
     add_test(NAME gcn_lift_test COMMAND gcn_lift_test)
   set_tests_properties(gcn_lift_test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(gcn_tess_lift_test tests/gcn_tess_lift_test.cpp)
+    target_link_libraries(gcn_tess_lift_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
+    add_test(NAME gcn_tess_lift_test COMMAND gcn_tess_lift_test)
+    set_tests_properties(gcn_tess_lift_test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(gcn_names_test tests/gcn_names_test.cpp)
+    target_link_libraries(gcn_names_test PRIVATE gcn ${SPIRV_TOOLS_LIB})
+    add_test(NAME gcn_names_test COMMAND gcn_names_test)
+    set_tests_properties(gcn_names_test PROPERTIES SKIP_RETURN_CODE 77)
     if(Vulkan_FOUND)
       add_executable(gcn_sampling_test tests/gcn_sampling_test.cpp)
       target_link_libraries(gcn_sampling_test PRIVATE gcn ${SPIRV_TOOLS_LIB} Vulkan::Vulkan)
       add_test(NAME gcn_sampling_test COMMAND gcn_sampling_test)
       set_tests_properties(gcn_sampling_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+      add_executable(indirect_clamp_test tests/indirect_clamp_test.cpp)
+      target_include_directories(indirect_clamp_test PRIVATE src)
+      target_link_libraries(indirect_clamp_test PRIVATE Vulkan::Vulkan)
+      add_test(NAME indirect_clamp_test COMMAND indirect_clamp_test)
+      set_tests_properties(indirect_clamp_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     endif()
   endif()
 endif()

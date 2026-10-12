@@ -43,8 +43,16 @@ main loop's work, the draws by how their pixel shader ran (lifted, translated,
 the page-table fallback's translation, none) and the draw failures by reason;
 for the arrival (the travel and the settle): the loads, pipeline compiles over
 30 ms, flip stalls over 40 ms, main-loop frames over 33 ms, and the pixel
-shaders met for the first time there, lifted or not and why; the frames; and
-the lift results. report.json holds all of it, summary.txt the same to read.
+shaders met for the first time there, lifted or not and why; the frames,
+scored over the picture (the top-left of the dumped display buffer at the
+render size) with band edges flagged; memory as the place was left; and the
+lift results. report.json holds all of it, summary.txt the same to read.
+
+A place counts only where the player was (presence): every mark in the
+place's map, a view's within VIEW_REACH of its standpoint, and from the
+arrival on no death, no new placing in a map, no loading screen in the window
+and no move past STAY_ACROSS / STAY_UP. A place that fails says why in its
+status and stays out of an A/B's numbers.
 
 `ab` runs A and B alternately for --rounds rounds (2: the second round of
 each build is the noise floor) - perf passes every round, the capture pass in
@@ -105,6 +113,23 @@ STAND_REACH = 50.0
 # comes - a new build's first start compiles its shader caches before it.
 TITLE_TAP_FIRST_S = 5.0
 TITLE_TAP_EVERY_S = 2.0
+# Each press is held TITLE_TAP_SEARCH_MS until the game has read one
+# (BBHOST_TRACE_PAD's `pad: buttons` lines), 200 ms after. A pad the game
+# finds disconnected - a headless one before bbhost plugged it in from the
+# start (hle/system.cpp test_pad_plugged) - it reads only once a second, and
+# a 200 ms press landed in one of those reads only when the two clocks lined
+# up: 1-3 minutes on a Steam Deck's cold start. A hold longer than the second
+# meets the next read; the half second released before the next press keeps
+# each press its own.
+TITLE_TAP_SEARCH_MS = 1500
+# Where the player must stay for a place's numbers to count: within STAY_ACROSS
+# metres (and STAY_UP up or down) of where it stood at the arrival, through the
+# window, and within VIEW_REACH of a view's standpoint. A player held still
+# moves ~0.02 m (482 visits of earlier runs); a fall, a slide or a respawn
+# elsewhere moved 16-900 m.
+STAY_ACROSS = 3.0
+STAY_UP = 5.0
+VIEW_REACH = 3.0
 
 
 # --- the places ---------------------------------------------------------------
@@ -275,6 +300,7 @@ def pass_settings(pass_dir, areas, opts, kind):
         "BBHOST_CONFIG_DIR": str(pass_dir / "cfg"), "BBHOST_OPTIONS_PATH": str(pass_dir / "cfg" / "bbhost-options.toml"),
         "BBHOST_PIPELINE_CACHE": "1" if opts["pipeline_cache"] else "0",
         "BBHOST_GAME_FPS": str(opts["fps"]), "BBHOST_FRAME_STATS": "1", "BBHOST_FRAME_DETAIL": "1", "BBHOST_STALL_MS": "40",
+        "BBHOST_TRACE_PAD": "1",
         "BBHOST_TEST_WARP": "1", "BBHOST_TEST_REQUESTS": str(pass_dir / "requests"),
         "BBHOST_MAPVAL_TOUR": str(pass_dir / "tour.txt"), "BBHOST_MAPVAL_START": "%g" % opts["start"],
         "BBHOST_MAPVAL_DUMPS": str(pass_dir / "frames"), "BBHOST_MAPVAL_CAPTURES": str(pass_dir / "captures"),
@@ -325,9 +351,16 @@ INTERVALS = re.compile(r"\] frame intervals ms:((?: [\d.]+)+)\s*$")
 # The probe's lines, as bbhost logs a plugin's ("plugin: <line>", host/plugins.cpp).
 PROBE = r"\] (?:plugin: )?mapval "
 TRAVEL = re.compile(PROBE + r"step \d+ travel (\S+) ([\d.]+) return point (\d+) block ([0-9a-f]+) -> (\w+)")
-TRAVEL_DONE = re.compile(PROBE + r"travel-done (\S+) ([\d.]+) ([0-9a-f]+) \S+ \S+ \S+ after ([\d.]+) s")
+TRAVEL_DONE = re.compile(PROBE + r"travel-done (\S+) ([\d.]+) ([0-9a-f]+) \S+ \S+ \S+ after ([\d.]+) s(?:, ([\d.]+) s of it loading)?")
 TRAVEL_FAILED = re.compile(PROBE + r"travel-failed (\S+) ([\d.]+) in ([0-9a-f]+) after ([\d.]+) s")
-MARK = re.compile(PROBE + r"mark (\S+?):(\w+) ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+) yaw (\S+)")
+MARK = re.compile(PROBE + r"mark (\S+?):(\w+) ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+) yaw (\S+)(?: hp (-?\d+) loading (\d))?")
+# Once a second, where the player is (block, x y z, yaw, HP); and as they
+# happen, a death, the player placed in a map (a load, a respawn, a lamp) and
+# the loading screen coming and going, each with the probe's clock.
+POS = re.compile(PROBE + r"pos ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+) (\S+) (-?\d+)")
+DEATH = re.compile(PROBE + r"death ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+)")
+PLACED = re.compile(PROBE + r"placed ([\d.]+) ([0-9a-f]+)")
+PROBE_LOADING = re.compile(PROBE + r"loading-(begins|ends) ([\d.]+)")
 AT = re.compile(PROBE + r"at (\S+?):view ([\d.]+) ([0-9a-f]+) (\S+) (\S+) (\S+)")
 REWARP = re.compile(PROBE + r"rewarp ")
 RETRAVEL = re.compile(PROBE + r"retravel ")
@@ -337,6 +370,17 @@ DUMP_DONE = re.compile(r"\] test: frame dump at flip (\d+) to (\S+?)( failed)?\s
 CAPTURE_WROTE = re.compile(r"\] capture: wrote (\S+)/manifest\.json \((\S+), flip (\d+)")
 CAPTURE_REJECTED = re.compile(r"\] capture: (\S+) draw \d+ \(flip \d+\) not captured: (.*?)\s*$")
 LOADING = re.compile(r"\] loading: ([\d.]+) s \(flips")
+# The way through the title: the host's answers to the menutap requests, and
+# (BBHOST_TRACE_PAD=1) each change in the buttons the game read.
+TAP_PRESSED = re.compile(r"\] test: menutap (\S+) \(0x[0-9a-f]+\) for (\d+) ms at flip (\d+)")
+TAP_REFUSED = re.compile(r"\] test: menutap (\S+) at flip (\d+): no menu has the input")
+PAD_READ = re.compile(r"\] pad: buttons 0x([0-9a-f]+) -> 0x([0-9a-f]+) at flip (\d+)")
+LOAD_BEGINS = re.compile(r"\] loading: begins, flip (\d+)")
+# The 5-second report's memory lines (host/gpu.cpp, host/render.cpp).
+MEMORY = re.compile(r"\] +gpu: memory by heap: (.*?)\s*$")
+HEAP_ENTRY = re.compile(r"heap (\d+)( \(device\))? (\d+)/(\d+) MiB")
+IMAGE_HEAP = re.compile(r"\] +image heap: (\d+) blocks, (\d+) MiB in use")
+MEMORY_TOTAL = re.compile(r"\] +gpu: memory by site \(MiB[^)]*\): total (\d+)")
 SLOW_PIPELINE = re.compile(r"\] render: slow pipeline (?!library )\S+.*vkCreateGraphicsPipelines (\d+) ms")
 SLOW_LIBRARY = re.compile(r"\] render: slow pipeline library .*?: (\d+) ms")
 STALL = re.compile(r"\] stall: flip #\d+ came (\d+) ms after")
@@ -416,20 +460,33 @@ class Log:
                 self.seconds[-1][1]["intervals"].extend(float(v) for v in m.group(1).split())
                 return
         if "mapval " in line and PROBE_LINE.search(line):
-            for kind, rx in (("travel", TRAVEL), ("travel_done", TRAVEL_DONE), ("travel_failed", TRAVEL_FAILED),
-                             ("mark", MARK), ("at", AT), ("quiet", QUIET), ("camera", CAMERA)):
+            for kind, rx in (("pos", POS), ("travel", TRAVEL), ("travel_done", TRAVEL_DONE), ("travel_failed", TRAVEL_FAILED),
+                             ("mark", MARK), ("at", AT), ("quiet", QUIET), ("camera", CAMERA), ("death", DEATH),
+                             ("placed", PLACED), ("probe_loading", PROBE_LOADING)):
                 m = rx.search(line)
                 if m:
-                    if kind == "travel":
+                    if kind == "pos":
+                        self._ev(i, kind, t=float(m.group(1)), block=m.group(2), pos=[float(m.group(k)) for k in (3, 4, 5)],
+                                 hp=int(m.group(7)))
+                    elif kind == "travel":
                         self._ev(i, kind, area=m.group(1), t=float(m.group(2)), return_point=int(m.group(3)),
                                  block=m.group(4), queued=m.group(5) == "queued")
                     elif kind == "travel_done":
-                        self._ev(i, kind, area=m.group(1), t=float(m.group(2)), block=m.group(3), seconds=float(m.group(4)))
+                        self._ev(i, kind, area=m.group(1), t=float(m.group(2)), block=m.group(3), seconds=float(m.group(4)),
+                                 loading_s=float(m.group(5)) if m.group(5) else None)
                     elif kind == "travel_failed":
                         self._ev(i, kind, area=m.group(1), t=float(m.group(2)), block=m.group(3), seconds=float(m.group(4)))
                     elif kind == "mark":
                         self._ev(i, kind, area=m.group(1), name=m.group(2), t=float(m.group(3)), block=m.group(4),
-                                 pos=[float(m.group(k)) for k in (5, 6, 7)], yaw=float(m.group(8)))
+                                 pos=[float(m.group(k)) for k in (5, 6, 7)], yaw=float(m.group(8)),
+                                 hp=int(m.group(9)) if m.group(9) is not None else None,
+                                 loading=m.group(10) == "1" if m.group(10) is not None else None)
+                    elif kind == "death":
+                        self._ev(i, kind, t=float(m.group(1)), block=m.group(2), pos=[float(m.group(k)) for k in (3, 4, 5)])
+                    elif kind == "placed":
+                        self._ev(i, kind, t=float(m.group(1)), block=m.group(2))
+                    elif kind == "probe_loading":
+                        self._ev(i, kind, begins=m.group(1) == "begins", t=float(m.group(2)))
                     elif kind == "at":
                         self._ev(i, kind, area=m.group(1), t=float(m.group(2)), block=m.group(3),
                                  pos=[float(m.group(k)) for k in (4, 5, 6)])
@@ -449,9 +506,11 @@ class Log:
                 self._ev(i, "tour_done")
             return
         for kind, rx in (("dump", DUMP_DONE), ("capture", CAPTURE_WROTE), ("capture_rejected", CAPTURE_REJECTED),
-                         ("loading", LOADING), ("slow_pipeline", SLOW_PIPELINE), ("slow_library", SLOW_LIBRARY),
-                         ("stall", STALL), ("long_frame", LONG_FRAME), ("ps_lifted", PS_LIFTED),
-                         ("ps_not_lifted", PS_NOT_LIFTED), ("pipeline_failed", PIPELINE_FAILED), ("world", WORLD)):
+                         ("loading", LOADING), ("load_begins", LOAD_BEGINS), ("slow_pipeline", SLOW_PIPELINE),
+                         ("slow_library", SLOW_LIBRARY), ("stall", STALL), ("long_frame", LONG_FRAME), ("ps_lifted", PS_LIFTED),
+                         ("ps_not_lifted", PS_NOT_LIFTED), ("pipeline_failed", PIPELINE_FAILED), ("world", WORLD),
+                         ("memory", MEMORY), ("image_heap", IMAGE_HEAP), ("memory_total", MEMORY_TOTAL),
+                         ("tap_pressed", TAP_PRESSED), ("tap_refused", TAP_REFUSED), ("pad_read", PAD_READ)):
             m = rx.search(line)
             if not m:
                 continue
@@ -474,6 +533,23 @@ class Log:
                 self._ev(i, kind, pipeline=m.group(1))
             elif kind == "world":
                 self.world = {"flip": int(m.group(1)), "seconds": float(m.group(2))}
+            elif kind == "load_begins":
+                self._ev(i, kind, flip=int(m.group(1)))
+            elif kind == "memory":
+                heaps = [(int(h.group(1)), bool(h.group(2)), int(h.group(3)), int(h.group(4))) for h in HEAP_ENTRY.finditer(m.group(1))]
+                self._ev(i, kind, device_mib=sum(u for _, dev, u, _ in heaps if dev),
+                         device_budget_mib=sum(b for _, dev, _, b in heaps if dev),
+                         host_mib=sum(u for _, dev, u, _ in heaps if not dev))
+            elif kind == "image_heap":
+                self._ev(i, kind, blocks=int(m.group(1)), mib=int(m.group(2)))
+            elif kind == "memory_total":
+                self._ev(i, kind, mib=int(m.group(1)))
+            elif kind == "tap_pressed":
+                self._ev(i, kind, hold_ms=int(m.group(2)), flip=int(m.group(3)))
+            elif kind == "tap_refused":
+                self._ev(i, kind, flip=int(m.group(2)))
+            elif kind == "pad_read":
+                self._ev(i, kind, buttons=int(m.group(2), 16), flip=int(m.group(3)))
             return
         m = VERSION.search(line)
         if m and not self.version:
@@ -481,6 +557,7 @@ class Log:
         m = RENDERING.search(line)
         if m:
             self.rendering = [int(m.group(1)), int(m.group(2))]
+            self._ev(i, "rendering", size=list(self.rendering))
         if FATAL.search(line):
             self.fatal.append(line.strip()[:300])
         elif PROBLEM.search(line):
@@ -488,6 +565,29 @@ class Log:
 
     def between(self, start, end, kinds=None):
         return [(i, k, d) for i, k, d in self.events if start < i < end and (kinds is None or k in kinds)]
+
+    def time_at(self, index):
+        """The probe's clock at a line: that of the last probe line at or
+        before it (the probe logs where the player is once a second), or
+        None before the first."""
+        t = None
+        for i, k, d in self.events:
+            if i > index:
+                break
+            if d.get("t") is not None:
+                t = d["t"]
+        return t
+
+    def rendering_at(self, index):
+        """The size the game rendered at as of a line: the last 'rendering
+        WxH' before it, or the run's last."""
+        size = None
+        for i, k, d in self.events:
+            if i > index:
+                break
+            if k == "rendering":
+                size = d["size"]
+        return size or self.rendering
 
     def seconds_between(self, start, end):
         """The seconds wholly inside (start, end): the first `frames:` line after
@@ -586,6 +686,115 @@ def area_segments(log, area_ids):
     return out
 
 
+def block_name(packed):
+    """'15000000' -> 'm21_00_00_00'; '00000000' (no player) -> 'no map'."""
+    try:
+        v = int(packed, 16)
+    except (TypeError, ValueError):
+        return str(packed)
+    if not v:
+        return "no map"
+    return "m%02d_%02d_%02d_%02d" % (v >> 24, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff)
+
+
+def presence(log, area, start, end, marks, kind):
+    """Whether the player was at the place for its numbers, from the probe's
+    lines: each mark's map block (and, from probes that log them, HP and the
+    loading screen), deaths, the player placed in a map again (a respawn, a
+    bounce out of an area), loading screens, the once-a-second positions in
+    the window, the movement from the arrival on and a view's standpoint.
+    Returns (status or None, details)."""
+    want = area.block_hex()
+    evs = log.between(start, end)
+    mk = {d["name"]: (i, d) for i, k, d in evs if k == "mark" and d["area"] == area.id}
+    out = {"marks": {n: {"block": d["block"], "pos": d["pos"], "hp": d.get("hp"), "loading": d.get("loading")}
+                     for n, (i, d) in mk.items() if n in ("arrived", "measure", "measured")}}
+    a_i = mk["arrived"][0] if "arrived" in mk else start
+    w0 = mk["measure"][0] if "measure" in mk else (mk["capture"][0] if "capture" in mk else None)
+    w1 = mk["measured"][0] if "measured" in mk else (mk["end"][0] if "end" in mk else end)
+    span = "the window" if kind == "perf" else "the captures"
+
+    def when(i):
+        if w0 is None or i < w0:
+            return "before " + span
+        return "in " + span if i <= w1 else "after " + span
+
+    status = None
+    for name in ("arrived", "measure", "measured"):
+        if name in mk and mk[name][1]["block"] != want:
+            status = status or "not there: %s at the %s mark" % (block_name(mk[name][1]["block"]), name)
+    deaths = [i for i, k, d in evs if k == "death" and i > a_i]
+    pos = [(i, d) for i, k, d in evs if k == "pos" and i > a_i]
+    run = 0
+    for i, d in pos:  # a probe without death lines: two seconds in a row at 0 HP
+        run = run + 1 if d["hp"] <= 0 and d["block"] == want else 0
+        if run == 2:
+            deaths.append(i)
+    for i, d in mk.values():
+        if d.get("hp") is not None and d["hp"] <= 0 and d["block"] == want and i > a_i:
+            deaths.append(i)
+    if deaths:
+        out["death"] = when(min(deaths))
+        status = status or "died " + when(min(deaths))
+    placed = [i for i, k, d in evs if k == "placed" and i > a_i]
+    if placed:
+        out["placed_again"] = when(min(placed))
+        status = status or "placed in a map again " + when(min(placed))
+    if w0 is not None:
+        loads = [i for i, k, d in evs if (k in ("load_begins", "loading") or (k == "probe_loading")) and w0 < i < w1]
+        loads += [i for n in ("measure", "measured") if n in mk and mk[n][1].get("loading") for i in [mk[n][0]]]
+        if loads:
+            status = status or "a loading screen in " + span
+    if "arrived" in mk:
+        p0 = mk["arrived"][1]["pos"]
+        last = mk.get("measured", mk.get("end", (None, None)))[1]
+        moved = []
+        if last and last["block"] == want:
+            moved.append((math.hypot(last["pos"][0] - p0[0], last["pos"][2] - p0[2]), abs(last["pos"][1] - p0[1])))
+        if w0 is not None and "measure" in mk:
+            pm = mk["measure"][1]["pos"]
+            moved += [(math.hypot(d["pos"][0] - pm[0], d["pos"][2] - pm[2]), abs(d["pos"][1] - pm[1]))
+                      for i, d in pos if w0 < i < w1 and d["block"] == want]
+        if moved:
+            across, up = max(m[0] for m in moved), max(m[1] for m in moved)
+            out["moved_m"] = [round(across, 2), round(up, 2)]
+            if across > STAY_ACROSS or up > STAY_UP:
+                status = status or "moved %.0f m in %s" % (max(across, up), "the window" if kind == "perf" else "the visit")
+    v = area.view()
+    at_mark = mk.get("measure", mk.get("capture", mk.get("arrived")))
+    if v and at_mark and at_mark[1]["block"] == want:
+        off = math.hypot(at_mark[1]["pos"][0] - v[0], at_mark[1]["pos"][2] - v[2])
+        out["view_off_m"] = round(off, 2)
+        if off > VIEW_REACH:
+            status = status or "not at the view (%.0f m from it)" % off
+    # The settle that was had: from the last loading screen's end before the
+    # window (or the arrival) to the window.
+    if "arrived" in mk and w0 is not None:
+        t_w = mk["measure"][1]["t"] if "measure" in mk else mk["capture"][1]["t"]
+        ends = [d["t"] for i, k, d in evs if k == "probe_loading" and not d["begins"] and a_i < i < w0]
+        ends += [t for i, k, d in evs if k == "loading" and a_i < i < w0 for t in [log.time_at(i)] if t is not None]
+        t0 = max([mk["arrived"][1]["t"]] + ends)
+        out["settle_s"] = round(t_w - t0, 1)
+        if ends:
+            out["loading_after_arrival"] = True
+    return status, out
+
+
+def memory_at(log, start, end):
+    """What the last 5-second report in (start, end) said of memory: the
+    device-local heaps' use (and budget), the host heaps', the image heap's
+    blocks and use, and everything bbhost allocated; None without one."""
+    out = {}
+    for _, k, d in log.between(start, end, {"memory", "image_heap", "memory_total"}):
+        if k == "memory":
+            out.update(device_mib=d["device_mib"], device_budget_mib=d["device_budget_mib"], host_mib=d["host_mib"])
+        elif k == "image_heap":
+            out.update(image_heap_mib=d["mib"], image_heap_blocks=d["blocks"])
+        else:
+            out["allocated_mib"] = d["mib"]
+    return out or None
+
+
 def area_report(log, area, seg, kind):
     """One place's numbers from one pass's log."""
     start, end = seg
@@ -603,6 +812,7 @@ def area_report(log, area, seg, kind):
     rep["quiet"] = sum(d["switched_off"] for _, k, d in evs if k == "quiet")
     rep["camera"] = next((d["result"] for _, k, d in evs if k == "camera"), None)
     arrived = marks.get("arrived")
+    where, rep["presence"] = presence(log, area, start, end, marks, kind)
     if failed or arrived is None:
         rep["status"] = "travel failed" if failed else "not reached"
     elif done and done["block"] != area.block_hex():
@@ -610,7 +820,7 @@ def area_report(log, area, seg, kind):
     elif area.view() and not at:
         rep["status"] = "view not reached"
     else:
-        rep["status"] = "ok"
+        rep["status"] = where or "ok"
     # The arrival: the travel and the settle, up to the window (or, in the
     # capture pass, to the captures).
     arrival_end = marks.get("measure" if kind == "perf" else "capture", marks.get("end", end))
@@ -637,14 +847,17 @@ def area_report(log, area, seg, kind):
             rep["window"].update(hitches(inside))
             rep["window"]["problems"] = [d["text"] for _, k, d in inside if k == "problem"][:20]
         rep["frames"] = {}
-        for _, k, d in log.between(w1, marks.get("end", end), {"dump"}):
+        for i, k, d in log.between(w1, marks.get("end", end), {"dump"}):
             name = Path(d["path"]).stem
             prefix = area.id + "-"
-            rep["frames"][name[len(prefix):] if name.startswith(prefix) else name] = {"path": d["path"], "flip": d["flip"], "ok": d["ok"]}
+            rep["frames"][name[len(prefix):] if name.startswith(prefix) else name] = {
+                "path": d["path"], "flip": d["flip"], "ok": d["ok"], "crop": log.rendering_at(i)}
         if not rep["window"] and rep["status"] == "ok":
             rep["status"] = "no window"
     elif kind == "perf" and rep["status"] == "ok":
         rep["status"] = "no window"
+    # Memory as the place was left: the last report before its end.
+    rep["memory"] = memory_at(log, start, marks.get("end", end))
     if kind == "capture":
         cap = log.between(start, end, {"capture", "capture_rejected"})
         rep["captures"] = {"written": [{"dir": d["dir"], "pipeline": d["pipeline"], "flip": d["flip"]} for _, k, d in cap if k == "capture"],
@@ -652,17 +865,46 @@ def area_report(log, area, seg, kind):
     return rep
 
 
+def title_report(log):
+    """The way through the title, up to the world's first frame: the confirm
+    presses asked for, those pressed in a menu and those that met none, and
+    the first press the game read (BBHOST_TRACE_PAD=1; None from a build
+    without the trace or a run that never read one)."""
+    world_i = next((i for i, l in enumerate(log.lines) if WORLD.search(l)), len(log.lines))
+    evs = [(i, k, d) for i, k, d in log.events if i < world_i and k in ("tap_pressed", "tap_refused", "pad_read")]
+    pressed = [d for _, k, d in evs if k == "tap_pressed"]
+    first = next((d for _, k, d in evs if k == "pad_read" and d["buttons"]), None)
+    return {"pressed": len(pressed), "refused": sum(1 for _, k, _ in evs if k == "tap_refused"),
+            "held_ms": sorted({d["hold_ms"] for d in pressed}), "first_read_flip": first["flip"] if first else None,
+            "traced": any(k == "pad_read" for _, k, _ in evs)}
+
+
 def pass_report(lines, areas, kind):
     """A pass's report from its log lines."""
     log = Log(lines)
     segs = area_segments(log, {a.id for a in areas})
     out = {"kind": kind, "version": log.version, "world": log.world, "tour_done": log.tour_done, "fatal": log.fatal[:20],
-           "rendering": log.rendering, "areas": {}}
+           "rendering": log.rendering, "title": title_report(log), "areas": {}}
     for a in areas:
         if a.id in segs:
             out["areas"][a.id] = area_report(log, a, segs[a.id], kind)
         else:
             out["areas"][a.id] = {"id": a.id, "name": a.name, "block": a.block, "status": "not reached"}
+    # Memory growth, place by place in the order they were visited: what was
+    # left held since the place before and since the first.
+    prev = first = None
+    for a in areas:
+        m = out["areas"][a.id].get("memory") or {}
+        if m.get("device_mib") is None:
+            continue
+        for key in ("device_mib", "image_heap_mib", "allocated_mib"):
+            if m.get(key) is None:
+                continue
+            if prev and prev.get(key) is not None:
+                m[key.replace("_mib", "_growth_mib")] = m[key] - prev[key]
+            if first and first.get(key) is not None:
+                m[key.replace("_mib", "_since_first_mib")] = m[key] - first[key]
+        prev, first = m, first or m
     return out
 
 
@@ -723,6 +965,83 @@ def image_stats(img):
         mean = [sum(img.rgb[c::3]) / n for c in range(3)]
     return {"width": img.width, "height": img.height, "mean_rgb": [round(v, 2) for v in mean],
             "mean_luma": round(0.299 * mean[0] + 0.587 * mean[1] + 0.114 * mean[2], 2)}
+
+
+def crop_image(img, w, h):
+    """The top-left w x h of a dumped frame: the picture, where bbhost's
+    display buffers are the largest size the Resolution setting offers
+    (5120x2160 on Linux) and the game renders into their corner. Scored over
+    the whole buffer, the black 4K frames once read brighter than the good
+    ones."""
+    if not w or not h or (w >= img.width and h >= img.height):
+        return img
+    w, h = min(w, img.width), min(h, img.height)
+    if np is not None:
+        a = np.frombuffer(img.rgb, np.uint8).reshape(img.height, img.width, 3)[:h, :w]
+        return Image(w, h, a.tobytes())
+    stride = img.width * 3
+    return Image(w, h, b"".join(bytes(img.rgb[y * stride:y * stride + w * 3]) for y in range(h)))
+
+
+# A band edge: a step in the picture's luma between two neighbouring columns
+# (or rows) that runs all the way down (or across) - the black world with a
+# grey band over its right quarter at 4K. A scene's own edges (a doorway, a
+# horizon) run part of the way or slant. Flagged: a step of BAND_MIN levels
+# or more that BAND_AGREE of BAND_SLABS slabs across the picture share, the
+# same way and at least half as large. Measured on the 1,185 frames of 100
+# earlier runs: the broken 4K and ultrawide frames step 74-197 levels in all
+# eight slabs; no other frame has a step of 12 levels shared by seven slabs
+# (the nearest: a loading screen's rule, 68 levels across six).
+BAND_MIN = 12.0
+BAND_SLABS = 8
+BAND_AGREE = 7
+# A picture this dark is black: nothing drawn (the 4K Forbidden Woods' 0.5).
+# The darkest scenes of earlier runs read 18 or more.
+BLACK_LUMA = 2.0
+
+
+def band_edges(img):
+    """{'column': edge, 'row': edge}: each axis's largest step, where it is
+    (at: the first column or row past it), its luma before and after, how
+    many slabs agree and whether that is a band edge."""
+    w, h = img.width, img.height
+    if w < 2 or h < 2:
+        return {}
+    if np is not None:
+        a = np.frombuffer(img.rgb, np.uint8).reshape(h, w, 3).astype(np.float32)
+        lum = a[..., 0] * 0.299 + a[..., 1] * 0.587 + a[..., 2] * 0.114
+        rows = None
+    else:
+        d = img.rgb
+        rows = [[0.299 * d[k] + 0.587 * d[k + 1] + 0.114 * d[k + 2] for k in range((y * w) * 3, (y * w + w) * 3, 3)] for y in range(h)]
+    out = {}
+    for axis in ("column", "row"):
+        if np is not None:
+            m = lum if axis == "column" else lum.T  # m[i][j]: j along the axis the edge crosses
+            n, length = m.shape
+            prof = m.mean(axis=0).tolist()
+        else:
+            m = rows if axis == "column" else [list(c) for c in zip(*rows)]
+            n, length = len(m), len(m[0])
+            prof = [sum(r[j] for r in m) / n for j in range(length)]
+        if length < 2:
+            continue
+        steps = [prof[j + 1] - prof[j] for j in range(length - 1)]
+        j = max(range(length - 1), key=lambda k: abs(steps[k]))
+        slabs = min(BAND_SLABS, n)
+        agree = 0
+        for k in range(slabs):
+            lo, hi = k * n // slabs, (k + 1) * n // slabs
+            if np is not None:
+                sk = float((m[lo:hi, j + 1] - m[lo:hi, j]).mean())
+            else:
+                sk = sum(m[i][j + 1] - m[i][j] for i in range(lo, hi)) / (hi - lo)
+            if sk * steps[j] > 0 and abs(sk) >= 0.5 * abs(steps[j]):
+                agree += 1
+        out[axis] = {"axis": axis, "at": j + 1, "from": round(prof[j], 1), "to": round(prof[j + 1], 1), "step": round(steps[j], 1),
+                     "agree": agree, "slabs": slabs,
+                     "flagged": abs(steps[j]) >= BAND_MIN and agree >= min(BAND_AGREE, slabs)}
+    return out
 
 
 GRID = 8  # the frame in GRID x GRID blocks for the block table
@@ -863,6 +1182,12 @@ PERF_METRICS = (
     ("main loop work ms", ("main_loop_work_ms", "mean"), False, 0.2),
     ("CPU %", ("cpu_pct",), False, 5.0),
 )
+# Memory as each place was left (the 5-second report's): growth here is
+# what a leak looks like.
+MEMORY_METRICS = (
+    ("device memory MiB", ("device_mib",), False, 128),
+    ("image heap MiB", ("image_heap_mib",), False, 64),
+)
 ARRIVAL_METRICS = (
     ("slow pipelines", ("slow_pipelines", "count"), False, 2),
     ("slow pipeline ms", ("slow_pipelines", "ms"), False, 100),
@@ -934,9 +1259,14 @@ def compare_reports(a_runs, b_runs, frame_pairs=None):
            "a_version": sorted({str(r["run"]["version"]) for r in a_runs if (r.get("run") or {}).get("version")}),
            "b_version": sorted({str(r["run"]["version"]) for r in b_runs if (r.get("run") or {}).get("version")}), "areas": {}}
     for aid in ids:
-        A = [r["areas"].get(aid, {}) for r in a_runs]
-        B = [r["areas"].get(aid, {}) for r in b_runs]
-        ent = {"status": {"a": [x.get("status") for x in A], "b": [x.get("status") for x in B]}, "perf": {}, "arrival": {}}
+        A_all = [r["areas"].get(aid, {}) for r in a_runs]
+        B_all = [r["areas"].get(aid, {}) for r in b_runs]
+        ent = {"status": {"a": [x.get("status") for x in A_all], "b": [x.get("status") for x in B_all]}, "perf": {}, "arrival": {},
+               "memory": {}}
+        # Only a visit that measured the place counts: a death, a load or the
+        # player somewhere else made other numbers.
+        A = [x if x.get("status") == "ok" else {} for x in A_all]
+        B = [x if x.get("status") == "ok" else {} for x in B_all]
         for label, path, hb, mn in PERF_METRICS:
             d = metric_delta([dig(x.get("window"), path) for x in A], [dig(x.get("window"), path) for x in B], hb, mn)
             if d:
@@ -945,6 +1275,10 @@ def compare_reports(a_runs, b_runs, frame_pairs=None):
             d = metric_delta([dig(x.get("arrival"), path) for x in A], [dig(x.get("arrival"), path) for x in B], hb, mn)
             if d:
                 ent["arrival"][label] = d
+        for label, path, hb, mn in MEMORY_METRICS:
+            d = metric_delta([dig(x.get("memory"), path) for x in A], [dig(x.get("memory"), path) for x in B], hb, mn)
+            if d:
+                ent["memory"][label] = d
         share = metric_delta([dig(x.get("window"), ("draws", "lifted_share")) for x in A],
                              [dig(x.get("window"), ("draws", "lifted_share")) for x in B], True, 0.001)
         if share:
@@ -953,11 +1287,12 @@ def compare_reports(a_runs, b_runs, frame_pairs=None):
                           [dig(x.get("window"), ("draws", "failures")) for x in B], False, 1)
         if wf:
             ent["window_draw_failures"] = wf
-        la = next((x.get("lift") for x in A if x.get("lift")), None)
-        lb = next((x.get("lift") for x in B if x.get("lift")), None)
+        # The lift checks are the capture pass's, whatever the perf pass met.
+        la = next((x.get("lift") for x in A_all if x.get("lift")), None)
+        lb = next((x.get("lift") for x in B_all if x.get("lift")), None)
         if la or lb:
-            ra = next((lift_rows(x) for x in A if x.get("lift")), {})
-            rb = next((lift_rows(x) for x in B if x.get("lift")), {})
+            ra = next((lift_rows(x) for x in A_all if x.get("lift")), {})
+            rb = next((lift_rows(x) for x in B_all if x.get("lift")), {})
             changed = {ps: {"a": ra.get(ps), "b": rb.get(ps)} for ps in sorted(set(ra) & set(rb)) if ra.get(ps) != rb.get(ps)}
             ent["lift"] = {"a": (la or {}).get("totals"), "b": (lb or {}).get("totals"), "changed": changed,
                            "b_different": sorted(ps for ps, s in rb.items() if s in ("different", "invalid"))}
@@ -968,8 +1303,8 @@ def compare_reports(a_runs, b_runs, frame_pairs=None):
         out["areas"][aid] = ent
     flagged, improved = [], []
     for aid, ent in out["areas"].items():
-        for group in ("perf", "arrival"):
-            for label, d in ent[group].items():
+        for group in ("perf", "arrival", "memory"):
+            for label, d in ent.get(group, {}).items():
                 if d.get("verdict") in ("worse", "better"):
                     (flagged if d["verdict"] == "worse" else improved).append(
                         "%s: %s %s (%+.3g, noise %.3g)" % (aid, label, d["verdict"], d["delta"], d.get("noise", 0)))
@@ -997,8 +1332,8 @@ def compare_frames(a_dirs, b_dirs, area_ids, out_dir=None):
             rep = json.loads((Path(run_dir) / "report.json").read_text())
         except (OSError, ValueError):
             return {}
-        return {aid: {n: f["path"] for n, f in (a.get("frames") or {}).items() if f.get("ok")}
-                for aid, a in rep.get("areas", {}).items()}
+        return {aid: {n: (f["path"], tuple(f.get("crop") or (0, 0))) for n, f in (a.get("frames") or {}).items() if f.get("ok")}
+                for aid, a in rep.get("areas", {}).items() if a.get("status") == "ok"}
     fa = [frames_of(d) for d in a_dirs]
     fb = [frames_of(d) for d in b_dirs]
     cache = {}
@@ -1006,7 +1341,7 @@ def compare_frames(a_dirs, b_dirs, area_ids, out_dir=None):
     def load(p):
         if p not in cache:
             try:
-                cache[p] = read_ppm(p)
+                cache[p] = crop_image(read_ppm(p[0]), *p[1])
             except (OSError, ValueError):
                 cache[p] = None
         return cache[p]
@@ -1067,9 +1402,30 @@ def summary_text(report):
                 "done" if p.get("tour_done") else "NOT done",
                 (", rendering %dx%d" % tuple(p["rendering"])) if p.get("rendering") else "",
                 ("; FATAL: " + p["fatal"][0]) if p.get("fatal") else ""))
+            ti = p.get("title")
+            if ti:
+                out.append("  title: %d confirm presses in a menu (held %s ms), %d with none open; %s%s" % (
+                    ti["pressed"], "/".join(str(h) for h in ti["held_ms"]) or "-", ti["refused"],
+                    ("the game read the first at flip %d" % ti["first_read_flip"]) if ti.get("first_read_flip") is not None else
+                    ("the game read none" if ti.get("traced") else "no pad trace in this build"),
+                    ("; the world at %.1f s" % p["world"]["seconds"]) if p.get("world") else ""))
+            files = p.get("build_files") or []
+            if files:
+                out.append("  written under %s/build: %s%s" % (kind, ", ".join(Path(f).name for f in files[:6]),
+                                                              " and %d more" % (len(files) - 6) if len(files) > 6 else ""))
     out.append("")
     for aid, a in report.get("areas", {}).items():
         out.append("%-19s %s (%s): %s" % (aid, a.get("name"), a.get("block"), a.get("status")))
+        pr = a.get("presence") or {}
+        where = []
+        if pr.get("settle_s") is not None:
+            where.append("settled %.0f s%s" % (pr["settle_s"], " (counted from the loading screen's end)" if pr.get("loading_after_arrival") else ""))
+        if pr.get("view_off_m") is not None:
+            where.append("%.1f m from the view" % pr["view_off_m"])
+        if pr.get("moved_m"):
+            where.append("moved %.1f m across, %.1f m up or down" % tuple(pr["moved_m"]))
+        if where:
+            out.append("  where: " + "; ".join(where))
         w = a.get("window")
         if w:
             fm = w.get("frame_ms", {})
@@ -1103,10 +1459,17 @@ def summary_text(report):
                     nps.get("lifted", 0), nps.get("translated", 0), (" (" + reasons + ")") if reasons else ""))
             if ar.get("pipelines_failed"):
                 out.append("  pipelines that failed to build: " + ", ".join(ar["pipelines_failed"][:8]))
+        m = a.get("memory")
+        if m and m.get("device_mib") is not None:
+            def grew(key):
+                v = m.get(key)
+                return "" if v is None else " (%+d since the last place)" % v
+            out.append("  memory at the end: device %d MiB%s, image heap %s MiB in %s blocks%s, allocated %s MiB" % (
+                m["device_mib"], grew("device_growth_mib"), fmt(m.get("image_heap_mib"), "%d"), fmt(m.get("image_heap_blocks"), "%d"),
+                grew("image_heap_growth_mib"), fmt(m.get("allocated_mib"), "%d")))
         fr = a.get("frames")
         if fr:
-            out.append("  frames: " + ", ".join("%s %s" % (n, "luma %.1f" % f["stats"]["mean_luma"] if f.get("stats") else
-                                                           ("missing" if not f.get("ok") else "-")) for n, f in sorted(fr.items())))
+            out.append("  frames: " + ", ".join("%s %s" % (n, frame_note(f)) for n, f in sorted(fr.items())))
         lf = a.get("lift")
         if lf:
             tot = lf.get("totals", {})
@@ -1122,13 +1485,27 @@ def summary_text(report):
     return "\n".join(out) + "\n"
 
 
+def frame_note(f):
+    """'luma 61.2 (1920x1080)', with a band edge's flag."""
+    if not f.get("ok"):
+        return "missing"
+    st = f.get("stats")
+    if not st:
+        return "-"
+    out = "luma %.1f (%dx%d)%s" % (st["mean_luma"], st["width"], st["height"], " BLACK" if st["mean_luma"] < BLACK_LUMA else "")
+    for edge in (f.get("bands") or {}).values():
+        if edge.get("flagged"):
+            out += " BAND EDGE at %s=%d (%.0f -> %.0f)" % ("x" if edge["axis"] == "column" else "y", edge["at"], edge["from"], edge["to"])
+    return out
+
+
 def ab_text(ab):
     out = ["area check A/B", "A: %s (%s)" % (", ".join(str(d) for d in ab["a_runs"]), ", ".join(ab["a_version"]) or "?"),
            "B: %s (%s)" % (", ".join(str(d) for d in ab["b_runs"]), ", ".join(ab["b_version"]) or "?"), ""]
     for aid, e in ab["areas"].items():
         out.append("%s: A %s, B %s" % (aid, "/".join(str(s) for s in e["status"]["a"]), "/".join(str(s) for s in e["status"]["b"])))
-        for group in ("perf", "arrival"):
-            for label, d in e[group].items():
+        for group in ("perf", "arrival", "memory"):
+            for label, d in e.get(group, {}).items():
                 out.append("  %-22s A %-9s B %-9s %+8.3f%s  %s" % (
                     label, fmt(d["a_mean"], "%.3f"), fmt(d["b_mean"], "%.3f"), d["delta"],
                     (" (noise %.3f)" % d["noise"]) if "noise" in d else "", d.get("verdict", "")))
@@ -1253,7 +1630,9 @@ def prepare_pass(pass_dir, kind, areas, opts, paths):
     the config, the tour."""
     seed = Path(opts["seed"])
     pass_dir.mkdir(parents=True)
-    for sub in ("cfg", "requests", "frames", "captures"):
+    # build/: where BBHOST_DUMP_FRAME, BBHOST_DUMP_AT_DRAW and other switches
+    # write, relative to the game's folder - the pass's - and fail without it.
+    for sub in ("cfg", "requests", "frames", "captures", "build"):
         (pass_dir / sub).mkdir()
     shutil.copytree(seed, pass_dir / "data", symlinks=False)
     copy = world_baseline.file_inventory(pass_dir / "data")
@@ -1281,17 +1660,22 @@ def game_env(settings):
     return env
 
 
-def title_tap(requests, n):
+def title_tap(requests, n, hold_ms=None):
     """The n-th press of the menus' confirm button on the way through the
     title, as a request file the host carries out on a flip (after the probe's
-    numbered ones, which sort first)."""
-    (requests / ("title-%03d.req" % n)).write_text("menutap confirm\n")
+    numbered ones, which sort first) - written beside and renamed into place,
+    as the probe writes its own, so the host never reads half of one. hold_ms:
+    how long it is held (the host's 200 ms when None)."""
+    tmp = requests / ("title-%03d.tmp" % n)
+    tmp.write_text("menutap confirm%s\n" % (" %d" % hold_ms if hold_ms else ""))
+    os.replace(tmp, requests / ("title-%03d.req" % n))
 
 
 def launch(pass_dir, plan, say):
     """Runs the game until the tour is done (or it dies, or the budget is out),
     with its log in run.log. Until the world's first frame it presses confirm
-    in the title's menus (TITLE_TAP_EVERY_S)."""
+    in the title's menus (TITLE_TAP_EVERY_S), each press held
+    TITLE_TAP_SEARCH_MS until the game has read one."""
     env = game_env(plan["settings"])
     requests = Path(plan["settings"]["BBHOST_TEST_REQUESTS"])
     started = time.monotonic()
@@ -1299,7 +1683,7 @@ def launch(pass_dir, plan, say):
     world_deadline = started + 300
     next_tap, taps = started + TITLE_TAP_FIRST_S, 0
     stop_reason, term_at, pending = None, None, b""
-    world = done = False
+    world = done = read_one = False
     with (pass_dir / "run.log").open("wb") as log:
         with subprocess.Popen(plan["argv"], cwd=pass_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               start_new_session=True) as proc:
@@ -1314,7 +1698,7 @@ def launch(pass_dir, plan, say):
                         stop_reason = "the world was not reached"
                     if not world and stop_reason is None and now >= next_tap:
                         taps += 1
-                        title_tap(requests, taps)
+                        title_tap(requests, taps, None if read_one else TITLE_TAP_SEARCH_MS)
                         next_tap = now + TITLE_TAP_EVERY_S
                     if stop_reason and term_at is None:
                         proc.send_signal(signal.SIGTERM)
@@ -1336,6 +1720,11 @@ def launch(pass_dir, plan, say):
                             if not world and WORLD.search(line):
                                 world = True
                                 say("world reached")
+                            if not read_one:
+                                m = PAD_READ.search(line)
+                                if m and int(m.group(2), 16):
+                                    read_one = True
+                                    say("the game read a press at flip %s" % m.group(3))
                             m = MARK.search(line)
                             if m:
                                 say("%s: %s" % (m.group(1), m.group(2)))
@@ -1384,10 +1773,21 @@ def verify_lifts(pass_dir, areas, opts, say):
     return out
 
 
+def build_files(pass_dir, limit=200):
+    """What the game wrote under the pass's build/ (frame dumps a --env switch
+    asked for, render-target dumps, shader listings), relative to the pass."""
+    root = pass_dir / "build"
+    if not root.is_dir():
+        return []
+    found = sorted(str(p.relative_to(pass_dir)) for p in root.rglob("*") if p.is_file())
+    return found[:limit]
+
+
 def finish_pass(pass_dir, areas, kind, launched, opts):
     lines = (pass_dir / "run.log").read_text(errors="replace").splitlines() if (pass_dir / "run.log").is_file() else []
     rep = pass_report(lines, areas, kind)
     rep.update(launched or {})
+    rep["build_files"] = build_files(pass_dir)
     if not opts.get("keep_data"):
         shutil.rmtree(pass_dir / "data", ignore_errors=True)
     return rep
@@ -1402,7 +1802,9 @@ def merge(perf, capture, lifts, areas):
         for name, f in (ent.get("frames") or {}).items():
             if f.get("ok") and Path(f["path"]).is_file():
                 try:
-                    f["stats"] = image_stats(read_ppm(f["path"]))
+                    img = crop_image(read_ppm(f["path"]), *(f.get("crop") or (0, 0)))
+                    f["stats"] = image_stats(img)
+                    f["bands"] = band_edges(img)
                 except (OSError, ValueError) as exc:
                     f["error"] = str(exc)
         if capture:
@@ -1437,6 +1839,19 @@ def problems_of(report):
         tot = (a.get("lift") or {}).get("totals", {})
         if tot.get("different") or tot.get("invalid"):
             out.append("%s: %d lifted shaders render differently, %d invalid" % (aid, tot.get("different", 0), tot.get("invalid", 0)))
+        # A settle cut to less than half by a loading screen still up at the
+        # arrival (an older probe declared a lamp travel done under it).
+        settle = report.get("run", {}).get("settle_s")
+        pr = a.get("presence") or {}
+        if a.get("status") == "ok" and settle and pr.get("settle_s") is not None and pr["settle_s"] < settle / 2:
+            out.append("%s: settled %.0f s of the %.0f asked: the loading screen was still up at the arrival" % (aid, pr["settle_s"], settle))
+        for name, f in sorted((a.get("frames") or {}).items()):
+            if f.get("stats") and f["stats"]["mean_luma"] < BLACK_LUMA:
+                out.append("%s: frame %s is black (luma %.1f)" % (aid, name, f["stats"]["mean_luma"]))
+            for edge in (f.get("bands") or {}).values():
+                if edge.get("flagged"):
+                    out.append("%s: frame %s has a band edge at %s=%d (luma %.0f -> %.0f, %d of %d slabs)" % (
+                        aid, name, "x" if edge["axis"] == "column" else "y", edge["at"], edge["from"], edge["to"], edge["agree"], edge["slabs"]))
     return out
 
 
@@ -1554,7 +1969,7 @@ def do_run(args, bbhost=None, out=None, captures=True, say=print):
         launched = launch(out / k, plans[k], say_t)
         passes[k] = finish_pass(out / k, areas, k, launched, opts)
         report["passes"][k] = {x: passes[k].get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version",
-                                                             "rendering")}
+                                                             "rendering", "build_files", "title")}
         say_t("%s after %.0f s" % (launched["stop_reason"], launched["elapsed_s"]))
         if k == "capture":
             lifts = verify_lifts(out / k, areas, opts, say_t)
@@ -1585,13 +2000,15 @@ def do_report(args):
         if (run / k / "run.log").is_file():
             passes[k] = pass_report((run / k / "run.log").read_text(errors="replace").splitlines(), areas, k)
             passes[k].update({x: (old.get("passes", {}).get(k) or {}).get(x) for x in ("stop_reason", "returncode", "elapsed_s")})
+            passes[k]["build_files"] = build_files(run / k)
     lifts = {}
     for a in areas:
         p = run / "capture" / "lift" / a.id / "summary.json"
         if p.is_file():
             lifts[a.id] = json.loads(p.read_text())
     report = {"schema": SCHEMA, "version": 1, "dir": str(run), "run": old.get("run", {}), "passes": {
-        k: {x: v.get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version", "rendering")}
+        k: {x: v.get(x) for x in ("stop_reason", "returncode", "elapsed_s", "world", "tour_done", "fatal", "version", "rendering",
+                                  "build_files", "title")}
         for k, v in passes.items()}}
     report["areas"] = merge(passes.get("perf"), passes.get("capture"), lifts, areas)
     report["problems"] = problems_of(report)
@@ -1671,7 +2088,7 @@ def add_run_options(p):
     p.add_argument("--capture-window", type=float, default=DEFAULTS["capture_window"], help="seconds the captures may take at a place")
     p.add_argument("--quiet", type=float, default=QUIET_RADIUS, help="metres around the view whose enemies are switched off; 0: none")
     p.add_argument("--start", type=float, default=DEFAULTS["start"], help="seconds in the world before the first travel")
-    p.add_argument("--fps", type=int, default=DEFAULTS["fps"], choices=(30, 60, 90), help="the game's frame rate (BBHOST_GAME_FPS)")
+    p.add_argument("--fps", type=int, default=DEFAULTS["fps"], choices=(30, 60, 90, 120), help="the game's frame rate (BBHOST_GAME_FPS)")
     p.add_argument("--pipeline-cache", choices=("seed", "off"), default="seed",
                    help="seed: the seed's shader caches and stage manifest, as a player's after an update (default); "
                         "off: BBHOST_PIPELINE_CACHE=0, every shader compiled when first met")
