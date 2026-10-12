@@ -410,6 +410,8 @@ bool FrameGenerator::ensure_feature(VkCommandBuffer cmd, std::uint32_t width, st
     // Even after a failed evaluation/released NGX feature, a previous real
     // frame's blit can still read our images. Retire that work before resizing.
     if (device_ && (frames_[0].generated[0].image || frames_[0].real_copy.image || frames_[0].input.image)) {
+        for (const auto& frame : frames_)
+            if (frame.pending && frame.ticket) host_gpu_wait_submitted(frame.ticket);
         host_gpu_queue_lock();
         vkDeviceWaitIdle(device_);
         host_gpu_queue_unlock();
@@ -423,6 +425,7 @@ bool FrameGenerator::ensure_feature(VkCommandBuffer cmd, std::uint32_t width, st
             ffxVkFsr3_3_1_6FrameGenerationContextDestroy(
                 static_cast<FfxVkFsr3_3_1_6FrameGenerationContext*>(fsr_fg_context_));
             fsr_fg_context_ = nullptr;
+            for (auto& frame : frames_) frame.fsr_frame_id = 0;
         }
 #endif
         feature_created_ = false;
@@ -716,8 +719,6 @@ bool FrameGenerator::record_fsr_fg(VkCommandBuffer cmd, std::uint32_t width, std
     if (r_prep != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
         static int prep_fail = 0;
         if (++prep_fail <= 5) host_log("framegen: FSR RecordPrepare failed (%d)", r_prep);
-        ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(ctx, fid);
-        frame.fsr_frame_id = 0;
         return false;
     }
 
@@ -748,8 +749,6 @@ bool FrameGenerator::record_fsr_fg(VkCommandBuffer cmd, std::uint32_t width, std
     if (r_disp != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
         static int disp_fail = 0;
         if (++disp_fail <= 5) host_log("framegen: FSR RecordDispatch failed (%d)", r_disp);
-        ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(ctx, fid);
-        frame.fsr_frame_id = 0;
         return false;
     }
 
@@ -998,12 +997,10 @@ bool FrameGenerator::evaluate_submit(VkImage color_image, VkImageView color_view
         vkEndCommandBuffer(frame.cmd);
         vkResetCommandBuffer(frame.cmd, 0);
 #if defined(BBHOST_HAVE_FSR)
-        if (active_backend_ == 1 && frame.fsr_frame_id && fsr_fg_context_) {
-            ffxVkFsr3_3_1_6FrameGenerationContextRetireFrame(
-                static_cast<FfxVkFsr3_3_1_6FrameGenerationContext*>(fsr_fg_context_),
-                frame.fsr_frame_id);
-            frame.fsr_frame_id = 0;
-        }
+        // This recording was abandoned, not GPU-completed. Its ID cannot be
+        // a cumulative retirement watermark for older submitted frames.
+        // Rebuild destroys the context after submission tickets and GPU idle.
+        frame.fsr_frame_id = 0;
 #endif
         recreate_ = true;
         return false;

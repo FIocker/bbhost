@@ -71,6 +71,24 @@ if(NOT fsr_debug_view_patch_present EQUAL 0)
   endif()
 endif()
 
+set(fsr_retirement_patch "${CMAKE_CURRENT_LIST_DIR}/fsr-frame-retirement.patch")
+execute_process(COMMAND "${GIT_EXECUTABLE}" apply --reverse --check "${fsr_retirement_patch}"
+  WORKING_DIRECTORY "${fsr_vulkan_SOURCE_DIR}" RESULT_VARIABLE fsr_retirement_present
+  OUTPUT_QUIET ERROR_QUIET)
+if(NOT fsr_retirement_present EQUAL 0)
+  execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check "${fsr_retirement_patch}"
+    WORKING_DIRECTORY "${fsr_vulkan_SOURCE_DIR}" RESULT_VARIABLE fsr_retirement_check
+    OUTPUT_QUIET ERROR_QUIET)
+  if(NOT fsr_retirement_check EQUAL 0)
+    message(FATAL_ERROR "FSR provider does not match the pinned frame-retirement patch")
+  endif()
+  execute_process(COMMAND "${GIT_EXECUTABLE}" apply "${fsr_retirement_patch}"
+    WORKING_DIRECTORY "${fsr_vulkan_SOURCE_DIR}" RESULT_VARIABLE fsr_retirement_result)
+  if(NOT fsr_retirement_result EQUAL 0)
+    message(FATAL_ERROR "Could not apply FSR provider frame-retirement patch")
+  endif()
+endif()
+
 add_library(bbhost_fsr_provider OBJECT ${CMAKE_CURRENT_SOURCE_DIR}/src/host/fsr_provider.cpp)
 target_include_directories(bbhost_fsr_provider PRIVATE
   "${fsr_vulkan_SOURCE_DIR}/upstream/ffx-2.3.0/Kits/FidelityFX/upscalers/fsr3/internal")
